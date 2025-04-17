@@ -59,6 +59,7 @@ struct AudioData {
     int64_t next_pts = 0;
     double time_base = 0;
     bool finished = false;
+    double last_seek_time = -1.0;
 };
 
 // Add a map for video data to the GLResources struct
@@ -720,6 +721,18 @@ static int decode_audio_at_time(AudioData& audio, float time_sec, std::vector<ui
         return 0;
     }
 
+    int64_t target_pts = static_cast<int64_t>(time_sec / audio.time_base);
+
+    if (fabs(time_sec - audio.last_seek_time) > 0.01) {
+        if (av_seek_frame(audio.fmt_ctx, audio.stream_index, target_pts, AVSEEK_FLAG_BACKWARD) < 0) {
+            std::cerr << "Failed to seek to time " << time_sec << std::endl;
+            return 0;
+        }
+        avcodec_flush_buffers(audio.codec_ctx);
+        audio.last_seek_time = time_sec;
+        audio.finished = false; // allow fresh decode loop
+    }
+
     const double pts_target = time_sec / audio.time_base;
     bool got_frame = false;
     int total_samples = 0;
@@ -751,26 +764,53 @@ static int decode_audio_at_time(AudioData& audio, float time_sec, std::vector<ui
                 : audio.frame->best_effort_timestamp;
 
             double frame_time = frame_pts * audio.time_base;
-
             std::cout << "Audio frame PTS: " << frame_pts << ", time: " << frame_time
                       << ", target: " << time_sec << std::endl;
 
-            int nb_samples = audio.frame->nb_samples;
-            if (nb_samples <= 0) continue;
+            int in_nb_samples = audio.frame->nb_samples;
 
-            int buffer_size = nb_samples * audio.channels * av_get_bytes_per_sample(audio.format);
+            int out_nb_samples = av_rescale_rnd(
+                swr_get_delay(audio.swr_ctx, audio.codec_ctx->sample_rate) + in_nb_samples,
+                audio.sample_rate,
+                audio.codec_ctx->sample_rate,
+                AV_ROUND_UP
+            );
+
+            int buffer_size = av_samples_get_buffer_size(
+                nullptr,
+                audio.channels,
+                out_nb_samples,
+                audio.format,
+                0
+            );
+
+            if (buffer_size <= 0) {
+                std::cerr << "Invalid buffer size for audio frame" << std::endl;
+                continue;
+            }
+
             out_buffer.resize(buffer_size);
+            uint8_t* out_data[] = { out_buffer.data() };
 
-            uint8_t* out[] = { out_buffer.data() };
-            int out_samples = swr_convert(audio.swr_ctx, out, nb_samples,
-                                          (const uint8_t**)audio.frame->data, nb_samples);
+            int out_samples = swr_convert(
+                audio.swr_ctx,
+                out_data,
+                out_nb_samples,
+                (const uint8_t**)audio.frame->data,
+                in_nb_samples
+            );
 
-            total_samples += out_samples;
-            return out_samples;
+            if (out_samples <= 0) {
+                std::cerr << "swr_convert failed or produced no samples" << std::endl;
+                continue;
+            }
+
+            total_samples = out_samples;
+            return total_samples;
         }
 
         if (!got_frame) {
-            continue; // decoder may need more packets
+            continue; // decoder may need more data
         }
     }
 
