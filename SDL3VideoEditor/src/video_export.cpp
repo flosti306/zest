@@ -62,6 +62,13 @@ struct AudioData {
     double last_seek_time = -1.0;
 };
 
+struct PreloadedAudio {
+    std::vector<int16_t> samples;
+    int sample_rate = 44100;
+    int channels = 2;
+    float duration = 0.0f;
+};
+
 // Add a map for video data to the GLResources struct
 struct GLResources {
     GLuint fbo = 0;
@@ -69,6 +76,7 @@ struct GLResources {
     std::map<std::string, GLuint> texture_cache;
     std::map<std::string, VideoData> video_cache;
     std::map<std::string, AudioData> audio_cache;
+    std::unordered_map<std::string, PreloadedAudio> preloaded_audio;
 };
 
 // Debug function to check OpenGL context status
@@ -623,210 +631,104 @@ void cleanup_video_resources(GLResources& res) {
     }
 }
 
-static int64_t get_default_channel_layout(int channels) {
-    #if LIBAVUTIL_VERSION_MAJOR < 58
-        return av_get_default_channel_layout(channels);
-    #else
-        switch (channels) {
-            case 1: return AV_CH_LAYOUT_MONO;
-            case 2: return AV_CH_LAYOUT_STEREO;
-            case 6: return AV_CH_LAYOUT_5POINT1;
-            default: return 0;
-        }
-    #endif
-}
 
-static bool init_audio(AudioData& audio, const std::string& path) {
-    if (avformat_open_input(&audio.fmt_ctx, path.c_str(), nullptr, nullptr) < 0) {
-        std::cerr << "Failed to open input audio file: " << path << std::endl;
+bool preload_audio_file(const std::string& path, PreloadedAudio& out) {
+    AVFormatContext* fmt_ctx = nullptr;
+    if (avformat_open_input(&fmt_ctx, path.c_str(), nullptr, nullptr) < 0) {
+        std::cerr << "Failed to open input: " << path << "\n";
         return false;
     }
 
-    if (avformat_find_stream_info(audio.fmt_ctx, nullptr) < 0) {
-        std::cerr << "Failed to find audio stream info: " << path << std::endl;
+    if (avformat_find_stream_info(fmt_ctx, nullptr) < 0) {
+        std::cerr << "Failed to find stream info\n";
+        avformat_close_input(&fmt_ctx);
         return false;
     }
 
-    audio.stream_index = av_find_best_stream(audio.fmt_ctx, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
-    if (audio.stream_index < 0) {
-        std::cerr << "No audio stream found in: " << path << std::endl;
+    int stream_index = av_find_best_stream(fmt_ctx, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+    if (stream_index < 0) {
+        std::cerr << "No audio stream found\n";
+        avformat_close_input(&fmt_ctx);
         return false;
     }
 
-    AVCodecParameters* params = audio.fmt_ctx->streams[audio.stream_index]->codecpar;
+    AVCodecParameters* params = fmt_ctx->streams[stream_index]->codecpar;
     const AVCodec* decoder = avcodec_find_decoder(params->codec_id);
-    if (!decoder) {
-        std::cerr << "Failed to find decoder for audio: " << path << std::endl;
-        return false;
-    }
+    AVCodecContext* codec_ctx = avcodec_alloc_context3(decoder);
+    avcodec_parameters_to_context(codec_ctx, params);
+    avcodec_open2(codec_ctx, decoder, nullptr);
 
-    audio.codec_ctx = avcodec_alloc_context3(decoder);
-    if (!audio.codec_ctx) {
-        std::cerr << "Failed to allocate codec context\n";
-        return false;
-    }
+    SwrContext* swr = swr_alloc();
+    av_opt_set_chlayout(swr, "in_chlayout", &params->ch_layout, 0);
+    AVChannelLayout stereo;
+    av_channel_layout_default(&stereo, 2);
+    av_opt_set_chlayout(swr, "out_chlayout", &stereo, 0);
+    av_opt_set_int(swr, "in_sample_rate", params->sample_rate, 0);
+    av_opt_set_int(swr, "out_sample_rate", 44100, 0);
+    av_opt_set_sample_fmt(swr, "in_sample_fmt", (AVSampleFormat)params->format, 0);
+    av_opt_set_sample_fmt(swr, "out_sample_fmt", AV_SAMPLE_FMT_S16, 0);
+    swr_init(swr);
 
-    if (avcodec_parameters_to_context(audio.codec_ctx, params) < 0) {
-        std::cerr << "Failed to copy codec params\n";
-        return false;
-    }
+    AVPacket* pkt = av_packet_alloc();
+    AVFrame* frame = av_frame_alloc();
 
-    if (avcodec_open2(audio.codec_ctx, decoder, nullptr) < 0) {
-        std::cerr << "Failed to open audio decoder\n";
-        return false;
-    }
-
-    audio.frame = av_frame_alloc();
-    audio.packet = av_packet_alloc();
-
-    AVChannelLayout in_ch_layout = params->ch_layout;
-    AVChannelLayout out_ch_layout;
-    av_channel_layout_default(&out_ch_layout, 2);  // stereo output
-
-    audio.swr_ctx = swr_alloc();
-    if (!audio.swr_ctx) {
-        std::cerr << "Failed to allocate SwrContext\n";
-        return false;
-    }
-
-    av_opt_set_chlayout(audio.swr_ctx, "in_chlayout", &in_ch_layout, 0);
-    av_opt_set_chlayout(audio.swr_ctx, "out_chlayout", &out_ch_layout, 0);
-    av_opt_set_int(audio.swr_ctx, "in_sample_rate", params->sample_rate, 0);
-    av_opt_set_int(audio.swr_ctx, "out_sample_rate", audio.sample_rate, 0);
-    av_opt_set_sample_fmt(audio.swr_ctx, "in_sample_fmt", (AVSampleFormat)params->format, 0);
-    av_opt_set_sample_fmt(audio.swr_ctx, "out_sample_fmt", audio.format, 0);
-
-    if (swr_init(audio.swr_ctx) < 0) {
-        std::cerr << "Failed to initialize SwrContext\n";
-        swr_free(&audio.swr_ctx);
-        av_channel_layout_uninit(&out_ch_layout);
-        return false;
-    }
-
-    av_channel_layout_uninit(&out_ch_layout);  // free copied layout
-
-    audio.channels = 2;
-    audio.time_base = av_q2d(audio.fmt_ctx->streams[audio.stream_index]->time_base);
-
-    std::cout << "Audio initialized: " << path << " | channels: " << audio.channels
-              << ", sample_rate: " << audio.sample_rate << ", format: " << audio.format << std::endl;
-
-    return true;
-}
-
-
-static int decode_audio_at_time(AudioData& audio, float time_sec, std::vector<uint8_t>& out_buffer) {
-    if (!audio.swr_ctx || !swr_is_initialized(audio.swr_ctx)) {
-        std::cerr << "SWResample context is not initialized\n";
-        return 0;
-    }
-
-    int64_t target_pts = static_cast<int64_t>(time_sec / audio.time_base);
-
-    if (fabs(time_sec - audio.last_seek_time) > 0.01) {
-        if (av_seek_frame(audio.fmt_ctx, audio.stream_index, target_pts, AVSEEK_FLAG_BACKWARD) < 0) {
-            std::cerr << "Failed to seek to time " << time_sec << std::endl;
-            return 0;
-        }
-        avcodec_flush_buffers(audio.codec_ctx);
-        audio.last_seek_time = time_sec;
-        audio.finished = false; // allow fresh decode loop
-    }
-
-    const double pts_target = time_sec / audio.time_base;
-    bool got_frame = false;
-    int total_samples = 0;
-
-    while (!audio.finished) {
-        int ret = av_read_frame(audio.fmt_ctx, audio.packet);
-        if (ret < 0) {
-            audio.finished = true;
-            break;
-        }
-
-        if (audio.packet->stream_index != audio.stream_index) {
-            av_packet_unref(audio.packet);
+    std::vector<int16_t> full_audio;
+    while (av_read_frame(fmt_ctx, pkt) >= 0) {
+        if (pkt->stream_index != stream_index) {
+            av_packet_unref(pkt);
             continue;
         }
 
-        ret = avcodec_send_packet(audio.codec_ctx, audio.packet);
-        av_packet_unref(audio.packet);
-        if (ret < 0) {
-            std::cerr << "Error sending audio packet to decoder\n";
-            continue;
-        }
+        avcodec_send_packet(codec_ctx, pkt);
+        av_packet_unref(pkt);
 
-        while (avcodec_receive_frame(audio.codec_ctx, audio.frame) == 0) {
-            got_frame = true;
-
-            int64_t frame_pts = (audio.frame->pts != AV_NOPTS_VALUE)
-                ? audio.frame->pts
-                : audio.frame->best_effort_timestamp;
-
-            double frame_time = frame_pts * audio.time_base;
-            std::cout << "Audio frame PTS: " << frame_pts << ", time: " << frame_time
-                      << ", target: " << time_sec << std::endl;
-
-            int in_nb_samples = audio.frame->nb_samples;
-
+        while (avcodec_receive_frame(codec_ctx, frame) == 0) {
             int out_nb_samples = av_rescale_rnd(
-                swr_get_delay(audio.swr_ctx, audio.codec_ctx->sample_rate) + in_nb_samples,
-                audio.sample_rate,
-                audio.codec_ctx->sample_rate,
+                swr_get_delay(swr, codec_ctx->sample_rate) + frame->nb_samples,
+                44100,
+                codec_ctx->sample_rate,
                 AV_ROUND_UP
             );
 
-            int buffer_size = av_samples_get_buffer_size(
-                nullptr,
-                audio.channels,
-                out_nb_samples,
-                audio.format,
-                0
-            );
-
-            if (buffer_size <= 0) {
-                std::cerr << "Invalid buffer size for audio frame" << std::endl;
-                continue;
+            std::vector<int16_t> temp(out_nb_samples * 2);
+            uint8_t* out[] = { (uint8_t*)temp.data() };
+            int samples = swr_convert(swr, out, out_nb_samples, (const uint8_t**)frame->data, frame->nb_samples);
+            if (samples > 0) {
+                full_audio.insert(full_audio.end(), temp.begin(), temp.begin() + samples * 2);
             }
-
-            out_buffer.resize(buffer_size);
-            uint8_t* out_data[] = { out_buffer.data() };
-
-            int out_samples = swr_convert(
-                audio.swr_ctx,
-                out_data,
-                out_nb_samples,
-                (const uint8_t**)audio.frame->data,
-                in_nb_samples
-            );
-
-            if (out_samples <= 0) {
-                std::cerr << "swr_convert failed or produced no samples" << std::endl;
-                continue;
-            }
-
-            total_samples = out_samples;
-            return total_samples;
-        }
-
-        if (!got_frame) {
-            continue; // decoder may need more data
         }
     }
 
-    return total_samples;
+    out.samples = std::move(full_audio);
+    out.sample_rate = 44100;
+    out.channels = 2;
+    out.duration = (float)out.samples.size() / (2 * 44100);
+
+    av_channel_layout_uninit(&stereo);
+    av_frame_free(&frame);
+    av_packet_free(&pkt);
+    avcodec_free_context(&codec_ctx);
+    swr_free(&swr);
+    avformat_close_input(&fmt_ctx);
+    return true;
 }
 
+void mix_audio_from_memory(const PreloadedAudio& audio, float time_sec, std::vector<float>& mix_buffer) {
+    int start_sample = static_cast<int>(time_sec * audio.sample_rate);
+    int sample_count = mix_buffer.size();
 
-void cleanup_audio_resources(std::map<std::string, AudioData>& audio_cache) {
-    for (auto& [_, a] : audio_cache) {
-        av_packet_free(&a.packet);
-        av_frame_free(&a.frame);
-        swr_free(&a.swr_ctx);
-        avcodec_free_context(&a.codec_ctx);
-        avformat_close_input(&a.fmt_ctx);
+    for (int i = 0; i < sample_count; ++i) {
+        int idx = (start_sample + i);
+        if (idx * audio.channels + 1 >= (int)audio.samples.size())
+            break;
+
+        for (int ch = 0; ch < audio.channels; ++ch) {
+            int16_t sample = audio.samples[idx * audio.channels + ch];
+            mix_buffer[i * audio.channels + ch] += sample / 32768.0f;
+        }
     }
 }
+
 
 bool start_video_export(const std::string& output_path, int width, int height, int fps, int duration_frames, const std::vector<Clip>& clips, SDL_Window* window) {
     std::cout << "Starting video export process..." << std::endl;
@@ -855,12 +757,15 @@ bool start_video_export(const std::string& output_path, int width, int height, i
     }
 
     load_textures(res, sorted_clips);
+
+    // Preload audio
     for (const auto& clip : sorted_clips) {
         if (is_video_file(clip.path)) {
-            if (init_audio(res.audio_cache[clip.path], clip.path)) {
-                std::cout << "Initialized audio for " << clip.path << std::endl;
+            PreloadedAudio preload;
+            if (preload_audio_file(clip.path, preload)) {
+                res.preloaded_audio[clip.path] = std::move(preload);
             } else {
-                std::cerr << "Failed to initialize audio for " << clip.path << std::endl;
+                std::cerr << "Failed to preload audio for " << clip.path << std::endl;
             }
         }
     }
@@ -873,17 +778,24 @@ bool start_video_export(const std::string& output_path, int width, int height, i
     }
 
     std::vector<uint8_t> pixels(width * height * 3);
-    std::vector<uint8_t> audio_mixed(44100 * 2 * 2 / fps);
+    const int audio_sample_rate = 44100;
+    const int audio_channels = 2;
+    const int bytes_per_sample = 2;
+    const int samples_per_frame = audio_sample_rate / fps;
+    std::vector<uint8_t> audio_mixed(samples_per_frame * audio_channels * bytes_per_sample);
+    std::vector<float> audio_float(samples_per_frame * audio_channels, 0.0f);
 
     for (int frame = 0; frame < duration_frames; ++frame) {
         float current_time = static_cast<float>(frame) / fps;
         render_frame(res, current_time, sorted_clips, width, height);
 
+        // Capture frame pixels
         glBindFramebuffer(GL_FRAMEBUFFER, res.fbo);
         glReadBuffer(GL_COLOR_ATTACHMENT0);
         glReadPixels(0, 0, width, height, GL_RGB, GL_UNSIGNED_BYTE, pixels.data());
 
-        const size_t row_size = width * 3;
+        // Flip vertically (OpenGL is bottom-left origin)
+        size_t row_size = width * 3;
         for (int y = 0; y < height / 2; ++y) {
             uint8_t* top = pixels.data() + y * row_size;
             uint8_t* bottom = pixels.data() + (height - 1 - y) * row_size;
@@ -892,39 +804,36 @@ bool start_video_export(const std::string& output_path, int width, int height, i
 
         video_file.write(reinterpret_cast<const char*>(pixels.data()), pixels.size());
 
-        std::fill(audio_mixed.begin(), audio_mixed.end(), 0);
-        bool mixed_any = false;
-
+        // Mix audio from preloaded buffers
+        std::fill(audio_float.begin(), audio_float.end(), 0.0f);
         for (const auto& clip : sorted_clips) {
             if (current_time >= clip.start_time && current_time < clip.start_time + clip.duration) {
                 float local_time = current_time - clip.start_time;
-                std::cout << "[time " << current_time << "] checking clip: " << clip.path << " (start=" << clip.start_time << ", dur=" << clip.duration << ")" << std::endl;
+                auto it = res.preloaded_audio.find(clip.path);
+                if (it != res.preloaded_audio.end()) {
+                    const PreloadedAudio& audio = it->second;
+                    int start_sample = static_cast<int>(local_time * audio.sample_rate);
+                    int max_samples = samples_per_frame;
 
-                auto it = res.audio_cache.find(clip.path);
-                if (it == res.audio_cache.end()) {
-                    std::cout << "  [AUDIO MISSING in cache]" << std::endl;
-                } else {
-                    std::cout << "  [AUDIO FOUND in cache]" << std::endl;
-                }
+                    for (int i = 0; i < max_samples; ++i) {
+                        int sample_idx = start_sample + i;
+                        if (sample_idx * audio.channels + 1 >= (int)audio.samples.size())
+                            break;
 
-                if (it != res.audio_cache.end()) {
-                    std::vector<uint8_t> temp;
-                    int samples = decode_audio_at_time(it->second, local_time, temp);
-                    std::cout << "Decoded " << samples << " samples from " << clip.path << " at t=" << local_time << std::endl;
-
-                    if (samples > 0 && !temp.empty()) {
-                        mixed_any = true;
-                        for (size_t j = 0; j < temp.size() && j < audio_mixed.size(); ++j) {
-                            int mixed = ((int16_t*)audio_mixed.data())[j / 2] + ((int16_t*)temp.data())[j / 2];
-                            ((int16_t*)audio_mixed.data())[j / 2] = std::clamp(mixed, -32768, 32767);
+                        for (int ch = 0; ch < audio.channels; ++ch) {
+                            int16_t s = audio.samples[sample_idx * audio.channels + ch];
+                            audio_float[i * audio.channels + ch] += s / 32768.0f;
                         }
                     }
                 }
             }
         }
 
-        bool nonzero = std::any_of(audio_mixed.begin(), audio_mixed.end(), [](uint8_t b) { return b != 0; });
-        std::cout << "Frame " << frame << " audio: " << (mixed_any ? (nonzero ? "non-silent" : "silent") : "no mix") << std::endl;
+        // Convert float to int16 and write
+        for (size_t j = 0; j < audio_float.size(); ++j) {
+            float sample = std::clamp(audio_float[j], -1.0f, 1.0f);
+            ((int16_t*)audio_mixed.data())[j] = static_cast<int16_t>(sample * 32767.0f);
+        }
 
         audio_file.write(reinterpret_cast<const char*>(audio_mixed.data()), audio_mixed.size());
 
@@ -935,12 +844,6 @@ bool start_video_export(const std::string& output_path, int width, int height, i
 
     video_file.close();
     audio_file.close();
-
-    std::error_code ec;
-    auto video_size = std::filesystem::file_size("video.raw", ec);
-    auto audio_size = std::filesystem::file_size("temp_audio.raw", ec);
-    std::cout << "Final video.raw size: " << video_size << " bytes\n";
-    std::cout << "Final temp_audio.raw size: " << audio_size << " bytes\n";
 
     std::string ffmpeg_cmd =
         "ffmpeg -y "
@@ -968,7 +871,6 @@ bool start_video_export(const std::string& output_path, int width, int height, i
         glDeleteTextures(1, &tex);
     }
 
-    cleanup_audio_resources(res.audio_cache);
     cleanup_video_resources(res);
 
     glBindFramebuffer(GL_FRAMEBUFFER, previous_framebuffer);
