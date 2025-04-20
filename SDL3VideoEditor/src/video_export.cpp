@@ -532,15 +532,24 @@ void render_frame(GLResources& res, float current_time,
                     continue;
                 }
                 
-                // Draw textured quad
+                glPushMatrix();
+
+                // Apply transform based on clip attributes
+                glTranslatef(clip.pos_x, clip.pos_y, 0.0f);
+                glScalef(clip.scale, clip.scale, 1.0f);
+
+                // Apply opacity via color
+                glColor4f(1.0f, 1.0f, 1.0f, clip.opacity);
+
+                // Draw textured quad (size -1 to 1 in normalized space)
                 glBegin(GL_QUADS);
-                // Set texture color to ensure visibility 
-                glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
-                glTexCoord2f(0.0f, 1.0f); glVertex2f(-1.0f, -1.0f);
-                glTexCoord2f(1.0f, 1.0f); glVertex2f(1.0f, -1.0f);
-                glTexCoord2f(1.0f, 0.0f); glVertex2f(1.0f, 1.0f);
-                glTexCoord2f(0.0f, 0.0f); glVertex2f(-1.0f, 1.0f);
+                    glTexCoord2f(0.0f, 1.0f); glVertex2f(-1.0f, -1.0f);
+                    glTexCoord2f(1.0f, 1.0f); glVertex2f( 1.0f, -1.0f);
+                    glTexCoord2f(1.0f, 0.0f); glVertex2f( 1.0f,  1.0f);
+                    glTexCoord2f(0.0f, 0.0f); glVertex2f(-1.0f,  1.0f);
                 glEnd();
+
+                glPopMatrix();
                 
                 rendered_any_clip = true;
                 clips_rendered++;

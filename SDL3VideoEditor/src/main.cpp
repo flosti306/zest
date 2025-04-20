@@ -79,6 +79,8 @@ Uint64 last_playback_time = SDL_GetTicksNS();
 int preview_width = 1280;
 int preview_height = 720;
 
+Clip* selected_clip = nullptr;
+
 // Error checking macro
 #define CHECK_AV_ERROR(ret, message) \
     if (ret < 0) { \
@@ -329,6 +331,10 @@ int main(int argc, char* argv[]) {
         ImGui_ImplSDL3_NewFrame();
         ImGui::NewFrame();
 
+        if (!selected_clip && !clips.empty()) {
+            selected_clip = &clips[0];
+        }        
+
         ImGui::Begin("FFmpeg Video Editor");
         ImGui::Text("Drag and drop a video file or enter the file path:");
         ImGui::InputText("Input Path", input_path, IM_ARRAYSIZE(input_path));
@@ -377,6 +383,33 @@ int main(int argc, char* argv[]) {
         ImGui::Text("Playhead: %.2f sec", playhead_time);
         ImGui::SliderFloat("Seek", &playhead_time, 0.0f, 60.0f); // replace 60 with actual duration if needed
         ImGui::End();
+
+        ImGui::Begin("Inspector");
+
+        if (selected_clip) {
+            ImGui::Text("Selected Clip: %s", selected_clip->name.c_str());
+
+            ImGui::SeparatorText("Transform");
+
+            ImGui::SliderFloat("Position X", &selected_clip->pos_x, -1.0f, 1.0f);
+            ImGui::SliderFloat("Position Y", &selected_clip->pos_y, -1.0f, 1.0f);
+            ImGui::SliderFloat("Scale",      &selected_clip->scale,  0.1f, 4.0f);
+            ImGui::SliderFloat("Opacity",    &selected_clip->opacity, 0.0f, 1.0f);
+
+            ImGui::SeparatorText("Trimming");
+
+            ImGui::InputFloat("Trim Start",  &selected_clip->trim_start, 0.1f);
+            ImGui::InputInt("Duration",      &selected_clip->duration);
+
+            ImGui::SeparatorText("Layering");
+
+            ImGui::InputInt("Layer", &selected_clip->layer);
+        } else {
+            ImGui::Text("No clip selected.");
+        }
+
+        ImGui::End();
+
 
         ImGui::Render();
 
