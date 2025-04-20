@@ -17,6 +17,7 @@ extern "C" {
 #include <imgui.h>
 #include <imgui_impl_sdl3.h>
 #include <imgui_impl_sdlrenderer3.h>
+#include <imgui_impl_opengl3.h>
 #include <SDL.h>
 #include <SDL_video.h>
 #include <SDL_image.h>
@@ -70,6 +71,14 @@ struct StreamState {
 };
 std::vector<StreamState> stream_states;
 
+// === Playback state ===
+bool playing = false;
+float playhead_time = 0.0f;
+Uint64 last_playback_time = SDL_GetTicksNS();
+
+int preview_width = 1280;
+int preview_height = 720;
+
 // Error checking macro
 #define CHECK_AV_ERROR(ret, message) \
     if (ret < 0) { \
@@ -98,11 +107,10 @@ void DrawTimelineEditor(
     bool& layers_changed
 );
 
-SDL_Texture* CreatePreviewTexture(SDL_Renderer* renderer, const std::vector<Clip>& clips, int playhead_time);
+void UpdatePreview(GLResources& res, const std::vector<Clip>& clips, int width, int height, float playhead_time);
 
-void UpdatePreview(SDL_Renderer* renderer, SDL_Texture*& preview_texture, const std::vector<Clip>& clips, int playhead_time);
+void RenderPreviewWindow(GLuint preview_tex, int preview_width, int preview_height);
 
-void RenderPreviewWindow(SDL_Texture* preview_texture);
 
 void SetupImGuiStyle() {
     ImGuiStyle& style = ImGui::GetStyle();
@@ -186,61 +194,6 @@ int get_video_duration(const std::string& input_path) {
     return duration;
 }
 
-std::string escape_path(const std::string& path) {
-    std::string result = path;
-    
-    // Replace backslashes with forward slashes
-    std::replace(result.begin(), result.end(), '\\', '/');
-    
-    // Escape special characters for FFmpeg
-    std::string escaped;
-    escaped.reserve(result.size() * 2);
-    escaped += '\'';
-    
-    for (char c : result) {
-        if (c == '\'')
-            escaped += "\\'";
-        else
-            escaped += c;
-    }
-    
-    escaped += '\'';
-    return escaped;
-}
-
-// Get preferred sample format for an audio codec (avoiding deprecated sample_fmts)
-AVSampleFormat get_preferred_sample_format(const AVCodec* codec) {
-    // Default to float planar if we can't determine
-    AVSampleFormat default_format = AV_SAMPLE_FMT_FLTP;
-    
-    // For AAC, we know these are common formats
-    if (codec->id == AV_CODEC_ID_AAC) {
-        return AV_SAMPLE_FMT_FLTP;
-    }
-    
-    // For other codecs, try to find a supported format using newer API
-    #if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(59, 37, 100)
-        // Use new API if available
-        if (codec->sample_fmts) {
-            return codec->sample_fmts[0]; // Use the first supported sample format
-        }
-    #endif
-    
-    return default_format;
-}
-
-static int check_filter_status(AVFilterContext* ctx) {
-    if (!ctx) return 0;
-    
-    AVFrame* tmp_frame = av_frame_alloc();
-    if (!tmp_frame) return 0;
-    
-    int ret = av_buffersink_get_frame(ctx, tmp_frame);
-    av_frame_free(&tmp_frame);
-    
-    return (ret == AVERROR_EOF) ? 1 : 0;
-}
-
 
 #ifndef AV_ERROR_MAX_STRING_SIZE
 #define AV_ERROR_MAX_STRING_SIZE 64
@@ -255,24 +208,17 @@ static const char* av_err2str(int errnum) {
 }
 
 int main(int argc, char* argv[]) {
+    avformat_network_init();
 
-    avformat_network_init();  // Initialize FFmpeg
+    SDL_Init(SDL_INIT_VIDEO);
 
-    SDL_Window *window;                    // Declare a pointer
-
-    SDL_Init(SDL_INIT_VIDEO);              // Initialize SDL3
-
-    // Create an application window with the following settings:
-    window = SDL_CreateWindow(
-        "Zest",                            // window title
-        640,                               // width, in pixels
-        480,                               // height, in pixels
-        SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_MAXIMIZED              // flags - see below
+    SDL_Window* window = SDL_CreateWindow(
+        "Zest",
+        640, 480,
+        SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_MAXIMIZED
     );
 
-    // Check that the window was successfully created
-    if (window == NULL) {
-        // In the case that the window could not be made...
+    if (!window) {
         SDL_LogError(SDL_LOG_CATEGORY_ERROR, "Could not create window: %s\n", SDL_GetError());
         return 1;
     }
@@ -283,158 +229,128 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Set up vsync if desired
-    // SDL_GL_SetSwapInterval(1);
-
-    // Then initialize GLAD
     if (!gladLoadGLLoader((GLADloadproc)SDL_GL_GetProcAddress)) {
         SDL_LogError(SDL_LOG_CATEGORY_ERROR, "Failed to initialize GLAD\n");
         return 1;
     }
 
-    SDL_Surface* icon_surface = IMG_Load("assets/logo.png"); // path to your logo
+    SDL_Surface* icon_surface = IMG_Load("assets/logo.png");
     if (icon_surface) {
         SDL_SetWindowIcon(window, icon_surface);
-        SDL_DestroySurface(icon_surface); // Free after setting
+        SDL_DestroySurface(icon_surface);
     }
 
-    SDL_Renderer *renderer = NULL;
-    renderer = SDL_CreateRenderer(window, NULL);
-
-    // create render target
-    SDL_Texture* texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_BGRA8888, SDL_TEXTUREACCESS_TARGET, 300, 200);
-
-    // load image
-    SDL_Surface* surf = IMG_Load("assets/image.png");
-    SDL_Texture* charlie_texture = SDL_CreateTextureFromSurface(renderer, surf);
-    SDL_DestroySurface(surf);
-
-    // draw texture
-    SDL_SetRenderTarget(renderer, texture);
-    SDL_SetRenderDrawColor(renderer, 80, 200, 230, 1);
-    SDL_RenderClear(renderer);
-
-    SDL_FRect rect{50, 50, 100, 200};
-    SDL_RenderTexture(renderer, charlie_texture,NULL, &rect);
-
-    SDL_SetRenderTarget(renderer, NULL);
-
-    // init imgui
+    // === ImGui Setup ===
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO(); (void)io;
-    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;     // Enable Keyboard Controls
-    io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;         // Enable Docking
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
 
-    // Setup Dear ImGui style
     ImGui::StyleColorsDark();
+    io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 18.0f);
 
-    // Setup Platform/Renderer backends
-    ImGui_ImplSDL3_InitForSDLRenderer(window, renderer);
-    ImGui_ImplSDLRenderer3_Init(renderer);
-
-    io.Fonts->AddFontFromFileTTF("c:\\Windows\\Fonts\\segoeui.ttf", 18.0f);
+    ImGui_ImplSDL3_InitForOpenGL(window, gl_context);
+    ImGui_ImplOpenGL3_Init("#version 130"); // Or "#version 330 core" for modern GL
 
     SetupImGuiStyle();
 
-    // State variables
+    // === State ===
     char input_path[256] = "";
     char output_path[256] = "output.mp4";
-    int start_time = 0;
-    int duration = 10;
-    bool process_success = false;
-    std::string process_message = "";
-    
-    int max_duration = 0;
+    int start_time = 0, duration = 10, max_duration = 0;
     float zoom_factor = 1.0f;
-
     int video_duration = 0;
-
     bool file_dropped = false;
+    bool process_success = false;
+    std::string process_message;
 
-    std::vector<Clip> clips; // {clip_name, start_time, duration, path}
+    std::vector<Clip> clips;
     int playhead_position = 0;
-
-    SDL_Texture* preview_texture = nullptr;
     int last_playhead_position = -1;
     static bool layers_changed = false;
 
-    // Main loop
+    bool playing = false;
+    float playhead_time = 0.0f;
+    Uint64 last_playback_time = SDL_GetTicksNS();
+
+    GLResources gl_resources;
+    setup_gl_resources(gl_resources, preview_width, preview_height);
+
+    // === Main Loop ===
     bool running = true;
     while (running) {
         SDL_Event event;
+
         while (SDL_PollEvent(&event)) {
-            if (event.type == SDL_EVENT_QUIT) {
+            if (event.type == SDL_EVENT_QUIT)
                 running = false;
+
+            if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_SPACE && event.key.down) {
+                playing = !playing;
+                std::cout << "Playback " << (playing ? "started" : "paused") << "\n";
             }
 
-            // Handle drag-and-drop files
             if (event.type == SDL_EVENT_DROP_FILE) {
                 if (event.drop.data) {
-                    std::cout << "Dropped \n";
                     strncpy(input_path, event.drop.data, IM_ARRAYSIZE(input_path) - 1);
-
-                    
                     file_dropped = true;
 
                     video_duration = get_video_duration(input_path);
-                    if (video_duration == -1) {
-                        process_message = "Failed to determine video duration!";
-                    } else {
-                        process_message = "Video duration loaded successfully!";
-                    }
+                    process_message = (video_duration == -1)
+                        ? "Failed to determine video duration!"
+                        : "Video duration loaded successfully!";
 
                     std::cout << "Input Path: " << input_path << "\n";
                     std::cout << "Video Duration: " << video_duration << "\n";
 
                     AddNewClip(clips, input_path, video_duration);
-
+                    load_textures(gl_resources, clips);
+                    UpdatePreview(gl_resources, clips, preview_width, preview_height, playhead_time);
                 }
-
             }
-
-
 
             ImGui_ImplSDL3_ProcessEvent(&event);
         }
 
+        if (playing) {
+            Uint64 now = SDL_GetTicksNS();
+            float delta_time = (now - last_playback_time) / 1'000'000'000.0f;
+            last_playback_time = now;
+            playhead_time += delta_time;
+            load_textures(gl_resources, clips);
+            UpdatePreview(gl_resources, clips, preview_width, preview_height, playhead_time);
+        } else {
+            last_playback_time = SDL_GetTicksNS();
+        }
 
-        // Start ImGui frame
-        ImGui_ImplSDLRenderer3_NewFrame();
+        // === ImGui Frame ===
+        ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplSDL3_NewFrame();
         ImGui::NewFrame();
 
-        // ImGui GUI
         ImGui::Begin("FFmpeg Video Editor");
         ImGui::Text("Drag and drop a video file or enter the file path:");
         ImGui::InputText("Input Path", input_path, IM_ARRAYSIZE(input_path));
         ImGui::Text("Set output file path:");
         ImGui::InputText("Output Path", output_path, IM_ARRAYSIZE(output_path));
 
-
         DrawTimelineEditor(clips, playhead_position, start_time, duration, max_duration, zoom_factor, last_playhead_position, layers_changed);
 
-        if (playhead_position != last_playhead_position) {
-            UpdatePreview(renderer, preview_texture, clips, playhead_position);
-            last_playhead_position = playhead_position;
-        }
-
-        if (layers_changed || playhead_position != last_playhead_position) {
-            UpdatePreview(renderer, preview_texture, clips, playhead_position);
+        if (playhead_position != last_playhead_position || layers_changed) {
+            UpdatePreview(gl_resources, clips, preview_width, preview_height, playhead_time);
             last_playhead_position = playhead_position;
             layers_changed = false;
         }
 
-        // Render the preview window
-        RenderPreviewWindow(preview_texture);
-
+        RenderPreviewWindow(gl_resources.render_tex, preview_width, preview_height);
         ImGui::Separator();
 
         if (ImGui::Button("Cut Video")) {
-            // Ensure OpenGL context is active
-            SDL_GL_MakeCurrent(window, SDL_GL_GetCurrentContext());
+            SDL_GL_MakeCurrent(window, gl_context);
+
             if (!SDL_GL_GetCurrentContext()) {
-                std::cerr << "OpenGL context is not active!" << std::endl;
+                std::cerr << "OpenGL context is not active!\n";
                 process_message = "OpenGL context error!";
                 process_success = false;
             } else {
@@ -445,8 +361,7 @@ int main(int argc, char* argv[]) {
                     } else {
                         int fps = 30;
                         int total_frames_needed = max_duration * fps;
-                        process_success = start_video_export("output.mp4", 1920, 1080, 30, 
-                            total_frames_needed, clips, window);
+                        process_success = start_video_export(output_path, 1920, 1080, fps, total_frames_needed, clips, window);
                         process_message = process_success ? "Video cut successfully!" : "Failed to cut video!";
                     }
                 } else {
@@ -458,34 +373,34 @@ int main(int argc, char* argv[]) {
         ImGui::TextWrapped("Status: %s", process_message.c_str());
         ImGui::End();
 
-        // Render ImGui
+        ImGui::Begin("Timeline");
+        ImGui::Text("Playhead: %.2f sec", playhead_time);
+        ImGui::SliderFloat("Seek", &playhead_time, 0.0f, 60.0f); // replace 60 with actual duration if needed
+        ImGui::End();
+
         ImGui::Render();
 
-        SDL_SetRenderDrawColor(renderer, 30, 30, 30, 255); // Dark gray background
-        SDL_RenderClear(renderer);
-
-        ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), renderer);
-        SDL_RenderPresent(renderer);
+        // === OpenGL render ===
+        int w, h;
+        SDL_GetWindowSize(window, &w, &h);
+        glViewport(0, 0, w, h);
+        glClearColor(0.12f, 0.12f, 0.12f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        SDL_GL_SwapWindow(window);
     }
-    // The window is open: could enter program loop here (see SDL_PollEvent())
-
-    SDL_Delay(300);
 
     // Cleanup
-    ImGui_ImplSDLRenderer3_Shutdown();
+    ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplSDL3_Shutdown();
     ImGui::DestroyContext();
-
     SDL_GL_DestroyContext(gl_context);
-
-    SDL_DestroyTexture(texture);
-    SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
-
     SDL_Quit();
 
     return 0;
 }
+
 
 
 void DrawTimelineEditor(
@@ -726,109 +641,50 @@ void DrawTimelineEditor(
 }
 
 
-// Basic FFmpeg-based preview generation
-SDL_Texture* CreatePreviewTexture(SDL_Renderer* renderer, const std::vector<Clip>& clips, int playhead_time) {
-    if (clips.empty()) return nullptr;
+void UpdatePreview(GLResources& res, const std::vector<Clip>& clips, int width, int height, float playhead_time) {
+    static float last_preview_time = -1.0f;
 
-    AVFormatContext* fmt_ctx = nullptr;
-    AVCodecParameters* codecpar = nullptr;
-    const AVCodec* codec = nullptr;
-    AVCodecContext* codec_ctx = nullptr;
-    AVFrame* frame = av_frame_alloc();
-    AVPacket pkt;
-    int video_stream = -1;
-    SDL_Texture* texture = nullptr;
+    if (std::abs(playhead_time - last_preview_time) < 0.01f) return;
 
-    // Open first clip for preview
-    if (avformat_open_input(&fmt_ctx, clips[0].path.c_str(), nullptr, nullptr) != 0) {
-        return nullptr;
-    }
+    std::vector<Clip> sorted_clips = clips;
+    std::sort(sorted_clips.begin(), sorted_clips.end(), [](const Clip& a, const Clip& b) {
+        return a.layer < b.layer;
+    });
 
-    avformat_find_stream_info(fmt_ctx, nullptr);
-    
-    // Find video stream
-    for (unsigned int i = 0; i < fmt_ctx->nb_streams; i++) {
-        if (fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-            video_stream = i;
-            codecpar = fmt_ctx->streams[i]->codecpar;
-            break;
-        }
-    }
-
-    if (video_stream == -1) {
-        avformat_close_input(&fmt_ctx);
-        return nullptr;
-    }
-
-    codec = avcodec_find_decoder(codecpar->codec_id);
-    codec_ctx = avcodec_alloc_context3(codec);
-    avcodec_parameters_to_context(codec_ctx, codecpar);
-    avcodec_open2(codec_ctx, codec, nullptr);
-
-    // Seek to requested time
-    av_seek_frame(fmt_ctx, video_stream, 
-        playhead_time * AV_TIME_BASE / 1000, AVSEEK_FLAG_BACKWARD);
-
-    while (av_read_frame(fmt_ctx, &pkt) >= 0) {
-        if (pkt.stream_index == video_stream) {
-            avcodec_send_packet(codec_ctx, &pkt);
-            if (avcodec_receive_frame(codec_ctx, frame) == 0) {
-                // Create SDL texture
-                texture = SDL_CreateTexture(
-                    renderer,
-                    SDL_PIXELFORMAT_YV12,
-                    SDL_TEXTUREACCESS_STREAMING,
-                    frame->width,
-                    frame->height
-                );
-
-                SDL_UpdateYUVTexture(texture, nullptr,
-                    frame->data[0], frame->linesize[0],
-                    frame->data[1], frame->linesize[1],
-                    frame->data[2], frame->linesize[2]);
-                break;
-            }
-        }
-        av_packet_unref(&pkt);
-    }
-
-    // Cleanup
-    av_frame_free(&frame);
-    avcodec_free_context(&codec_ctx);
-    avformat_close_input(&fmt_ctx);
-    return texture;
+    render_frame(res, playhead_time, sorted_clips, width, height);
+    last_preview_time = playhead_time;
 }
 
-void UpdatePreview(SDL_Renderer* renderer, SDL_Texture*& preview_texture, 
-                  const std::vector<Clip>& clips, int playhead_time) {
-    // Only regenerate if time changed significantly
-    static int last_preview_time = -1;
-    if (abs(playhead_time - last_preview_time) < 0.5f) return;
-    
-    SDL_Texture* new_texture = CreatePreviewTexture(renderer, clips, playhead_time);
-    if (new_texture) {
-        if (preview_texture) SDL_DestroyTexture(preview_texture);
-        preview_texture = new_texture;
-        last_preview_time = playhead_time;
-    }
-}
 
-void RenderPreviewWindow(SDL_Texture* preview_texture) {
+void RenderPreviewWindow(GLuint preview_tex, int preview_width, int preview_height) {
     ImGui::Begin("Video Preview");
-    
-    if (preview_texture) {
-        // Get window size while maintaining aspect ratio
-        float tex_w, tex_h;
-        SDL_GetTextureSize(preview_texture, &tex_w, &tex_h);
-        float aspect = static_cast<float>(tex_w) / tex_h;
-        
+
+    if (preview_tex) {
+        // Maintain aspect ratio
+        float aspect = static_cast<float>(preview_width) / preview_height;
+
         ImVec2 avail = ImGui::GetContentRegionAvail();
-        ImVec2 preview_size(avail.x, avail.x / aspect);
-        
-        ImGui::Image(reinterpret_cast<ImTextureID>(preview_texture), preview_size);
+        ImVec2 preview_size = avail;
+
+        // Fit to width, maintain aspect ratio
+        preview_size.y = preview_size.x / aspect;
+
+        // Clip if height too large
+        if (preview_size.y > avail.y) {
+            preview_size.y = avail.y;
+            preview_size.x = preview_size.y * aspect;
+        }
+
+        // Flip vertically: use UVs (0,1) to (1,0)
+        ImGui::Image(
+            (ImTextureID)(intptr_t)preview_tex,
+            preview_size,
+            ImVec2(0, 1),  // <-- top-left
+            ImVec2(1, 0)   // <-- bottom-right
+        );
     } else {
         ImGui::Text("Preview unavailable");
     }
-    
+
     ImGui::End();
 }

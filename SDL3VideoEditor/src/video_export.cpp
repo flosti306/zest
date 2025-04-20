@@ -27,58 +27,6 @@ extern "C" {
     #include <libavutil/channel_layout.h>
 }
 
-struct VideoData {
-    AVFormatContext* format_ctx = nullptr;
-    AVCodecContext* codec_ctx = nullptr;
-    AVFrame* frame = nullptr;
-    AVFrame* frame_rgb = nullptr;
-    SwsContext* sws_ctx = nullptr;
-    AVPacket* packet = nullptr;
-    int video_stream_idx = -1;
-    int width = 0;
-    int height = 0;
-    uint8_t* buffer = nullptr;
-    GLuint texture_id = 0;
-    bool is_initialized = false;
-    double current_pts = 0;       // Current presentation timestamp 
-    double time_base = 0;         // Time base for video stream
-    int frames_read = 0;          // Number of frames read
-    bool reached_eof = false;
-};
-
-struct AudioData {
-    AVFormatContext* fmt_ctx = nullptr;
-    AVCodecContext* codec_ctx = nullptr;
-    SwrContext* swr_ctx = nullptr;
-    AVFrame* frame = nullptr;
-    AVPacket* packet = nullptr;
-    int stream_index = -1;
-    int sample_rate = 44100;
-    int channels = 2;
-    AVSampleFormat format = AV_SAMPLE_FMT_S16;
-    int64_t next_pts = 0;
-    double time_base = 0;
-    bool finished = false;
-    double last_seek_time = -1.0;
-};
-
-struct PreloadedAudio {
-    std::vector<int16_t> samples;
-    int sample_rate = 44100;
-    int channels = 2;
-    float duration = 0.0f;
-};
-
-// Add a map for video data to the GLResources struct
-struct GLResources {
-    GLuint fbo = 0;
-    GLuint render_tex = 0;
-    std::map<std::string, GLuint> texture_cache;
-    std::map<std::string, VideoData> video_cache;
-    std::map<std::string, AudioData> audio_cache;
-    std::unordered_map<std::string, PreloadedAudio> preloaded_audio;
-};
-
 // Debug function to check OpenGL context status
 void check_gl_context() {
     if (SDL_GL_GetCurrentContext()) {
@@ -93,7 +41,7 @@ void check_gl_context() {
     }
 }
 
-static bool setup_gl_resources(GLResources& res, int width, int height) {
+bool setup_gl_resources(GLResources& res, int width, int height) {
     // Create FBO
     glGenFramebuffers(1, &res.fbo);
     glBindFramebuffer(GL_FRAMEBUFFER, res.fbo);
@@ -395,7 +343,7 @@ bool update_video_frame(VideoData& video, float target_time_seconds) {
 }
 
 // Update load_textures function to handle both images and videos
-static void load_textures(GLResources& res, const std::vector<Clip>& clips) {
+void load_textures(GLResources& res, const std::vector<Clip>& clips) {
     for (const auto& clip : clips) {
         if (res.texture_cache.count(clip.path)) continue;
 
@@ -517,7 +465,7 @@ static void load_textures(GLResources& res, const std::vector<Clip>& clips) {
 }
 
 // Update render_frame to handle video frames
-static void render_frame(GLResources& res, float current_time, 
+void render_frame(GLResources& res, float current_time, 
                         const std::vector<Clip>& sorted_clips,
                         int width, int height) {
     // Bind the framebuffer for rendering
