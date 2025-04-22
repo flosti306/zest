@@ -4,8 +4,8 @@
 struct Clip {
     std::string name;
     
-    int start_time = 0;      // timeline position in seconds
-    int duration = 0;        // duration on timeline
+    float start_time = 0.0f;      // timeline position in seconds
+    float duration = 0.0f;        // duration on timeline
     int layer = 0;           // compositing layer (higher = in front)
     
     std::string path;

@@ -101,9 +101,9 @@ if (condition) { \
 void DrawTimelineEditor(
     std::vector<Clip>& clips,
     int& playhead_position,
-    int& start_time,
-    int& duration,
-    int& max_duration,
+    float& start_time,
+    float& duration,
+    float& max_duration,
     float& zoom_factor,
     int& last_playhead_position,
     bool& layers_changed
@@ -174,13 +174,13 @@ void SetupImGuiStyle() {
     style.TabRounding = 0.0f;
 }
 
-void AddNewClip(std::vector<Clip>& clips, const std::string& input_path, int video_duration, int layer = 0) {
+void AddNewClip(std::vector<Clip>& clips, const std::string& input_path, float video_duration, int layer = 0) {
     std::string clip_name = std::filesystem::path(input_path).filename().string();
     clips.push_back(Clip{clip_name, 0, video_duration, layer, input_path});  // Default start at 0 and a default duration
 }
 
 // Modified get_video_duration using FFmpeg
-int get_video_duration(const std::string& input_path) {
+float get_video_duration(const std::string& input_path) {
     AVFormatContext* fmt_ctx = nullptr;
     if (avformat_open_input(&fmt_ctx, input_path.c_str(), nullptr, nullptr) != 0) {
         return -1;
@@ -191,7 +191,7 @@ int get_video_duration(const std::string& input_path) {
         return -1;
     }
     
-    int duration = static_cast<int>(fmt_ctx->duration / AV_TIME_BASE);
+    float duration = static_cast<float>(fmt_ctx->duration / AV_TIME_BASE);
     avformat_close_input(&fmt_ctx);
     return duration;
 }
@@ -260,9 +260,9 @@ int main(int argc, char* argv[]) {
     // === State ===
     char input_path[256] = "";
     char output_path[256] = "output.mp4";
-    int start_time = 0, duration = 10, max_duration = 0;
+    float start_time = 0.0f, duration = 10.0f, max_duration = 0.0f;
     float zoom_factor = 1.0f;
-    int video_duration = 0;
+    float video_duration = 0.0f;
     bool file_dropped = false;
     bool process_success = false;
     std::string process_message;
@@ -272,10 +272,10 @@ int main(int argc, char* argv[]) {
     int last_playhead_position = -1;
     static bool layers_changed = false;
 
-    bool playing = false;
+    /* bool playing = false;
     float playhead_time = 0.0f;
     Uint64 last_playback_time = SDL_GetTicksNS();
-
+ */
     GLResources gl_resources;
     setup_gl_resources(gl_resources, preview_width, preview_height);
 
@@ -323,17 +323,17 @@ int main(int argc, char* argv[]) {
                 float clip_start_global = selected_clip->start_time;
                 float clip_end_global = selected_clip->start_time + selected_clip->duration;
                 if (cut_time <= clip_start_global || cut_time >= clip_end_global) {
-                    std::cout << "Cut is outside clip bounds\n";
+                    std::cout << "Cut is outside clip bounds: " << cut_time << "\n";
                 } else {
                     float relative_cut = cut_time - selected_clip->start_time;
                     float new_media_start = selected_clip->media_start + relative_cut;
             
                     // First clip: update duration
-                    selected_clip->duration = static_cast<int>(relative_cut);
+                    selected_clip->duration = relative_cut;
             
                     // Second clip: create from remaining duration
                     Clip new_clip = *selected_clip;
-                    new_clip.start_time = static_cast<int>(cut_time);
+                    new_clip.start_time = cut_time;
                     new_clip.media_start = new_media_start;
                     new_clip.duration = clip_end_global - cut_time;
             
@@ -429,7 +429,7 @@ int main(int argc, char* argv[]) {
             ImGui::SeparatorText("Trimming");
 
             ImGui::InputFloat("Trim Start",  &selected_clip->media_start, 0.1f);
-            ImGui::InputInt("Duration",      &selected_clip->duration);
+            ImGui::InputFloat("Duration",      &selected_clip->duration);
 
             ImGui::SeparatorText("Layering");
 
@@ -469,9 +469,9 @@ int main(int argc, char* argv[]) {
 void DrawTimelineEditor(
     std::vector<Clip>& clips,
     int& playhead_position,
-    int& start_time,
-    int& duration,
-    int& max_duration,
+    float& start_time,
+    float& duration,
+    float& max_duration,
     float& zoom_factor,
     int& last_playhead_position,
     bool& layers_changed
@@ -530,8 +530,8 @@ void DrawTimelineEditor(
         auto& clip = clips[i];
 
         float layer_offset_y = clip.layer * (layer_height + layer_padding);
-        float clip_start_x = timeline_start.x + (float(clip.start_time) / max_duration) * timeline_width * zoom_factor;
-        float clip_end_x = clip_start_x + (float(clip.duration) / max_duration) * timeline_width * zoom_factor;
+        float clip_start_x = timeline_start.x + (clip.start_time / max_duration) * timeline_width * zoom_factor;
+        float clip_end_x = clip_start_x + (clip.duration / max_duration) * timeline_width * zoom_factor;
 
         ImVec2 clip_rect_min = ImVec2(clip_start_x, timeline_start.y + layer_offset_y + layer_padding);
         ImVec2 clip_rect_max = ImVec2(clip_end_x, timeline_start.y + layer_offset_y + layer_height);
@@ -576,8 +576,8 @@ void DrawTimelineEditor(
 
             if (dragging_clip_index == i) {
                 float mouse_x = ImGui::GetMousePos().x;
-                int new_start_time = int(((mouse_x - drag_offset_x - timeline_start.x) / timeline_width * zoom_factor) * max_duration);
-                new_start_time = std::max(0, new_start_time);
+                float new_start_time = ((mouse_x - drag_offset_x - timeline_start.x) / timeline_width * zoom_factor) * max_duration;
+                new_start_time = std::max(0.0f, new_start_time);
                 new_start_time = std::min(new_start_time, max_duration - clip.duration);
                 clip.start_time = new_start_time;
             }
@@ -604,12 +604,12 @@ void DrawTimelineEditor(
             if (!resizing_right) {
                 resizing_left = true;
                 float mouse_x = ImGui::GetMousePos().x;
-                int new_start_time = int(((mouse_x - timeline_start.x) / timeline_width * zoom_factor) * max_duration);
-                int new_duration = clip.duration + (clip.start_time - new_start_time);
-                new_start_time = std::max(0, new_start_time);
-                new_duration = std::max(1, std::min(max_duration - new_start_time, new_duration));
+                float new_start_time = ((mouse_x - timeline_start.x) / timeline_width * zoom_factor) * max_duration;
+                float new_duration = clip.duration + (clip.start_time - new_start_time);
+                new_start_time = std::max(0.0f, new_start_time);
+                new_duration = std::max(1.0f, std::min(max_duration - new_start_time, new_duration));
                 
-                int delta = new_start_time - clip.start_time;
+                float delta = new_start_time - clip.start_time;
 
                 if (delta > 0) {
                     clip.media_start += delta;
@@ -630,8 +630,8 @@ void DrawTimelineEditor(
             if (!resizing_left) {
                 resizing_right = true;
                 float mouse_x = ImGui::GetMousePos().x;
-                int new_duration = int(((mouse_x - clip_start_x) / timeline_width / zoom_factor) * max_duration);
-                new_duration = std::max(1, std::min(max_duration - clip.start_time, new_duration));
+                float new_duration = ((mouse_x - clip_start_x) / timeline_width / zoom_factor) * max_duration;
+                new_duration = std::max(1.0f, std::min(max_duration - clip.start_time, new_duration));
                 clip.duration = new_duration;
             }
         } else if (resizing_right) {
@@ -658,9 +658,103 @@ void DrawTimelineEditor(
         selected_clip = nullptr;
     }
 
-    ImGui::Separator();
-    ImGui::Text("Playhead Position: %d seconds", playhead_position);
-    ImGui::SliderInt("Playhead", &playhead_position, 0, max_duration);
+        // === Playhead rendering & interaction ===
+
+        float normalized_time = playhead_time / max_duration;
+        float playhead_x = timeline_start.x + normalized_time * timeline_width * zoom_factor;
+    
+        const float line_width = 2.5f;
+        const float head_width = 12.5f;
+        const float head_height = 18.0f;
+        const ImU32 playhead_color = IM_COL32(255, 255, 0, 255);
+        const ImU32 shadow_color = IM_COL32(0, 0, 0, 80);
+
+        // ===== PRECISE SHADOW ALIGNMENT =====
+        const float shadow_offset = 1.5f;
+        const float shadow_blur = 3.0f;
+
+        // Head shadow (mathematically offset path)
+        draw_list->PathClear();
+        draw_list->PathLineTo(ImVec2(playhead_x + shadow_offset, timeline_start.y + head_height + shadow_offset));
+        draw_list->PathBezierCubicCurveTo(
+            ImVec2(playhead_x - head_width*0.42f + shadow_offset, timeline_start.y + head_height*0.66f + shadow_offset),
+            ImVec2(playhead_x - head_width*0.66f + shadow_offset, timeline_start.y + line_width + shadow_offset),
+            ImVec2(playhead_x + shadow_offset, timeline_start.y + shadow_offset)
+        );
+        draw_list->PathBezierCubicCurveTo(
+            ImVec2(playhead_x + head_width*0.66f + shadow_offset, timeline_start.y + line_width + shadow_offset),
+            ImVec2(playhead_x + head_width*0.42f + shadow_offset, timeline_start.y + head_height*0.66f + shadow_offset),
+            ImVec2(playhead_x + shadow_offset, timeline_start.y + head_height + shadow_offset)
+        );
+        draw_list->PathStroke(shadow_color, false, shadow_blur);
+
+        // Line shadow with perfect width matching
+        draw_list->AddLine(
+            ImVec2(playhead_x + shadow_offset, timeline_start.y + head_height + shadow_offset - line_width/2),
+            ImVec2(playhead_x + shadow_offset, timeline_start.y + timeline_height),
+            shadow_color, line_width + shadow_blur
+        );
+
+        // ===== MATHEMATICALLY PERFECT HEAD-LINE CONNECTION =====
+        const float connection_radius = line_width * 0.8f;
+        const ImVec2 connection_point = ImVec2(playhead_x, timeline_start.y + head_height - connection_radius);
+
+        // Head shape with exact line-width termination
+        draw_list->PathClear();
+        draw_list->PathLineTo(connection_point);
+        draw_list->PathBezierCubicCurveTo(
+            ImVec2(playhead_x - head_width*0.47f, timeline_start.y + head_height*0.6f),
+            ImVec2(playhead_x - head_width*0.65f, timeline_start.y + line_width*1.95f),
+            ImVec2(playhead_x, timeline_start.y)
+        );
+        draw_list->PathBezierCubicCurveTo(
+            ImVec2(playhead_x + head_width*0.65f, timeline_start.y + line_width*1.95f),
+            ImVec2(playhead_x + head_width*0.47f, timeline_start.y + head_height*0.6f),
+            connection_point
+        );
+        draw_list->PathFillConvex(playhead_color);
+
+        // Vertical line with exact width matching
+        draw_list->AddLine(
+            connection_point,
+            ImVec2(playhead_x - 1.0f, timeline_start.y + timeline_height),
+            playhead_color, line_width
+        );
+
+        // Connection reinforcement
+        draw_list->AddCircleFilled(
+            connection_point,
+            connection_radius,
+            playhead_color
+        );
+
+        // Handle dragging or clicking to set playhead
+        static bool dragging_playhead = false;
+    
+        ImGui::SetCursorScreenPos(ImVec2(playhead_x - 4, timeline_start.y));
+        ImGui::InvisibleButton("##PlayheadGrab", ImVec2(8, timeline_height));
+    
+        if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+            dragging_playhead = true;
+            float mouse_x = ImGui::GetMousePos().x;
+            float new_normalized = (mouse_x - timeline_start.x) / (timeline_width * zoom_factor);
+            new_normalized = std::clamp(new_normalized, 0.0f, 1.0f);
+            playhead_time = new_normalized * max_duration;
+        } else if (dragging_playhead && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            dragging_playhead = false;
+        }
+    
+        // Allow clicking anywhere on timeline (but not on clips) to move playhead
+        if (!clicked_on_clip && ImGui::IsWindowHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            ImVec2 mouse = ImGui::GetMousePos();
+            if (mouse.y > timeline_start.y && mouse.y < timeline_end.y) {
+                float new_normalized = (mouse.x - timeline_start.x) / (timeline_width * zoom_factor);
+                new_normalized = std::clamp(new_normalized, 0.0f, 1.0f);
+                playhead_time = new_normalized * max_duration;
+            }
+        }
+    
+    
     ImGui::End();
 
     ImGui::Begin("Active Clips");
