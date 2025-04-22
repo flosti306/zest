@@ -312,6 +312,40 @@ int main(int argc, char* argv[]) {
                 }
             }
 
+            if (event.type == SDL_EVENT_KEY_DOWN &&
+                event.key.key == SDL_Keycode{'b'} &&
+                (event.key.mod & SDL_KMOD_CTRL) &&
+                selected_clip) {
+            
+                float cut_time = playhead_time;
+            
+                // Check if the cut is within clip bounds
+                float clip_start_global = selected_clip->start_time;
+                float clip_end_global = selected_clip->start_time + selected_clip->duration;
+                if (cut_time <= clip_start_global || cut_time >= clip_end_global) {
+                    std::cout << "Cut is outside clip bounds\n";
+                } else {
+                    float relative_cut = cut_time - selected_clip->start_time;
+                    float new_media_start = selected_clip->media_start + relative_cut;
+            
+                    // First clip: update duration
+                    selected_clip->duration = static_cast<int>(relative_cut);
+            
+                    // Second clip: create from remaining duration
+                    Clip new_clip = *selected_clip;
+                    new_clip.start_time = static_cast<int>(cut_time);
+                    new_clip.media_start = new_media_start;
+                    new_clip.duration = clip_end_global - cut_time;
+            
+                    new_clip.name += " (cut)";
+                    clips.push_back(new_clip);
+            
+                    std::cout << "Blade tool: split clip at " << cut_time << "s\n";
+                }
+            }
+            
+            
+
             ImGui_ImplSDL3_ProcessEvent(&event);
         }
 
@@ -329,11 +363,7 @@ int main(int argc, char* argv[]) {
         // === ImGui Frame ===
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplSDL3_NewFrame();
-        ImGui::NewFrame();
-
-        if (!selected_clip && !clips.empty()) {
-            selected_clip = &clips[0];
-        }        
+        ImGui::NewFrame();     
 
         ImGui::Begin("FFmpeg Video Editor");
         ImGui::Text("Drag and drop a video file or enter the file path:");
@@ -398,7 +428,7 @@ int main(int argc, char* argv[]) {
 
             ImGui::SeparatorText("Trimming");
 
-            ImGui::InputFloat("Trim Start",  &selected_clip->trim_start, 0.1f);
+            ImGui::InputFloat("Trim Start",  &selected_clip->media_start, 0.1f);
             ImGui::InputInt("Duration",      &selected_clip->duration);
 
             ImGui::SeparatorText("Layering");
@@ -449,7 +479,7 @@ void DrawTimelineEditor(
     ImGui::Begin("Timeline Editor");
 
     float timeline_width = ImGui::GetContentRegionAvail().x;
-    const float resize_edge_area = 10.0f; // Larger area for resizing
+    const float resize_edge_area = 10.0f;
     const float move_area_width = 20.0f;
     const float layer_height = 60.0f;
     const float layer_padding = 10.0f;
@@ -465,31 +495,24 @@ void DrawTimelineEditor(
     ImGui::Text("Timeline:");
     ImGui::Separator();
 
-    // Zoom controls
-    if (ImGui::Button("Zoom In")) {
-        zoom_factor *= 1.1f;
-    }
+    if (ImGui::Button("Zoom In")) zoom_factor *= 1.1f;
     ImGui::SameLine();
     if (ImGui::Button("Zoom Out")) {
         zoom_factor /= 1.1f;
         max_duration *= 1.1f;
     }
 
-    // Calculate the maximum duration of all clips
     for (const auto& clip : clips) {
-
         max_duration = std::max(max_duration, clip.start_time + clip.duration);
     }
 
     int timeline_size = max_duration / zoom_factor;
 
-    // Draw background bar for the timeline
     ImVec2 timeline_start = ImGui::GetCursorScreenPos();
     ImVec2 timeline_end = ImVec2(timeline_start.x + timeline_width, timeline_start.y + timeline_height);
     ImDrawList* draw_list = ImGui::GetWindowDrawList();
     draw_list->AddRectFilled(timeline_start, timeline_end, IM_COL32(100, 100, 100, 255));
 
-    // Draw layer separators
     for (int layer = 0; layer < max_layer; ++layer) {
         float y = timeline_start.y + layer * (layer_height + layer_padding);
         draw_list->AddLine(ImVec2(timeline_start.x, y), ImVec2(timeline_end.x, y), IM_COL32(255, 255, 255, 255));
@@ -500,40 +523,51 @@ void DrawTimelineEditor(
     static bool resizing_left = false;
     static bool resizing_right = false;
 
-    // Draw clips on the timeline
+    // Deselect if clicked empty space
+    bool clicked_on_clip = false;
+
     for (size_t i = 0; i < clips.size(); ++i) {
         auto& clip = clips[i];
 
-        // Calculate the vertical position based on the layer
         float layer_offset_y = clip.layer * (layer_height + layer_padding);
-
-        // Convert the clip's start time and duration to screen space
         float clip_start_x = timeline_start.x + (float(clip.start_time) / max_duration) * timeline_width * zoom_factor;
         float clip_end_x = clip_start_x + (float(clip.duration) / max_duration) * timeline_width * zoom_factor;
 
-         // Clip rectangle
         ImVec2 clip_rect_min = ImVec2(clip_start_x, timeline_start.y + layer_offset_y + layer_padding);
         ImVec2 clip_rect_max = ImVec2(clip_end_x, timeline_start.y + layer_offset_y + layer_height);
 
-        // Draw the clip's background
+        // Draw base and border
         draw_list->AddRectFilled(clip_rect_min, clip_rect_max, IM_COL32(255, 100, 100, 255));
-
-        // Highlight the borders
         draw_list->AddRect(clip_rect_min, clip_rect_max, IM_COL32(255, 255, 255, 255));
 
-        // Add draggable area in the center of the clip
-        ImVec2 drag_area_start = ImVec2(clip_start_x + move_area_width, timeline_start.y + layer_offset_y + layer_padding);
-        ImVec2 drag_area_end = ImVec2(clip_end_x - move_area_width, timeline_start.y + layer_offset_y + layer_height);
+        // Highlight selected
+        if (&clip == selected_clip) {
+            draw_list->AddRect(clip_rect_min, clip_rect_max, IM_COL32(255, 255, 0, 255), 0.0f, 0, 3.0f);
+            clip.selected = true;
+        } else {
+            clip.selected = false;
+        }
+
+        // Only select if not dragging or resizing
+        bool hovering_entire_clip = ImGui::IsMouseHoveringRect(clip_rect_min, clip_rect_max);
+        if (!resizing_left && !resizing_right && dragging_clip_index == -1 &&
+            hovering_entire_clip && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            selected_clip = &clip;
+            clicked_on_clip = true;
+        }
+
+
+        // Dragging
+        ImVec2 drag_area_start = ImVec2(clip_start_x + move_area_width, clip_rect_min.y);
+        ImVec2 drag_area_end = ImVec2(clip_end_x - move_area_width, clip_rect_max.y);
         ImGui::SetCursorScreenPos(drag_area_start);
         ImGui::InvisibleButton(("clip_move" + std::to_string(i)).c_str(), ImVec2(drag_area_end.x - drag_area_start.x, layer_height - layer_padding));
 
-        // Indicate where to drag
         if (ImGui::IsItemHovered()) {
-            draw_list->AddRect(drag_area_start, drag_area_end, IM_COL32(255, 255, 0, 255));  // Yellow highlight
-            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);  // Change cursor to show dragging
+            draw_list->AddRect(drag_area_start, drag_area_end, IM_COL32(255, 255, 0, 255));
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
         }
 
-        // Make the clip draggable
         if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
             if (dragging_clip_index == -1 && !resizing_left && !resizing_right) {
                 dragging_clip_index = i;
@@ -541,61 +575,45 @@ void DrawTimelineEditor(
             }
 
             if (dragging_clip_index == i) {
-                // Get the mouse position
                 float mouse_x = ImGui::GetMousePos().x;
-
-                // Calculate the new start time based on the mouse position and offset
                 int new_start_time = int(((mouse_x - drag_offset_x - timeline_start.x) / timeline_width * zoom_factor) * max_duration);
-
-                // Ensure that the clip's start_time doesn't go negative
                 new_start_time = std::max(0, new_start_time);
-
-                // Make sure the clip doesn't exceed the end of the video
                 new_start_time = std::min(new_start_time, max_duration - clip.duration);
-
-                // Update the clip's start time
                 clip.start_time = new_start_time;
             }
         } else if (dragging_clip_index == i) {
             dragging_clip_index = -1;
         }
 
-          // Add resize handles for left and right edges
-        float resize_handle_size = 6.0f; // Size of the resize handles (small boxes)
-        ImVec2 left_handle_min = ImVec2(clip_start_x - resize_handle_size / 2, timeline_start.y + layer_offset_y + layer_padding);
-        ImVec2 left_handle_max = ImVec2(clip_start_x + resize_handle_size / 2, timeline_start.y + layer_offset_y + layer_height);
-        ImVec2 right_handle_min = ImVec2(clip_end_x - resize_handle_size / 2, timeline_start.y + layer_offset_y + layer_padding);
-        ImVec2 right_handle_max = ImVec2(clip_end_x + resize_handle_size / 2, timeline_start.y + layer_offset_y + layer_height);
+        // Resizing (left and right)
+        float resize_handle_size = 6.0f;
+        ImVec2 left_handle_min = ImVec2(clip_start_x - resize_handle_size / 2, clip_rect_min.y);
+        ImVec2 left_handle_max = ImVec2(clip_start_x + resize_handle_size / 2, clip_rect_max.y);
+        ImVec2 right_handle_min = ImVec2(clip_end_x - resize_handle_size / 2, clip_rect_min.y);
+        ImVec2 right_handle_max = ImVec2(clip_end_x + resize_handle_size / 2, clip_rect_max.y);
 
-        draw_list->AddRectFilled(left_handle_min, left_handle_max, IM_COL32(255, 255, 255, 255));  // White resize handle
-        draw_list->AddRectFilled(right_handle_min, right_handle_max, IM_COL32(255, 255, 255, 255));  // White resize handle
+        draw_list->AddRectFilled(left_handle_min, left_handle_max, IM_COL32(255, 255, 255, 255));
+        draw_list->AddRectFilled(right_handle_min, right_handle_max, IM_COL32(255, 255, 255, 255));
 
-        // Left edge resizing
+        // Left resize
         ImGui::SetCursorScreenPos(left_handle_min);
         ImGui::InvisibleButton(("clip_resize_left" + std::to_string(i)).c_str(), ImVec2(resize_handle_size, layer_height - layer_padding));
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);  // Show resize cursor for left edge
-        }
+        if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+
         if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
             if (!resizing_right) {
                 resizing_left = true;
-                // Get the mouse position
                 float mouse_x = ImGui::GetMousePos().x;
-
-                // Calculate the new start time and duration based on the mouse position
                 int new_start_time = int(((mouse_x - timeline_start.x) / timeline_width * zoom_factor) * max_duration);
                 int new_duration = clip.duration + (clip.start_time - new_start_time);
-
-                // Ensure that the clip's start_time doesn't go negative
                 new_start_time = std::max(0, new_start_time);
+                new_duration = std::max(1, std::min(max_duration - new_start_time, new_duration));
+                
+                int delta = new_start_time - clip.start_time;
 
-                // Ensure duration is not negative
-                new_duration = std::max(1, new_duration);
-
-                // Ensure the duration does not exceed the video duration
-                new_duration = std::min(max_duration - new_start_time, new_duration);
-
-                // Update the clip's start time and duration
+                if (delta > 0) {
+                    clip.media_start += delta;
+                }
                 clip.start_time = new_start_time;
                 clip.duration = new_duration;
             }
@@ -603,40 +621,27 @@ void DrawTimelineEditor(
             resizing_left = false;
         }
 
-        // Right edge resizing
+        // Right resize
         ImGui::SetCursorScreenPos(right_handle_min);
         ImGui::InvisibleButton(("clip_resize_right" + std::to_string(i)).c_str(), ImVec2(resize_handle_size, layer_height - layer_padding));
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);  // Show resize cursor for right edge
-        }
+        if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+
         if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
             if (!resizing_left) {
                 resizing_right = true;
-                // Get the mouse position
                 float mouse_x = ImGui::GetMousePos().x;
-
-                // Calculate the new duration based on the mouse position
                 int new_duration = int(((mouse_x - clip_start_x) / timeline_width / zoom_factor) * max_duration);
-
-                // Ensure the duration stays within bounds
-                new_duration = std::min(int((max_duration - clip.start_time) ), new_duration);
-
-                // Ensure duration is not negative
-                new_duration = std::max(1, new_duration);
-  
-                // Update the clip's duration
+                new_duration = std::max(1, std::min(max_duration - clip.start_time, new_duration));
                 clip.duration = new_duration;
             }
         } else if (resizing_right) {
             resizing_right = false;
         }
 
-        // Layer selection
-        ImGui::SetCursorScreenPos(ImVec2(clip_start_x, timeline_start.y + layer_offset_y + layer_height + 5));
+        // Layer buttons
+        ImGui::SetCursorScreenPos(ImVec2(clip_start_x, clip_rect_max.y + 5));
         ImGui::Text("Layer:");
         ImGui::SameLine();
-        std::string layer_id = "##layer" + std::to_string(i);
-        ImGui::SetCursorScreenPos(ImVec2(clip_start_x + 50, timeline_start.y + layer_offset_y + layer_height + 5));
         if (ImGui::Button(("<##" + std::to_string(i)).c_str())) {
             clip.layer = std::max(0, clip.layer - 1);
             layers_changed = true;
@@ -648,25 +653,30 @@ void DrawTimelineEditor(
         }
     }
 
+    // Deselect if clicked outside any clips
+    if (!clicked_on_clip && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && ImGui::IsWindowHovered()) {
+        selected_clip = nullptr;
+    }
+
     ImGui::Separator();
     ImGui::Text("Playhead Position: %d seconds", playhead_position);
-
-    // Playhead position slider
     ImGui::SliderInt("Playhead", &playhead_position, 0, max_duration);
-
     ImGui::End();
 
-    // Active Clips List
     ImGui::Begin("Active Clips");
     ImGui::Text("Clip List:");
     ImGui::Separator();
 
     for (size_t i = 0; i < clips.size(); ++i) {
         auto& clip = clips[i];
+        if (&clip == selected_clip)
+            ImGui::TextColored(ImVec4(1, 1, 0, 1), "->");
+        ImGui::SameLine();
         ImGui::Text("%zu: %s (Start: %d, Duration: %d, Layer: %d)", i, clip.name.c_str(), clip.start_time, clip.duration, clip.layer);
         if (ImGui::Button(("Delete##" + std::to_string(i)).c_str())) {
+            if (selected_clip == &clip) selected_clip = nullptr;
             clips.erase(clips.begin() + i);
-            break; // Avoid iterating over a modified vector
+            break;
         }
     }
 

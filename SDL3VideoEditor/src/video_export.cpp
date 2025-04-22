@@ -236,111 +236,98 @@ bool init_video(GLResources& res, const std::string& path) {
     return true;
 }
 
-// Replace seek_video_frame with this improved function
 bool update_video_frame(VideoData& video, float target_time_seconds) {
-    // Initialize time_base if not set
+    // Make sure time base is initialized
     if (video.time_base == 0) {
         video.time_base = av_q2d(video.format_ctx->streams[video.video_stream_idx]->time_base);
     }
-    
-    // Reset if we need to go backward or if we're at EOF
-    double target_pts = target_time_seconds / video.time_base;
-    if (target_pts < video.current_pts || video.reached_eof) {
-        // Seek to beginning
-        int ret = av_seek_frame(video.format_ctx, video.video_stream_idx, 0, AVSEEK_FLAG_BACKWARD);
+
+    // Convert target time in seconds to stream time base using av_rescale_q
+    int64_t seek_target = av_rescale_q(
+        static_cast<int64_t>(target_time_seconds * AV_TIME_BASE),
+        AVRational{1, AV_TIME_BASE},
+        video.format_ctx->streams[video.video_stream_idx]->time_base
+    );
+
+    // Seek if target is before current or we reached EOF
+    if (target_time_seconds < video.current_pts || video.reached_eof) {
+        int ret = av_seek_frame(video.format_ctx, video.video_stream_idx, seek_target, AVSEEK_FLAG_BACKWARD);
         if (ret < 0) {
-            std::cerr << "Error seeking to beginning of video" << std::endl;
+            std::cerr << "Error seeking to time: " << target_time_seconds << std::endl;
             return false;
         }
+
         avcodec_flush_buffers(video.codec_ctx);
         video.current_pts = 0;
         video.frames_read = 0;
         video.reached_eof = false;
-        
-        // If target is 0, we're done
-        if (target_time_seconds <= 0) {
-            return true;
-        }
     }
-    
-    // Read frames until we reach target time
+
     bool frame_updated = false;
-    
+
     while (!frame_updated && !video.reached_eof) {
         int ret = av_read_frame(video.format_ctx, video.packet);
         if (ret < 0) {
             if (ret == AVERROR_EOF) {
                 video.reached_eof = true;
-                
-                // Flush buffered frames
                 avcodec_send_packet(video.codec_ctx, nullptr);
             } else {
-                std::cerr << "Error reading frame" << std::endl;
+                std::cerr << "Error reading frame\n";
                 return false;
             }
         } else if (video.packet->stream_index != video.video_stream_idx) {
-            // Not a video packet
             av_packet_unref(video.packet);
             continue;
         } else {
-            // Send the packet to the decoder
             ret = avcodec_send_packet(video.codec_ctx, video.packet);
+            av_packet_unref(video.packet);
             if (ret < 0) {
-                std::cerr << "Error sending packet to decoder" << std::endl;
-                av_packet_unref(video.packet);
+                std::cerr << "Error sending packet\n";
                 return false;
             }
-            av_packet_unref(video.packet);
         }
-        
-        // Try to receive a frame
+
         while (true) {
             ret = avcodec_receive_frame(video.codec_ctx, video.frame);
-            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-                break;
-            } else if (ret < 0) {
-                std::cerr << "Error receiving frame from decoder" << std::endl;
+            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
+            if (ret < 0) {
+                std::cerr << "Error receiving frame\n";
                 return false;
             }
-            
-            // Get the PTS (presentation timestamp)
+
             double pts = 0;
             if (video.frame->pts != AV_NOPTS_VALUE) {
                 pts = video.frame->pts * video.time_base;
             } else {
-                // If no PTS, estimate based on frame count
                 pts = video.frames_read * (1.0 / av_q2d(video.format_ctx->streams[video.video_stream_idx]->r_frame_rate));
             }
-            
+
             video.current_pts = pts;
             video.frames_read++;
-            
-            // Check if we've reached or passed our target time
+
             if (pts >= target_time_seconds || video.reached_eof) {
-                // Convert the frame to RGB
                 sws_scale(video.sws_ctx, video.frame->data, video.frame->linesize, 0,
                           video.height, video.frame_rgb->data, video.frame_rgb->linesize);
-                
-                // Update texture
+
                 glBindTexture(GL_TEXTURE_2D, video.texture_id);
                 glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, video.width, video.height,
-                               GL_RGB, GL_UNSIGNED_BYTE, video.frame_rgb->data[0]);
-                
+                                GL_RGB, GL_UNSIGNED_BYTE, video.frame_rgb->data[0]);
+
                 GLenum err = glGetError();
                 if (err != GL_NO_ERROR) {
                     std::cerr << "OpenGL error when updating texture: " << err << std::endl;
                     return false;
                 }
-                
+
                 frame_updated = true;
                 break;
             }
         }
     }
-    
-    // If we've read at least one frame, consider it a success
-    return video.frames_read > 0;
+
+    return frame_updated;
 }
+
 
 // Update load_textures function to handle both images and videos
 void load_textures(GLResources& res, const std::vector<Clip>& clips) {
@@ -505,14 +492,14 @@ void render_frame(GLResources& res, float current_time,
                 auto video_it = res.video_cache.find(clip.path);
                 if (video_it != res.video_cache.end() && video_it->second.is_initialized) {
                     // Calculate the video-local time
-                    float clip_time = current_time - clip.start_time;
+                    float clip_time = current_time - clip.start_time + clip.media_start;
                     // If it's a video clip, update the frame based on the current time
                     if (is_video_file(clip.path)) {
                         auto video_it = res.video_cache.find(clip.path);
                         if (video_it != res.video_cache.end() && video_it->second.is_initialized) {
                             // Calculate the video-local time
                             float clip_time = current_time - clip.start_time;
-                            if (!update_video_frame(video_it->second, clip_time)) {
+                            if (!update_video_frame(video_it->second, clip_time + clip.media_start)) {
                                 std::cerr << "Failed to update frame at time " << clip_time << " for " << clip.path << std::endl;
                                 continue;
                             }
@@ -589,7 +576,7 @@ void cleanup_video_resources(GLResources& res) {
 }
 
 
-bool preload_audio_file(const std::string& path, PreloadedAudio& out) {
+bool preload_audio_file(const std::string& path, PreloadedAudio& out, float media_start = 0.0f, float media_duration = -1.0f) {
     AVFormatContext* fmt_ctx = nullptr;
     if (avformat_open_input(&fmt_ctx, path.c_str(), nullptr, nullptr) < 0) {
         std::cerr << "Failed to open input: " << path << "\n";
@@ -626,10 +613,22 @@ bool preload_audio_file(const std::string& path, PreloadedAudio& out) {
     av_opt_set_sample_fmt(swr, "out_sample_fmt", AV_SAMPLE_FMT_S16, 0);
     swr_init(swr);
 
+    // Seek to media_start
+    if (media_start > 0.0f) {
+        int64_t seek_target = av_rescale_q(media_start * AV_TIME_BASE, AVRational{1, AV_TIME_BASE}, fmt_ctx->streams[stream_index]->time_base);
+        av_seek_frame(fmt_ctx, stream_index, seek_target, AVSEEK_FLAG_BACKWARD);
+        avcodec_flush_buffers(codec_ctx);
+    }
+
     AVPacket* pkt = av_packet_alloc();
     AVFrame* frame = av_frame_alloc();
 
     std::vector<int16_t> full_audio;
+
+    float current_time = 0.0f;
+    float target_end = (media_duration > 0.0f) ? (media_start + media_duration) : std::numeric_limits<float>::max();
+    float time_base = av_q2d(fmt_ctx->streams[stream_index]->time_base);
+
     while (av_read_frame(fmt_ctx, pkt) >= 0) {
         if (pkt->stream_index != stream_index) {
             av_packet_unref(pkt);
@@ -640,26 +639,35 @@ bool preload_audio_file(const std::string& path, PreloadedAudio& out) {
         av_packet_unref(pkt);
 
         while (avcodec_receive_frame(codec_ctx, frame) == 0) {
+            float pts = (frame->pts != AV_NOPTS_VALUE) ? frame->pts * time_base : current_time;
+
+            if (pts < media_start) {
+                continue; // skip early frames
+            }
+            if (pts > target_end) {
+                goto done; // break both loops
+            }
+
             int out_nb_samples = av_rescale_rnd(
                 swr_get_delay(swr, codec_ctx->sample_rate) + frame->nb_samples,
-                44100,
-                codec_ctx->sample_rate,
-                AV_ROUND_UP
-            );
+                44100, codec_ctx->sample_rate, AV_ROUND_UP);
 
             std::vector<int16_t> temp(out_nb_samples * 2);
-            uint8_t* out[] = { (uint8_t*)temp.data() };
-            int samples = swr_convert(swr, out, out_nb_samples, (const uint8_t**)frame->data, frame->nb_samples);
+            uint8_t* out_data[] = { (uint8_t*)temp.data() };
+            int samples = swr_convert(swr, out_data, out_nb_samples, (const uint8_t**)frame->data, frame->nb_samples);
             if (samples > 0) {
                 full_audio.insert(full_audio.end(), temp.begin(), temp.begin() + samples * 2);
             }
+
+            current_time = pts + (float)samples / 44100.0f;
         }
     }
 
+done:
     out.samples = std::move(full_audio);
     out.sample_rate = 44100;
     out.channels = 2;
-    out.duration = (float)out.samples.size() / (2 * 44100);
+    out.duration = (float)out.samples.size() / (2.0f * 44100.0f); // stereo
 
     av_channel_layout_uninit(&stereo);
     av_frame_free(&frame);
@@ -669,6 +677,7 @@ bool preload_audio_file(const std::string& path, PreloadedAudio& out) {
     avformat_close_input(&fmt_ctx);
     return true;
 }
+
 
 void mix_audio_from_memory(const PreloadedAudio& audio, float time_sec, std::vector<float>& mix_buffer) {
     int start_sample = static_cast<int>(time_sec * audio.sample_rate);
@@ -719,7 +728,7 @@ bool start_video_export(const std::string& output_path, int width, int height, i
     for (const auto& clip : sorted_clips) {
         if (is_video_file(clip.path)) {
             PreloadedAudio preload;
-            if (preload_audio_file(clip.path, preload)) {
+            if (preload_audio_file(clip.path, preload, clip.media_start, clip.duration)) {
                 res.preloaded_audio[clip.path] = std::move(preload);
             } else {
                 std::cerr << "Failed to preload audio for " << clip.path << std::endl;

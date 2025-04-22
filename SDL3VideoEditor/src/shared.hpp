@@ -10,8 +10,7 @@ struct Clip {
     
     std::string path;
 
-    float trim_start = 0.0f; // where in the source video to start
-    float trim_end = 0.0f;   // where to stop in the source (optional, or derived)
+    float media_start = 0.0f; // where in the source video to start
 
     // Transform attributes
     float pos_x = 0.0f;      // normalized [-1, 1] or pixel values (we can decide)
