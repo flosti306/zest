@@ -13,6 +13,7 @@ extern "C" {
     #include <libavutil/pixdesc.h>
     #include <libavutil/channel_layout.h>
     #include <glad/glad.h>
+    #include <tinyfiledialogs.h>
 }
 #include <imgui.h>
 #include <imgui_impl_sdl3.h>
@@ -34,6 +35,7 @@ extern "C" {
 
 #include "video_export.hpp"
 #include "shared.hpp"
+#include "project_io.hpp"
 
 /* TODO
 
@@ -407,6 +409,45 @@ int main(int argc, char* argv[]) {
         }
 
         ImGui::TextWrapped("Status: %s", process_message.c_str());
+
+        ImGui::Separator();
+
+        if (ImGui::Button("Save Project")) {
+            const char* filters[] = { "*.zest" };
+            const char* save_path = tinyfd_saveFileDialog(
+                "Save Project", "project.zest", 1, filters, "Zest Project Files (*.zest)"
+            );
+
+            if (save_path && SaveProject(save_path, clips, playhead_time, zoom_factor)) {
+                process_message = "Project saved!";
+                std::cout << "Project saved to: " << save_path << "\n";
+            } else if (save_path) {
+                std::cerr << "Failed to save project\n";
+                process_message = "Failed to save project!";
+            }
+        }
+        ImGui::SameLine();
+
+        if (ImGui::Button("Load Project")) {
+            const char* filters[] = { "*.zest" };
+            const char* load_path = tinyfd_openFileDialog(
+                "Load Project", "", 1, filters, "Zest Project Files (*.zest)", 0
+            );
+
+            if (load_path && LoadProject(load_path, clips, playhead_time, zoom_factor)) {
+                load_textures(gl_resources, clips);
+                UpdatePreview(gl_resources, clips, preview_width, preview_height, playhead_time);
+                layers_changed = true;
+                process_message = "Project loaded!";
+                std::cout << "Project loaded from: " << load_path << "\n";
+            } else if (load_path) {
+                std::cerr << "Failed to load project\n";
+                process_message = "Failed to load project!";
+            }
+        }
+
+
+
         ImGui::End();
 
         ImGui::Begin("Timeline");
@@ -766,7 +807,7 @@ void DrawTimelineEditor(
         if (&clip == selected_clip)
             ImGui::TextColored(ImVec4(1, 1, 0, 1), "->");
         ImGui::SameLine();
-        ImGui::Text("%zu: %s (Start: %d, Duration: %d, Layer: %d)", i, clip.name.c_str(), clip.start_time, clip.duration, clip.layer);
+        ImGui::Text("%zu: %s (Start: %f, Duration: %f, Layer: %d)", i, clip.name.c_str(), clip.start_time, clip.duration, clip.layer);
         if (ImGui::Button(("Delete##" + std::to_string(i)).c_str())) {
             if (selected_clip == &clip) selected_clip = nullptr;
             clips.erase(clips.begin() + i);

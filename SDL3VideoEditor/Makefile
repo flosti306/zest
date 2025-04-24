@@ -10,12 +10,15 @@ LIB_DIRS = -Llib/ffmpeg -Llib
 # Link libraries
 LIBS = -lavformat -lavcodec -lavutil -lswscale -lswresample -lavfilter \
        -lSDL3 -lSDL3_image \
-       -lopengl32 -lbcrypt -lsecur32 -lws2_32
+       -lopengl32 -lbcrypt -lsecur32 -lws2_32 \
+	   -lole32 -luuid -lcomdlg32
 
 # Source files
 SRC = $(wildcard src/*.cpp) $(wildcard imgui/*.cpp)
 SRC := $(filter-out src/main_old.cpp, $(SRC))
 SRC += src/glad.c
+SRC += src/miniz.c
+SRC += src/tinyfiledialogs.c
 
 # Object files from both .cpp and .c
 OBJ = $(SRC:.cpp=.o)
