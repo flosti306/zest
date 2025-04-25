@@ -1,6 +1,21 @@
 #include <vector>
 #include <algorithm>
+#include <iostream>
+#include <string>
+#include <sstream>
+#include <filesystem>
+#include <cstdio>
+#include <cstdlib> // For system()
+#include <regex>
+#include <fstream> // For std::ofstream
+#include <atomic>  // For layers_changed, playing
+#include <cmath>   // For std::abs
+#include <map>     // For GLResources caches
+#include <deque>   // For VideoData frame_cache
+#include <mutex>   // For potential future threading
+#include <limits>  // For numeric_limits
 
+// External C libraries (FFmpeg, glad, tinyfiledialogs)
 extern "C" {
     #include <libavformat/avformat.h>
     #include <libavcodec/avcodec.h>
@@ -12,131 +27,78 @@ extern "C" {
     #include <libavfilter/buffersrc.h>
     #include <libavutil/pixdesc.h>
     #include <libavutil/channel_layout.h>
+    #include <libavutil/error.h> // For av_err2str
+    #include <libavutil/imgutils.h> // For av_image_* functions
     #include <glad/glad.h>
     #include <tinyfiledialogs.h>
 }
+
+// C++ libraries (ImGui, SDL3)
 #include <imgui.h>
 #include <imgui_impl_sdl3.h>
-#include <imgui_impl_sdlrenderer3.h>
 #include <imgui_impl_opengl3.h>
-#include <SDL.h>
-#include <SDL_video.h>
-#include <SDL_image.h>
-#include <SDL_render.h>
-#include <SDL_image.h>
-#include <iostream>
-#include <string>
-#include <sstream>
-#include <filesystem>
-#include <cstdio>
-#include <cstdlib> // for system()
-#include <regex>
-#include <fstream> // for std::ofstream
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_video.h>
+#include <SDL3/SDL_image.h> // Use SDL_image for SDL3
 
-#include "video_export.hpp"
+// Project headers
+#include "video_export.hpp" // Include AFTER system headers and glad/imgui
 #include "shared.hpp"
 #include "project_io.hpp"
 
-/* TODO
-
-Fix Layer export
-Fix whitespace export
-Add Frames for the timing
-Preview
-Zoom (resizing)
-Docking
-UI
-
-
-*/
-
+// Global gradient data storage (used by ApplyWindowBackgroundGradients)
 struct GradientData {
     ImVec4 window_grad_top;
     ImVec4 window_grad_bottom;
 };
 
-struct StreamContext {
-    AVFormatContext* fmt_ctx = nullptr;
-    AVCodecContext* dec_ctx = nullptr;
-    int stream_idx = -1;
-    AVFrame* frame = nullptr;
-    AVPacket* pkt = nullptr;
-    int64_t next_pts = 0;
-};
-
-struct OutputStream {
-    AVStream* stream = nullptr;
-    AVCodecContext* enc_ctx = nullptr;
-    SwsContext* sws_ctx = nullptr;
-    SwrContext* swr_ctx = nullptr;
-    int64_t next_pts = 0;
-};
-
-struct StreamState {
-    int64_t next_video_dts = AV_NOPTS_VALUE;
-    int64_t next_audio_dts = AV_NOPTS_VALUE;
-};
-std::vector<StreamState> stream_states;
-
 // === Playback state ===
-bool playing = false;
+std::atomic<bool> playing = false;
 float playhead_time = 0.0f;
-Uint64 last_playback_time = SDL_GetTicksNS();
+Uint64 last_frame_ticks = 0; // Use SDL_GetTicks for frame delta calculation
 
 int preview_width = 1280;
 int preview_height = 720;
 
-Clip* selected_clip = nullptr;
+Clip* selected_clip = nullptr; // Keep track of selected clip
 
-// Error checking macro
+// Error checking macros
 #define CHECK_AV_ERROR(ret, message) \
     if (ret < 0) { \
         char errbuf[AV_ERROR_MAX_STRING_SIZE]; \
         av_make_error_string(errbuf, sizeof(errbuf), ret); \
-        std::cerr << "ERROR: " << message << ": " << errbuf << std::endl; \
+        std::cerr << "ERROR: " << message << ": " << errbuf << " (code " << ret << ")" << std::endl; \
         std::cerr << "At " << __FILE__ << ":" << __LINE__ << std::endl; \
-        return false; \
+        /* Consider returning false or throwing an exception */ \
     }
 
 #define FFMPEG_CHECK(condition, message) \
 if (condition) { \
     std::cerr << "Error: " << message << std::endl; \
-    return false; \
+    /* Consider returning false or throwing an exception */ \
 }
 
-// Forward declaration
-void DrawTimelineEditor(
-    std::vector<Clip>& clips,
-    float& playhead_time,
-    float& max_duration,
-    float& zoom_factor,
-    bool& layers_changed
-);
-
-void UpdatePreview(GLResources& res, const std::vector<Clip>& clips, int width, int height, float playhead_time);
-
-void RenderPreviewWindow(GLuint preview_tex, int preview_width, int preview_height);
-
+// --- ImGui Styling and Custom Rendering ---
 
 void SetupImGuiStyle() {
     ImGuiStyle& style = ImGui::GetStyle();
     ImVec4* colors = style.Colors;
-    
+
     // Refined color palette with enhanced visual clarity
     ImVec4 bg_dark          = ImVec4(0.13f, 0.12f, 0.15f, 1.00f); // Darker base for gradient
     ImVec4 bg_light         = ImVec4(0.17f, 0.16f, 0.19f, 1.00f); // Lighter top for gradient
     ImVec4 bg_alt           = ImVec4(0.15f, 0.15f, 0.17f, 1.00f);
-    
+
     // Refined orange tones for better clarity and distinction
     ImVec4 accent           = ImVec4(1.00f, 0.56f, 0.15f, 1.00f); // More vibrant base orange
     ImVec4 accent_hover     = ImVec4(1.00f, 0.67f, 0.25f, 1.00f); // Brighter, more distinct hover
     ImVec4 accent_active    = ImVec4(1.00f, 0.42f, 0.00f, 1.00f); // Deeper, richer active state
     ImVec4 accent_muted     = ImVec4(0.85f, 0.48f, 0.12f, 1.00f); // Muted orange for secondary elements
-    
+
     ImVec4 text             = ImVec4(0.98f, 0.98f, 0.98f, 1.00f);
     ImVec4 text_secondary   = ImVec4(0.80f, 0.80f, 0.80f, 1.00f);
     ImVec4 frame_bg         = ImVec4(0.16f, 0.16f, 0.18f, 1.00f);
-    
+
     // Apply the new color palette
     colors[ImGuiCol_Text]                  = text;
     colors[ImGuiCol_TextDisabled]          = ImVec4(0.60f, 0.60f, 0.60f, 1.00f);
@@ -151,7 +113,7 @@ void SetupImGuiStyle() {
     colors[ImGuiCol_TitleBg]               = bg_alt;
     colors[ImGuiCol_TitleBgActive]         = accent_muted;
     colors[ImGuiCol_TitleBgCollapsed]      = ImVec4(bg_dark.x, bg_dark.y, bg_dark.z, 0.75f);
-    colors[ImGuiCol_MenuBarBg]             = ImVec4(0.18f, 0.18f, 0.21f, 1.00f);
+    colors[ImGuiCol_MenuBarBg]             = ImVec4(0.12f, 0.12f, 0.15f, 1.00f);
     colors[ImGuiCol_ScrollbarBg]           = ImVec4(0.18f, 0.18f, 0.21f, 0.80f);
     colors[ImGuiCol_ScrollbarGrab]         = ImVec4(0.35f, 0.35f, 0.37f, 1.00f);
     colors[ImGuiCol_ScrollbarGrabHovered]  = accent_hover;
@@ -188,7 +150,7 @@ void SetupImGuiStyle() {
     colors[ImGuiCol_NavWindowingHighlight] = ImVec4(1.00f, 1.00f, 1.00f, 0.70f);
     colors[ImGuiCol_NavWindowingDimBg]     = ImVec4(0.80f, 0.80f, 0.80f, 0.20f);
     colors[ImGuiCol_ModalWindowDimBg]      = ImVec4(0.10f, 0.10f, 0.10f, 0.65f);
-    
+
     // Style adjustments for a premium look
     style.WindowPadding     = ImVec2(8, 8);
     style.WindowRounding    = 6.0f;
@@ -207,10 +169,11 @@ void SetupImGuiStyle() {
     style.FrameBorderSize   = 0.0f;
     style.PopupRounding     = 5.0f;
     style.Alpha             = 1.0f;
-    
+
     // Store gradient colors in user data for later use
-    // We'll store them as floats in ImGui's UserData (if you have space available)
-    ImGui::GetIO().UserData = IM_NEW(GradientData)();
+    if (!ImGui::GetIO().UserData) {
+        ImGui::GetIO().UserData = IM_NEW(GradientData)();
+    }
     GradientData* gradient_data = (GradientData*)ImGui::GetIO().UserData;
     gradient_data->window_grad_top = bg_light;
     gradient_data->window_grad_bottom = bg_dark;
@@ -221,12 +184,9 @@ GLuint CreateGradientTexture(ImVec4 top_color, ImVec4 bottom_color, int height =
     GLuint texture_id;
     glGenTextures(1, &texture_id);
     glBindTexture(GL_TEXTURE_2D, texture_id);
-    
-    // Create a 2D texture with dithering
-    const int width = 32; // Wider for better dithering pattern
+
+    const int width = 32;
     unsigned char* data = new unsigned char[width * height * 4];
-    
-    // Bayer dithering matrix 8x8
     const float bayer8x8[64] = {
         0/64.0f,  32/64.0f,  8/64.0f, 40/64.0f,  2/64.0f, 34/64.0f, 10/64.0f, 42/64.0f,
         48/64.0f, 16/64.0f, 56/64.0f, 24/64.0f, 50/64.0f, 18/64.0f, 58/64.0f, 26/64.0f,
@@ -237,38 +197,26 @@ GLuint CreateGradientTexture(ImVec4 top_color, ImVec4 bottom_color, int height =
         15/64.0f, 47/64.0f,  7/64.0f, 39/64.0f, 13/64.0f, 45/64.0f,  5/64.0f, 37/64.0f,
         63/64.0f, 31/64.0f, 55/64.0f, 23/64.0f, 61/64.0f, 29/64.0f, 53/64.0f, 21/64.0f
     };
-    
-    // Dithering strength - adjust as needed
     const float dither_strength = 1.0f/255.0f * 1.5f;
-    
+
     for (int y = 0; y < height; y++) {
         float t = (float)y / (float)(height - 1);
-        // Improved easing function
         float eased_t = t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
-        
-        // Blend colors in linear space for perceptual correctness
         ImVec4 col_mix;
         col_mix.x = powf(powf(bottom_color.x, 2.2f) * (1.0f - eased_t) + powf(top_color.x, 2.2f) * eased_t, 1.0f/2.2f);
         col_mix.y = powf(powf(bottom_color.y, 2.2f) * (1.0f - eased_t) + powf(top_color.y, 2.2f) * eased_t, 1.0f/2.2f);
         col_mix.z = powf(powf(bottom_color.z, 2.2f) * (1.0f - eased_t) + powf(top_color.z, 2.2f) * eased_t, 1.0f/2.2f);
         col_mix.w = bottom_color.w * (1.0f - eased_t) + top_color.w * eased_t;
-        
         for (int x = 0; x < width; x++) {
-            // Apply dithering pattern
             int pattern_x = x % 8;
             int pattern_y = y % 8;
             float dither_value = bayer8x8[pattern_y * 8 + pattern_x];
-            
-            // Apply dithering to each component
             float r = col_mix.x + (dither_value - 0.5f) * dither_strength;
             float g = col_mix.y + (dither_value - 0.5f) * dither_strength;
             float b = col_mix.z + (dither_value - 0.5f) * dither_strength;
-            
-            // Clamp values
-            r = r < 0.0f ? 0.0f : (r > 1.0f ? 1.0f : r);
-            g = g < 0.0f ? 0.0f : (g > 1.0f ? 1.0f : g);
-            b = b < 0.0f ? 0.0f : (b > 1.0f ? 1.0f : b);
-            
+            r = std::max(0.0f, std::min(1.0f, r));
+            g = std::max(0.0f, std::min(1.0f, g));
+            b = std::max(0.0f, std::min(1.0f, b));
             int idx = (y * width + x) * 4;
             data[idx + 0] = (unsigned char)(r * 255.0f);
             data[idx + 1] = (unsigned char)(g * 255.0f);
@@ -276,171 +224,205 @@ GLuint CreateGradientTexture(ImVec4 top_color, ImVec4 bottom_color, int height =
             data[idx + 3] = (unsigned char)(col_mix.w * 255.0f);
         }
     }
-    
-    // Upload to texture with proper dimensions
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
-    
-    // Use trilinear filtering
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    
-    // Generate mipmaps
     glGenerateMipmap(GL_TEXTURE_2D);
-    
     delete[] data;
+    glBindTexture(GL_TEXTURE_2D, 0);
     return texture_id;
 }
 
 void ApplyWindowBackgroundGradients() {
     static GLuint gradient_texture = 0;
-    static ImVec4 last_top_color = ImVec4(0,0,0,0);
-    static ImVec4 last_bottom_color = ImVec4(0,0,0,0);
-    
+    static ImVec4 last_top_color = ImVec4(-1,-1,-1,-1);
+    static ImVec4 last_bottom_color = ImVec4(-1,-1,-1,-1);
+
     GradientData* gradient_data = (GradientData*)ImGui::GetIO().UserData;
-    if (!gradient_data)
-        return;
-    
-    // Recreate texture if colors have changed
-    if (gradient_texture == 0 || 
+    if (!gradient_data) return;
+
+    if (gradient_texture == 0 ||
         memcmp(&last_top_color, &gradient_data->window_grad_top, sizeof(ImVec4)) != 0 ||
-        memcmp(&last_bottom_color, &gradient_data->window_grad_bottom, sizeof(ImVec4)) != 0) {
-        
-        if (gradient_texture != 0)
+        memcmp(&last_bottom_color, &gradient_data->window_grad_bottom, sizeof(ImVec4)) != 0)
+    {
+        if (gradient_texture != 0) {
             glDeleteTextures(1, &gradient_texture);
-            
+        }
         gradient_texture = CreateGradientTexture(gradient_data->window_grad_top, gradient_data->window_grad_bottom);
         last_top_color = gradient_data->window_grad_top;
         last_bottom_color = gradient_data->window_grad_bottom;
+        std::cout << "Recreated gradient texture." << std::endl;
     }
-    
-    // Now draw the texture
+
     ImDrawList* draw_list = ImGui::GetWindowDrawList();
-    if (!draw_list || gradient_texture == 0)
-        return;
-    
+    if (!draw_list || gradient_texture == 0) return;
+
     ImVec2 window_pos = ImGui::GetWindowPos();
     ImVec2 window_size = ImGui::GetWindowSize();
-    
-    // Convert OpenGL texture to ImGui texture ID
     ImTextureID tex_id = (ImTextureID)(intptr_t)gradient_texture;
-    
-    // Draw the texture stretched to cover the window
-    draw_list->AddImage(
-        tex_id,
-        window_pos,
-        ImVec2(window_pos.x + window_size.x, window_pos.y + window_size.y),
-        ImVec2(0, 0),
-        ImVec2(1, 1)
-    );
-    
-    // Add a subtle highlight at the top (optional)
-    draw_list->AddRectFilled(
-        ImVec2(window_pos.x, window_pos.y),
-        ImVec2(window_pos.x + window_size.x, window_pos.y + 1.5f),
-        IM_COL32(255, 255, 255, 15)
-    );
+    draw_list->AddImage(tex_id, window_pos, ImVec2(window_pos.x + window_size.x, window_pos.y + window_size.y), ImVec2(0, 0), ImVec2(1, 1), IM_COL32_WHITE);
 }
 
-
-
-void AddNewClip(std::vector<Clip>& clips, const std::string& input_path, float video_duration, int layer = 0) {
-    // Reserve space for 2 potential new clips
-    clips.reserve(clips.size() + 2);
-    
-    std::string base_name = std::filesystem::path(input_path).filename().string();
-    
-    // Create video clip
-    size_t video_index = clips.size();
-    clips.emplace_back();
-    Clip& video_clip = clips[video_index]; // Get reference that won't change
-    
-    video_clip.name = base_name + " [Video]";
-    video_clip.path = input_path;
-    video_clip.type = ClipType::Video;
-    video_clip.start_time = 0.0f;
-    video_clip.duration = video_duration;
-    video_clip.layer = layer;
-    
-    // Attempt to load audio
-    PreloadedAudio audio;
-    if (preload_audio_file(input_path, audio, 0.0f, video_duration)) {
-        size_t audio_index = clips.size();
-        clips.emplace_back();
-        Clip& audio_clip = clips[audio_index]; // Get reference that won't change
-        
-        audio_clip.name = base_name + " [Audio]";
-        audio_clip.path = input_path;
-        audio_clip.type = ClipType::Audio;
-        audio_clip.start_time = 0.0f;
-        audio_clip.duration = video_duration;
-        audio_clip.layer = layer;
-        audio_clip.waveform = std::move(audio.waveform);
-        
-        // Link both ways using pointers that are now safe (no reallocation will happen)
-        audio_clip.linked_clip = &clips[video_index];
-        video_clip.linked_clip = &clips[audio_index];
-    }
-}
-
-
-// Modified get_video_duration using FFmpeg
-float get_video_duration(const std::string& input_path) {
-    AVFormatContext* fmt_ctx = nullptr;
-    if (avformat_open_input(&fmt_ctx, input_path.c_str(), nullptr, nullptr) != 0) {
-        return -1;
-    }
-    
-    if (avformat_find_stream_info(fmt_ctx, nullptr) < 0) {
-        avformat_close_input(&fmt_ctx);
-        return -1;
-    }
-    
-    float duration = static_cast<float>(fmt_ctx->duration / AV_TIME_BASE);
-    avformat_close_input(&fmt_ctx);
-    return duration;
-}
-
-
-#ifndef AV_ERROR_MAX_STRING_SIZE
-#define AV_ERROR_MAX_STRING_SIZE 64
-#endif
-
-// Define av_err2str as a function instead of a macro for better compatibility
-#undef av_err2str
-static const char* av_err2str(int errnum) {
-    static char str[AV_ERROR_MAX_STRING_SIZE];
-    memset(str, 0, sizeof(str));
-    return av_make_error_string(str, AV_ERROR_MAX_STRING_SIZE, errnum);
-}
-
+// --- Docking Setup ---
 void RenderDockSpace() {
-    static ImGuiDockNodeFlags dockspace_flags = ImGuiDockNodeFlags_None;
+    static ImGuiDockNodeFlags dockspace_flags = ImGuiDockNodeFlags_PassthruCentralNode; // Allow background rendering
 
     ImGuiWindowFlags window_flags = ImGuiWindowFlags_MenuBar | ImGuiWindowFlags_NoDocking;
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(viewport->WorkPos);
     ImGui::SetNextWindowSize(viewport->WorkSize);
     ImGui::SetNextWindowViewport(viewport->ID);
-
-    window_flags |= ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse |
-                    ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove;
-    window_flags |= ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNavFocus;
-
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    window_flags |= ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove;
+    window_flags |= ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNavFocus;
 
+    if (dockspace_flags & ImGuiDockNodeFlags_PassthruCentralNode)
+        window_flags |= ImGuiWindowFlags_NoBackground;
+
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
     ImGui::Begin("DockSpace Demo", nullptr, window_flags);
-    ImGui::PopStyleVar(2);
+    ImGui::PopStyleVar(); // Pop WindowPadding
+    ImGui::PopStyleVar(2); // Pop Rounding, BorderSize
 
-    ImGuiID dockspace_id = ImGui::GetID("MyDockSpace");
-    ImGui::DockSpace(dockspace_id, ImVec2(0.0f, 0.0f), dockspace_flags);
+    ImGuiIO& io = ImGui::GetIO();
+    if (io.ConfigFlags & ImGuiConfigFlags_DockingEnable) {
+        ImGuiID dockspace_id = ImGui::GetID("MyDockSpace");
+        ImGui::DockSpace(dockspace_id, ImVec2(0.0f, 0.0f), dockspace_flags);
+    }
 
+    if (ImGui::BeginMenuBar()) {
+        if (ImGui::BeginMenu("File")) {
+            if (ImGui::MenuItem("Load Project...")) { /* Trigger load */ }
+            if (ImGui::MenuItem("Save Project...")) { /* Trigger save */ }
+            if (ImGui::MenuItem("Export Video...")) { /* Trigger export */ }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Exit")) {
+                 SDL_Event quit_event; quit_event.type = SDL_EVENT_QUIT; SDL_PushEvent(&quit_event);
+            }
+            ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("Edit")) {
+             ImGui::MenuItem("Undo", "CTRL+Z", nullptr, false);
+             ImGui::MenuItem("Redo", "CTRL+Y", nullptr, false);
+             ImGui::EndMenu();
+        }
+        ImGui::EndMenuBar();
+    }
     ImGui::End();
 }
 
+// --- Clip Management ---
+void AddNewClip(std::vector<Clip>& clips, const std::string& input_path, float video_duration, int layer, GLResources& res) {
+    Clip temp_clip;
+    temp_clip.path = input_path;
+    temp_clip.type = ClipType::Video;
+    load_resources_for_clip(res, temp_clip);
 
+    clips.reserve(clips.size() + 2);
+    std::string base_name = std::filesystem::path(input_path).filename().string();
+
+    size_t video_index = clips.size();
+    clips.emplace_back();
+    Clip& video_clip = clips[video_index];
+    video_clip.name = base_name + " [Video]";
+    video_clip.path = input_path;
+    video_clip.type = ClipType::Video;
+    video_clip.start_time = playhead_time;
+    video_clip.duration = video_duration;
+    video_clip.layer = layer;
+    video_clip.media_start = 0.0f;
+    video_clip.is_audio_only = false;
+    video_clip.opacity = 1.0f;
+    video_clip.scale = 1.0f;
+    video_clip.pos_x = 0.0f;
+    video_clip.pos_y = 0.0f;
+    video_clip.selected = false;
+
+    auto audio_it = res.preloaded_audio.find(input_path);
+    if (audio_it != res.preloaded_audio.end() && !audio_it->second.samples.empty()) {
+        size_t audio_index = clips.size();
+        clips.emplace_back();
+        Clip& audio_clip = clips[audio_index];
+        audio_clip.name = base_name + " [Audio]";
+        audio_clip.path = input_path;
+        audio_clip.type = ClipType::Audio;
+        audio_clip.start_time = video_clip.start_time;
+        audio_clip.duration = audio_it->second.duration;
+        audio_clip.layer = layer;
+        audio_clip.media_start = 0.0f;
+        audio_clip.waveform = audio_it->second.waveform;
+        audio_clip.is_audio_only = false;
+        audio_clip.opacity = 1.0f;
+        audio_clip.scale = 1.0f;
+        audio_clip.pos_x = 0.0f;
+        audio_clip.pos_y = 0.0f;
+        audio_clip.selected = false;
+
+        audio_clip.linked_clip = &clips[video_index];
+        video_clip.linked_clip = &clips[audio_index];
+        video_clip.has_audio = true;
+        std::cout << "Added linked Video and Audio clips for: " << input_path << std::endl;
+    } else {
+        video_clip.has_audio = false;
+        video_clip.linked_clip = nullptr;
+        if (audio_it != res.preloaded_audio.end() && audio_it->second.samples.empty()) {
+            std::cout << "Added Video clip (Audio stream found but empty/failed preload) for: " << input_path << std::endl;
+        } else {
+             std::cout << "Added Video clip (No audio stream found/preloaded) for: " << input_path << std::endl;
+        }
+    }
+}
+
+// --- Video Duration Helper ---
+float get_video_duration(const std::string& input_path) {
+    AVFormatContext* fmt_ctx = nullptr;
+    float duration = -1.0f;
+    AVDictionary* fmt_opts = nullptr;
+
+    if (avformat_open_input(&fmt_ctx, input_path.c_str(), nullptr, &fmt_opts) != 0) {
+        std::cerr << "ERROR: Could not open input file " << input_path << std::endl;
+        av_dict_free(&fmt_opts);
+        return -1.0f;
+    }
+    av_dict_free(&fmt_opts);
+
+    if (avformat_find_stream_info(fmt_ctx, nullptr) < 0) {
+        std::cerr << "ERROR: Could not find stream information for " << input_path << std::endl;
+        avformat_close_input(&fmt_ctx);
+        return -1.0f;
+    }
+
+    int video_stream_idx = av_find_best_stream(fmt_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+    if (video_stream_idx >= 0) {
+        AVStream* stream = fmt_ctx->streams[video_stream_idx];
+        if (stream->duration != AV_NOPTS_VALUE && stream->time_base.den != 0) {
+            duration = static_cast<float>(stream->duration) * av_q2d(stream->time_base);
+            if (duration <= 0) duration = -1.0f;
+        }
+    }
+
+    if (duration < 0 && fmt_ctx->duration != AV_NOPTS_VALUE) {
+        duration = static_cast<float>(fmt_ctx->duration) / AV_TIME_BASE;
+    }
+
+    avformat_close_input(&fmt_ctx);
+
+    if (duration < 0) {
+        std::cerr << "Warning: Could not determine duration reliably for " << input_path << ". Returning 0." << std::endl;
+        return 0.0f;
+    }
+    return duration;
+}
+
+// --- Forward Declarations ---
+void DrawTimelineEditor(std::vector<Clip>& clips, float& playhead_time, float& max_duration, float& zoom_factor, std::atomic<bool>& layers_changed, Clip*& selected_clip);
+void UpdatePreview(GLResources& res, const std::vector<Clip>& sorted_clips, int width, int height, float playhead_time, bool force_update);
+void RenderPreviewWindow(GLuint preview_tex, int preview_width, int preview_height);
+
+// --- Main Application ---
 int main(int argc, char* argv[]) {
     avformat_network_init();
 
@@ -489,347 +471,382 @@ int main(int argc, char* argv[]) {
     ImGui_ImplOpenGL3_Init("#version 130"); // Or "#version 330 core" for modern GL
 
     SetupImGuiStyle();
+    std::string font_path = "C:\\Windows\\Fonts\\segoeui.ttf";
+    if (std::filesystem::exists(font_path)) {
+        io.Fonts->AddFontFromFileTTF(font_path.c_str(), 18.0f);
+    } else {
+        std::cerr << "Warning: Font not found at " << font_path << ". Using default ImGui font." << std::endl;
+    }
 
-    // === State ===
-    char input_path[256] = "";
-    char output_path[256] = "output.mp4";
-    float start_time = 0.0f, duration = 10.0f, max_duration = 0.0f;
+    char input_path[FILENAME_MAX] = "";
+    char output_path[FILENAME_MAX] = "output.mp4";
+    float max_duration = 10.0f;
     float zoom_factor = 1.0f;
-    float video_duration = 0.0f;
-    bool file_dropped = false;
-    bool process_success = false;
-    std::string process_message;
-
+    std::atomic<bool> layers_changed = true;
+    bool file_dropped_this_frame = false;
+    std::string process_message = "Ready.";
     std::vector<Clip> clips;
-    int playhead_position = 0;
-    int last_playhead_position = -1;
-    static bool layers_changed = false;
+    float last_preview_update_time = -1.0f;
+    const float PREVIEW_UPDATE_INTERVAL = 1.0f / 60.0f;
 
-    /* bool playing = false;
-    float playhead_time = 0.0f;
-    Uint64 last_playback_time = SDL_GetTicksNS();
- */
     GLResources gl_resources;
-    setup_gl_resources(gl_resources, preview_width, preview_height);
+    if (!setup_gl_resources(gl_resources, preview_width, preview_height)) {
+        std::cerr << "Failed to initialize initial GL resources!" << std::endl;
+        ImGui_ImplOpenGL3_Shutdown(); ImGui_ImplSDL3_Shutdown(); ImGui::DestroyContext();
+        // Use SDL_GL_DestroyContext (Fix 1)
+        SDL_GL_DestroyContext(gl_context);
+        SDL_DestroyWindow(window); SDL_Quit();
+        return 1;
+    }
 
-    // === Main Loop ===
     bool running = true;
-    while (running) {
-        SDL_Event event;
+    last_frame_ticks = SDL_GetTicks();
 
+    while (running) {
+        Uint64 current_ticks = SDL_GetTicks();
+        float delta_time = (current_ticks - last_frame_ticks) / 1000.0f;
+        delta_time = std::min(delta_time, 0.1f);
+        last_frame_ticks = current_ticks;
+
+        file_dropped_this_frame = false;
+        SDL_Event event;
         while (SDL_PollEvent(&event)) {
-            if (event.type == SDL_EVENT_QUIT)
-                running = false;
+            ImGui_ImplSDL3_ProcessEvent(&event);
+
+            if (event.type == SDL_EVENT_QUIT) running = false;
+
+            if (event.type == SDL_EVENT_WINDOW_RESIZED || event.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) {
+                 int w, h; SDL_GetWindowSizeInPixels(window, &w, &h); glViewport(0, 0, w, h);
+            }
 
             if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_SPACE && event.key.down) {
-                playing = !playing;
+                playing = !playing.load();
                 std::cout << "Playback " << (playing ? "started" : "paused") << "\n";
             }
-
-            if (event.type == SDL_EVENT_DROP_FILE) {
-                if (event.drop.data) {
-                    strncpy(input_path, event.drop.data, IM_ARRAYSIZE(input_path) - 1);
-                    file_dropped = true;
-
-                    video_duration = get_video_duration(input_path);
-                    process_message = (video_duration == -1)
-                        ? "Failed to determine video duration!"
-                        : "Video duration loaded successfully!";
-
-                    std::cout << "Input Path: " << input_path << "\n";
-                    std::cout << "Video Duration: " << video_duration << "\n";
-
-                    AddNewClip(clips, input_path, video_duration);
-                    load_textures(gl_resources, clips);
-                    UpdatePreview(gl_resources, clips, preview_width, preview_height, playhead_time);
-                    
-                }
-            }
-
-            if (event.type == SDL_EVENT_KEY_DOWN &&
-                event.key.key == SDL_Keycode{'b'} &&
-                (event.key.mod & SDL_KMOD_CTRL) &&
-                selected_clip) {
-            
+            // Use event.key.key and SDLK_B (Fix 3 & 4)
+            else if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_B && (SDL_GetModState() & SDL_KMOD_CTRL) && selected_clip && event.key.down) {
+                // --- Blade Tool Logic ---
                 float cut_time = playhead_time;
-            
-                // Check if the cut is within clip bounds
                 float clip_start_global = selected_clip->start_time;
                 float clip_end_global = selected_clip->start_time + selected_clip->duration;
-                
-                if (cut_time <= clip_start_global || cut_time >= clip_end_global) {
-                    std::cout << "Cut is outside clip bounds: " << cut_time << "\n";
-                } else {
-                    // Store a pointer to the linked clip before any operations
+                if (cut_time > clip_start_global && cut_time < clip_end_global) {
                     Clip* linked_clip_ptr = selected_clip->linked_clip;
-                    
-                    // Calculate relative position of cut within the clip
-                    float relative_cut = cut_time - selected_clip->start_time;
+                    float relative_cut = cut_time - clip_start_global;
                     float new_media_start = selected_clip->media_start + relative_cut;
-                    
-                    // Prepare the second clip (the right part after the cut)
                     Clip new_clip = *selected_clip;
                     new_clip.start_time = cut_time;
                     new_clip.media_start = new_media_start;
                     new_clip.duration = clip_end_global - cut_time;
-                    new_clip.linked_clip = nullptr; // Clear linked clip reference for now
-                    new_clip.name += " (cut)";
-                    
-                    // Store the index before adding the new clip
-                    size_t original_clip_index = 0;
-                    for (size_t i = 0; i < clips.size(); ++i) {
-                        if (&clips[i] == selected_clip) {
-                            original_clip_index = i;
-                            break;
-                        }
-                    }
-                    
-                    // First clip: update duration (the left part of the cut)
+                    new_clip.name += " (Split)";
+                    new_clip.selected = false;
+                    new_clip.linked_clip = nullptr;
                     selected_clip->duration = relative_cut;
-                    selected_clip->linked_clip = nullptr; // Clear linked clip reference temporarily
-                    
-                    // Handle linked clips if present
+                    selected_clip->linked_clip = nullptr;
+                    Clip* new_linked_clip_ptr = nullptr;
                     if (linked_clip_ptr) {
-                        // Find the index of the linked clip
-                        size_t linked_clip_index = 0;
-                        bool found_linked = false;
-                        
-                        for (size_t i = 0; i < clips.size(); ++i) {
-                            if (&clips[i] == linked_clip_ptr) {
-                                linked_clip_index = i;
-                                found_linked = true;
-                                break;
-                            }
-                        }
-                        
-                        if (found_linked) {
-                            // Create a new clip for the second part of the linked clip
-                            Clip linked_new_clip = *linked_clip_ptr;
-                            linked_new_clip.start_time = cut_time;
-                            linked_new_clip.media_start = linked_clip_ptr->media_start + relative_cut;
-                            linked_new_clip.duration = clip_end_global - cut_time;
-                            linked_new_clip.name += " (cut)";
-                            linked_new_clip.linked_clip = nullptr; // Clear temporarily
-                            
-                            // Adjust the first part of the linked clip
-                            linked_clip_ptr->duration = relative_cut;
-                            linked_clip_ptr->linked_clip = nullptr; // Clear temporarily
-                            
-                            // Add the new linked clip
-                            clips.push_back(linked_new_clip);
-                            Clip* linked_new_clip_ptr = &clips.back();
-                            
-                            // Add the main new clip
-                            clips.push_back(new_clip);
-                            Clip* new_clip_ptr = &clips.back();
-                            
-                            // Re-establish linking between the first parts
-                            selected_clip->linked_clip = linked_clip_ptr;
-                            linked_clip_ptr->linked_clip = selected_clip;
-                            
-                            // Re-establish linking between the second parts
-                            new_clip_ptr->linked_clip = linked_new_clip_ptr;
-                            linked_new_clip_ptr->linked_clip = new_clip_ptr;
+                        bool linked_found = false;
+                        for (const auto& c : clips) { if (&c == linked_clip_ptr) { linked_found = true; break; } }
+                        if (linked_found) {
+                            Clip new_linked_clip = *linked_clip_ptr;
+                            new_linked_clip.start_time = cut_time;
+                            new_linked_clip.media_start = linked_clip_ptr->media_start + relative_cut;
+                            new_linked_clip.duration = new_clip.duration;
+                            new_linked_clip.name += " (Split)";
+                            new_linked_clip.selected = false;
+                            new_linked_clip.linked_clip = nullptr;
+                            linked_clip_ptr->duration = selected_clip->duration;
+                            linked_clip_ptr->linked_clip = nullptr;
+                            clips.push_back(new_linked_clip);
+                            new_linked_clip_ptr = &clips.back();
                         } else {
-                            // If we couldn't find the linked clip (shouldn't happen), just add the new clip
-                            clips.push_back(new_clip);
-                            std::cout << "Warning: Linked clip not found during cut operation.\n";
+                            std::cerr << "Warning: Linked clip pointer was invalid during split." << std::endl;
+                            linked_clip_ptr = nullptr;
                         }
-                    } else {
-                        // No linked clip, just add the new clip
-                        clips.push_back(new_clip);
                     }
-                    
-                    // Update the selected clip to the new (right) clip if desired
-                    // This ensures the user can see the result of the cut and potentially continue cutting
-                    selected_clip = &clips.back();
-                    
-                    std::cout << "Blade tool: split clip at " << cut_time << "s\n";
+                    clips.push_back(new_clip);
+                    Clip* new_clip_ptr = &clips.back();
+                    if (linked_clip_ptr) {
+                        selected_clip->linked_clip = linked_clip_ptr;
+                        linked_clip_ptr->linked_clip = selected_clip;
+                        if (new_linked_clip_ptr) {
+                            new_clip_ptr->linked_clip = new_linked_clip_ptr;
+                            new_linked_clip_ptr->linked_clip = new_clip_ptr;
+                        }
+                    }
+                    layers_changed = true;
+                    selected_clip = new_clip_ptr;
+                    std::cout << "Split clip at " << cut_time << "s\n";
+                } else {
+                    std::cout << "Split position (" << cut_time << ") is not within the selected clip bounds (" << clip_start_global << " - " << clip_end_global << ")\n";
+                }
+                // --- End Blade Tool ---
+            }
+            // Use event.key.key and SDLK_DELETE (Fix 3 & 4)
+            else if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_DELETE && selected_clip && event.key.down) {
+                ptrdiff_t selected_index = -1;
+                for(size_t i = 0; i < clips.size(); ++i) { if (&clips[i] == selected_clip) { selected_index = i; break; } }
+                if (selected_index != -1) {
+                        Clip& clip_to_delete = clips[selected_index];
+                    if (clip_to_delete.linked_clip) clip_to_delete.linked_clip->linked_clip = nullptr;
+                        clips.erase(clips.begin() + selected_index);
+                        selected_clip = nullptr;
+                        layers_changed = true;
+                        process_message = "Deleted clip.";
+                        std::cout << "Deleted selected clip." << std::endl;
                 }
             }
-            
-            
 
-            ImGui_ImplSDL3_ProcessEvent(&event);
+            if (event.type == SDL_EVENT_DROP_FILE) {
+                if (event.drop.data) {
+                    strncpy(input_path, event.drop.data, sizeof(input_path) - 1);
+                    input_path[sizeof(input_path) - 1] = '\0';
+                    file_dropped_this_frame = true;
+                }
+            }
+        } // End SDL_PollEvent loop
+
+        if (file_dropped_this_frame) {
+            std::string dropped_path_str = input_path;
+            std::cout << "File dropped: " << dropped_path_str << std::endl;
+            if (std::filesystem::exists(dropped_path_str)) {
+                float duration = get_video_duration(dropped_path_str);
+                if (duration >= 0) {
+                    AddNewClip(clips, dropped_path_str, duration, 0, gl_resources);
+                    layers_changed = true;
+                    process_message = "Added clip: " + std::filesystem::path(dropped_path_str).filename().string();
+                } else {
+                    process_message = "Failed to get duration for: " + std::filesystem::path(dropped_path_str).filename().string();
+                    std::cerr << process_message << std::endl;
+                }
+            } else {
+                process_message = "Dropped file path does not exist: " + dropped_path_str;
+                std::cerr << process_message << std::endl;
+            }
+            input_path[0] = '\0';
         }
 
         if (playing) {
-            Uint64 now = SDL_GetTicksNS();
-            float delta_time = (now - last_playback_time) / 1'000'000'000.0f;
-            last_playback_time = now;
             playhead_time += delta_time;
-            load_textures(gl_resources, clips);
-            UpdatePreview(gl_resources, clips, preview_width, preview_height, playhead_time);
-        } else {
-            last_playback_time = SDL_GetTicksNS();
+            if (playhead_time > max_duration) { playhead_time = max_duration; playing = false; }
+            playhead_time = std::max(0.0f, playhead_time);
         }
 
-        // === ImGui Frame ===
-        ImGui_ImplOpenGL3_NewFrame();
-        ImGui_ImplSDL3_NewFrame();
-        ImGui::NewFrame();   
-        
-        RenderDockSpace();
-
-        ImGui::Begin("FFmpeg Video Editor");
-        ApplyWindowBackgroundGradients();
-        ImGui::Text("Drag and drop a video file or enter the file path:");
-        ImGui::InputText("Input Path", input_path, IM_ARRAYSIZE(input_path));
-        ImGui::Text("Set output file path:");
-        ImGui::InputText("Output Path", output_path, IM_ARRAYSIZE(output_path));
-
-        DrawTimelineEditor(clips, playhead_time, max_duration, zoom_factor, layers_changed);
-
-        if (playhead_position != last_playhead_position || layers_changed) {
-            UpdatePreview(gl_resources, clips, preview_width, preview_height, playhead_time);
-            last_playhead_position = playhead_position;
-            layers_changed = false;
-        }
-
-        RenderPreviewWindow(gl_resources.render_tex, preview_width, preview_height);
-        ImGui::Separator();
-
-        if (ImGui::Button("Cut Video")) {
-            SDL_GL_MakeCurrent(window, gl_context);
-
-            if (!SDL_GL_GetCurrentContext()) {
-                std::cerr << "OpenGL context is not active!\n";
-                process_message = "OpenGL context error!";
-                process_success = false;
-            } else {
-                if (std::filesystem::exists(input_path)) {
-                    if (start_time < 0 || duration <= 0 || start_time + duration > video_duration) {
-                        process_message = "Invalid start time or duration!";
-                        process_success = false;
-                    } else {
-                        int fps = 30;
-                        int total_frames_needed = max_duration * fps;
-                        process_success = start_video_export(output_path, 1920, 1080, fps, total_frames_needed, clips, window);
-                        process_message = process_success ? "Video cut successfully!" : "Failed to cut video!";
-                    }
-                } else {
-                    process_message = "Input file does not exist!";
+        std::vector<Clip> active_clips_for_preview;
+        float preview_time_window = 1.0f;
+        for (const auto& clip : clips) {
+             // Need is_video_file (Fix 5 - requires declaration in hpp)
+            if (clip.type == ClipType::Video && is_video_file(clip.path)) {
+                 float clip_start = clip.start_time; float clip_end = clip.start_time + clip.duration;
+                if (std::max(clip_start, playhead_time - preview_time_window) < std::min(clip_end, playhead_time + preview_time_window)) {
+                    active_clips_for_preview.push_back(clip);
                 }
             }
         }
+        update_video_previews(gl_resources, active_clips_for_preview, playhead_time);
 
-        ImGui::TextWrapped("Status: %s", process_message.c_str());
+        ImGui_ImplOpenGL3_NewFrame(); ImGui_ImplSDL3_NewFrame(); ImGui::NewFrame();
+        RenderDockSpace();
 
+        ImGui::Begin("Controls");
+        ApplyWindowBackgroundGradients();
+        ImGui::InputText("Output Path", output_path, sizeof(output_path)); ImGui::Separator();
+        if (ImGui::Button(playing ? "Pause (Space)" : "Play (Space)")) playing = !playing.load();
+        ImGui::SameLine(); ImGui::Text("Time: %.2f / %.2f", playhead_time, max_duration);
+        if (ImGui::SliderFloat("##Seek", &playhead_time, 0.0f, max_duration, "%.2f s")) {
+             layers_changed = true; playing = false;
+        }
         ImGui::Separator();
-
+        if (ImGui::Button("Export Video")) {
+            SDL_GL_MakeCurrent(window, gl_context);
+            std::filesystem::path out_p(output_path);
+            if (!out_p.has_filename()) { process_message = "Output path is not a valid filename!"; }
+            else {
+                 int export_fps = 30;
+                 int export_duration_frames = static_cast<int>(std::ceil(max_duration * export_fps));
+                 if (export_duration_frames <= 0) { process_message = "Cannot export empty timeline!"; }
+                 else {
+                    process_message = "Exporting...";
+                    bool success = start_video_export(output_path, preview_width, preview_height, export_fps, export_duration_frames, clips, window);
+                    process_message = success ? "Export finished successfully!" : "Export failed!";
+                }
+            }
+        }
+        ImGui::Text("Status: %s", process_message.c_str()); ImGui::Separator();
         if (ImGui::Button("Save Project")) {
             const char* filters[] = { "*.zest" };
-            const char* save_path = tinyfd_saveFileDialog(
-                "Save Project", "project.zest", 1, filters, "Zest Project Files (*.zest)"
-            );
-
-            if (save_path && SaveProject(save_path, clips, playhead_time, zoom_factor)) {
-                process_message = "Project saved!";
-                std::cout << "Project saved to: " << save_path << "\n";
-            } else if (save_path) {
-                std::cerr << "Failed to save project\n";
-                process_message = "Failed to save project!";
+            const char* save_path = tinyfd_saveFileDialog("Save Project", "project.zest", 1, filters, "Zest Project Files (*.zest)");
+            if (save_path) {
+                 if (SaveProject(save_path, clips, playhead_time, zoom_factor)) {
+                    process_message = "Project saved to " + std::string(save_path); std::cout << process_message << std::endl;
+                } else { process_message = "Failed to save project!"; std::cerr << process_message << std::endl; }
             }
         }
         ImGui::SameLine();
-
         if (ImGui::Button("Load Project")) {
             const char* filters[] = { "*.zest" };
-            const char* load_path = tinyfd_openFileDialog(
-                "Load Project", "", 1, filters, "Zest Project Files (*.zest)", 0
-            );
-
-            if (load_path && LoadProject(load_path, clips, playhead_time, zoom_factor)) {
-                load_textures(gl_resources, clips);
-                UpdatePreview(gl_resources, clips, preview_width, preview_height, playhead_time);
-                layers_changed = true;
-                process_message = "Project loaded!";
-                std::cout << "Project loaded from: " << load_path << "\n";
-            } else if (load_path) {
-                std::cerr << "Failed to load project\n";
-                process_message = "Failed to load project!";
+            const char* load_path = tinyfd_openFileDialog("Load Project", "", 1, filters, "Zest Project Files (*.zest)", 0);
+            if (load_path) {
+                std::vector<Clip> loaded_clips; float loaded_playhead = 0; float loaded_zoom = 1.0f;
+                // In the project loading block:
+                if (LoadProject(load_path, loaded_clips, loaded_playhead, loaded_zoom)) {
+                    playing = false;
+                    clips.clear();
+                    selected_clip = nullptr;
+                    cleanup_gl_resources(gl_resources);
+                    cleanup_video_resources(gl_resources);
+                    gl_resources.preloaded_audio.clear();
+                    setup_gl_resources(gl_resources, preview_width, preview_height);
+                    
+                    clips = std::move(loaded_clips);
+                    playhead_time = loaded_playhead;
+                    zoom_factor = loaded_zoom;
+                    
+                    // Reload audio waveforms for all clips
+                    for (auto& clip : clips) {
+                        if (clip.type == ClipType::Audio) {
+                            // Force reload audio data
+                            load_resources_for_clip(gl_resources, clip);
+                            // Link waveform pointer after reload
+                            auto audio_it = gl_resources.preloaded_audio.find(clip.path);
+                            if (audio_it != gl_resources.preloaded_audio.end()) {
+                                clip.waveform = audio_it->second.waveform;
+                            }
+                        }
+                    }
+                    
+                    layers_changed = true;
+                    process_message = "Project loaded from " + std::string(load_path);
+                } else { process_message = "Failed to load project!"; std::cerr << process_message << std::endl; }
             }
         }
+        ImGui::End(); // End Controls
 
+        DrawTimelineEditor(clips, playhead_time, max_duration, zoom_factor, layers_changed, selected_clip);
 
-
-        ImGui::End();
-
-        ImGui::Begin("Timeline");
-        ApplyWindowBackgroundGradients();
-        ImGui::Text("Playhead: %.2f sec", playhead_time);
-        ImGui::SliderFloat("Seek", &playhead_time, 0.0f, max_duration); // replace 60 with actual duration if needed
-        ImGui::End();
-
-        ImGui::Begin("Inspector");
-        ApplyWindowBackgroundGradients();
-
-        if (selected_clip) {
-            ImGui::Text("Selected Clip: %s", selected_clip->name.c_str());
-
-            ImGui::SeparatorText("Transform");
-
-            ImGui::SliderFloat("Position X", &selected_clip->pos_x, -1.0f, 1.0f);
-            ImGui::SliderFloat("Position Y", &selected_clip->pos_y, -1.0f, 1.0f);
-            ImGui::SliderFloat("Scale",      &selected_clip->scale,  0.1f, 4.0f);
-            ImGui::SliderFloat("Opacity",    &selected_clip->opacity, 0.0f, 1.0f);
-
-            ImGui::SeparatorText("Trimming");
-
-            ImGui::InputFloat("Trim Start",  &selected_clip->media_start, 0.1f);
-            ImGui::InputFloat("Duration",      &selected_clip->duration);
-
-            ImGui::SeparatorText("Layering");
-
-            ImGui::InputInt("Layer", &selected_clip->layer);
-        } else {
-            ImGui::Text("No clip selected.");
+        bool force_preview_update = layers_changed.load();
+        if (force_preview_update || std::abs(playhead_time - last_preview_update_time) > PREVIEW_UPDATE_INTERVAL) {
+            std::vector<Clip> sorted_clips = clips;
+            std::sort(sorted_clips.begin(), sorted_clips.end(), [](const Clip& a, const Clip& b) { return a.layer < b.layer; });
+            UpdatePreview(gl_resources, sorted_clips, preview_width, preview_height, playhead_time, force_preview_update);
+            last_preview_update_time = playhead_time;
+            layers_changed = false;
         }
+        RenderPreviewWindow(gl_resources.render_tex, preview_width, preview_height);
 
-        ImGui::End();
+        ImGui::Begin("Inspector"); ApplyWindowBackgroundGradients();
+        if (selected_clip) {
+            ImGui::Text("Selected: %s", selected_clip->name.c_str()); ImGui::Text("Path: %s", selected_clip->path.c_str());
+            bool changed = false;
+            ImGui::SeparatorText("Transform");
+            changed |= ImGui::SliderFloat("Pos X", &selected_clip->pos_x, -1.0f, 1.0f, "%.3f");
+            changed |= ImGui::SliderFloat("Pos Y", &selected_clip->pos_y, -1.0f, 1.0f, "%.3f");
+            changed |= ImGui::SliderFloat("Scale", &selected_clip->scale, 0.01f, 10.0f, "%.3f");
+            changed |= ImGui::SliderFloat("Opacity", &selected_clip->opacity, 0.0f, 1.0f, "%.3f");
+            ImGui::SeparatorText("Timing & Trimming");
+            changed |= ImGui::InputFloat("Start Time", &selected_clip->start_time, 0.1f, 1.0f, "%.2f"); selected_clip->start_time = std::max(0.0f, selected_clip->start_time);
+            changed |= ImGui::InputFloat("Media Start", &selected_clip->media_start, 0.1f, 1.0f, "%.2f"); selected_clip->media_start = std::max(0.0f, selected_clip->media_start);
+            changed |= ImGui::InputFloat("Duration", &selected_clip->duration, 0.1f, 1.0f, "%.2f"); selected_clip->duration = std::max(0.01f, selected_clip->duration);
+            ImGui::SeparatorText("Layering");
+            changed |= ImGui::InputInt("Layer", &selected_clip->layer); selected_clip->layer = std::max(0, selected_clip->layer);
+            if (changed) {
+                layers_changed = true;
+                if (selected_clip->linked_clip) {
+                    if (selected_clip->type == ClipType::Video) {
+                        selected_clip->linked_clip->start_time = selected_clip->start_time;
+                        selected_clip->linked_clip->duration = selected_clip->duration;
+                    }
+                }
+            }
+        } else ImGui::Text("No clip selected.");
+        ImGui::End(); // End Inspector
 
+        ImGui::Begin("Active Clips"); ApplyWindowBackgroundGradients();
+        ImGui::Text("Clip List (%zu clips):", clips.size()); ImGui::Separator();
+        ImGuiListClipper clipper; clipper.Begin(clips.size());
+        while (clipper.Step()) {
+            for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
+                 Clip& clip = clips[i]; bool is_selected = (&clip == selected_clip); ImGui::PushID(i);
+                 if (is_selected) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.7f, 0.3f, 1.0f));
+                 if (ImGui::Selectable(clip.name.c_str(), is_selected, ImGuiSelectableFlags_AllowItemOverlap)) selected_clip = &clip;
+                 if (is_selected) ImGui::PopStyleColor();
+                 ImGui::SameLine(300); ImGui::TextDisabled("T:%.2f D:%.2f L:%d MStart:%.2f %s", clip.start_time, clip.duration, clip.layer, clip.media_start, clip.linked_clip ? "[L]" : "");
+                 ImGui::SameLine(ImGui::GetWindowWidth() - 50);
+                 if (ImGui::SmallButton("Del")) {
+                     if (clip.linked_clip) clip.linked_clip->linked_clip = nullptr;
+                     clips.erase(clips.begin() + i);
+                     if (&clip == selected_clip) selected_clip = nullptr;
+                     layers_changed = true; ImGui::PopID(); clipper.End(); goto end_debug_loop_main;
+                 }
+                 ImGui::PopID();
+            }
+        } end_debug_loop_main:;
+        ImGui::End(); // End Active Clips Debug
 
         ImGui::Render();
 
-        // === OpenGL render ===
-        int w, h;
-        SDL_GetWindowSize(window, &w, &h);
-        glViewport(0, 0, w, h);
-        glClearColor(0.12f, 0.12f, 0.12f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
+        int display_w, display_h; SDL_GetWindowSizeInPixels(window, &display_w, &display_h); glViewport(0, 0, display_w, display_h);
+        ImVec4 bg_col = ImGui::GetStyle().Colors[ImGuiCol_WindowBg]; glClearColor(bg_col.x * bg_col.w, bg_col.y * bg_col.w, bg_col.z * bg_col.w, bg_col.w); glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-        SDL_GL_SwapWindow(window);
 
         if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
-            SDL_Window* backup_current_window = SDL_GL_GetCurrentWindow();
-            SDL_GLContext backup_context = SDL_GL_GetCurrentContext();
-        
-            ImGui::UpdatePlatformWindows();
-            ImGui::RenderPlatformWindowsDefault();
-        
-            SDL_GL_MakeCurrent(backup_current_window, backup_context);
+            SDL_Window* backup_current_window = SDL_GL_GetCurrentWindow(); SDL_GLContext backup_context = SDL_GL_GetCurrentContext();
+            ImGui::UpdatePlatformWindows(); ImGui::RenderPlatformWindowsDefault();
+            if (SDL_GL_GetCurrentContext() != backup_context) SDL_GL_MakeCurrent(backup_current_window, backup_context);
         }
-    }
+        SDL_GL_SwapWindow(window);
 
-    // Cleanup
-    ImGui_ImplOpenGL3_Shutdown();
-    ImGui_ImplSDL3_Shutdown();
-    ImGui::DestroyContext();
+    } // End main loop
+
+    std::cout << "Cleaning up resources..." << std::endl;
+    if (ImGui::GetIO().UserData) { IM_DELETE((GradientData*)ImGui::GetIO().UserData); ImGui::GetIO().UserData = nullptr; }
+    cleanup_gl_resources(gl_resources); cleanup_video_resources(gl_resources);
+    ImGui_ImplOpenGL3_Shutdown(); ImGui_ImplSDL3_Shutdown(); ImGui::DestroyContext();
+    // Use SDL_GL_DestroyContext (Fix 1)
     SDL_GL_DestroyContext(gl_context);
-    SDL_DestroyWindow(window);
-    SDL_Quit();
-
+    SDL_DestroyWindow(window); SDL_Quit(); avformat_network_deinit();
+    std::cout << "Exiting application." << std::endl;
     return 0;
 }
 
 
+// --- Updated UpdatePreview Function ---
+void UpdatePreview(GLResources& res, const std::vector<Clip>& sorted_clips, int width, int height, float playhead_time, bool force_update) {
+    render_frame(res, playhead_time, sorted_clips, width, height);
+}
 
+// --- RenderPreviewWindow ---
+void RenderPreviewWindow(GLuint preview_tex, int preview_width, int preview_height) {
+    ImGui::Begin("Video Preview"); ApplyWindowBackgroundGradients();
+    ImVec2 available_size = ImGui::GetContentRegionAvail();
+    available_size.x = std::max(available_size.x, 1.0f); available_size.y = std::max(available_size.y, 1.0f);
+    ImVec2 render_size = ImVec2((float)preview_width, (float)preview_height);
+    if (render_size.x <= 0 || render_size.y <= 0) { ImGui::Text("Invalid preview dimensions."); ImGui::End(); return; }
+    float aspect_ratio = render_size.x / render_size.y;
+    ImVec2 display_size = available_size;
+    if (available_size.x / aspect_ratio <= available_size.y) display_size.y = available_size.x / aspect_ratio;
+    else display_size.x = available_size.y * aspect_ratio;
+    display_size.x = std::max(display_size.x, 1.0f); display_size.y = std::max(display_size.y, 1.0f);
+    ImVec2 cursor_pos = ImGui::GetCursorPos();
+    ImVec2 centered_pos = ImVec2(cursor_pos.x + (available_size.x - display_size.x) * 0.5f, cursor_pos.y + (available_size.y - display_size.y) * 0.5f);
+    ImGui::SetCursorPos(centered_pos);
+    if (preview_tex != 0) ImGui::Image((ImTextureID)(intptr_t)preview_tex, display_size, ImVec2(0, 0), ImVec2(1, 1));
+    else {
+        ImGui::Dummy(display_size); ImU32 placeholder_col = IM_COL32(40, 40, 45, 255);
+        ImVec2 rect_min = ImGui::GetItemRectMin(); ImVec2 rect_max = ImGui::GetItemRectMax();
+        ImGui::GetWindowDrawList()->AddRectFilled(rect_min, rect_max, placeholder_col);
+        ImGui::GetWindowDrawList()->AddText(rect_min, IM_COL32(200, 200, 200, 255), "Preview Unavailable");
+    }
+    ImGui::End();
+}
+
+// --- DrawTimelineEditor ---
 void DrawTimelineEditor(
     std::vector<Clip>& clips,
     float& playhead_time,
     float& max_duration,
     float& zoom_factor,
-    bool& layers_changed
+    std::atomic<bool>& layers_changed,
+    Clip*& selected_clip
 ) {
     ImGui::Begin("Timeline Editor");
     ApplyWindowBackgroundGradients();
@@ -1413,77 +1430,6 @@ void DrawTimelineEditor(
 
     // Need to advance cursor past the timeline for future components
     ImGui::SetCursorScreenPos(ImVec2(labels_start.x, labels_start.y + timeline_height + 5));
-
-    ImGui::End();
-
-    ImGui::Begin("Active Clips");
-    ApplyWindowBackgroundGradients();
-    ImGui::Text("Clip List:");
-    ImGui::Separator();
-
-    for (size_t i = 0; i < clips.size(); ++i) {
-        auto& clip = clips[i];
-        if (&clip == selected_clip)
-            ImGui::TextColored(ImVec4(1.00f, 0.56f, 0.15f, 1.00f), "->");
-        ImGui::SameLine();
-        ImGui::Text("%zu: %s (Start: %f, Duration: %f, Layer: %d)", i, clip.name.c_str(), clip.start_time, clip.duration, clip.layer);
-        if (ImGui::Button(("Delete##" + std::to_string(i)).c_str())) {
-            if (selected_clip == &clip) selected_clip = nullptr;
-            clips.erase(clips.begin() + i);
-            break;
-        }
-    }
-
-    ImGui::End();
-}
-
-
-
-void UpdatePreview(GLResources& res, const std::vector<Clip>& clips, int width, int height, float playhead_time) {
-    static float last_preview_time = -1.0f;
-
-    if (std::abs(playhead_time - last_preview_time) < 0.01f) return;
-
-    std::vector<Clip> sorted_clips = clips;
-    std::sort(sorted_clips.begin(), sorted_clips.end(), [](const Clip& a, const Clip& b) {
-        return a.layer < b.layer;
-    });
-
-    render_frame(res, playhead_time, sorted_clips, width, height);
-    last_preview_time = playhead_time;
-}
-
-
-void RenderPreviewWindow(GLuint preview_tex, int preview_width, int preview_height) {
-    ImGui::Begin("Video Preview");
-    ApplyWindowBackgroundGradients();
-
-    if (preview_tex) {
-        // Maintain aspect ratio
-        float aspect = static_cast<float>(preview_width) / preview_height;
-
-        ImVec2 avail = ImGui::GetContentRegionAvail();
-        ImVec2 preview_size = avail;
-
-        // Fit to width, maintain aspect ratio
-        preview_size.y = preview_size.x / aspect;
-
-        // Clip if height too large
-        if (preview_size.y > avail.y) {
-            preview_size.y = avail.y;
-            preview_size.x = preview_size.y * aspect;
-        }
-
-        // Flip vertically: use UVs (0,1) to (1,0)
-        ImGui::Image(
-            (ImTextureID)(intptr_t)preview_tex,
-            preview_size,
-            ImVec2(0, 1),  // <-- top-left
-            ImVec2(1, 0)   // <-- bottom-right
-        );
-    } else {
-        ImGui::Text("Preview unavailable");
-    }
 
     ImGui::End();
 }

@@ -33,4 +33,6 @@ struct Clip {
 
     Clip* linked_clip = nullptr; // for audio/video pairs
 
+    std::vector<GLuint>* thumbnails = nullptr;
+
 };
