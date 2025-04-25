@@ -50,6 +50,11 @@ UI
 
 */
 
+struct GradientData {
+    ImVec4 window_grad_top;
+    ImVec4 window_grad_bottom;
+};
+
 struct StreamContext {
     AVFormatContext* fmt_ctx = nullptr;
     AVCodecContext* dec_ctx = nullptr;
@@ -119,62 +124,229 @@ void RenderPreviewWindow(GLuint preview_tex, int preview_width, int preview_heig
 void SetupImGuiStyle() {
     ImGuiStyle& style = ImGui::GetStyle();
     ImVec4* colors = style.Colors;
-
-    colors[ImGuiCol_Text] = ImVec4(1.00f, 1.00f, 1.00f, 1.00f);
-    colors[ImGuiCol_TextDisabled] = ImVec4(0.24f, 0.24f, 0.24f, 1.00f);
-    colors[ImGuiCol_WindowBg] = ImVec4(0.14f, 0.14f, 0.14f, 1.00f);
-    colors[ImGuiCol_ChildBg] = ImVec4(0.14f, 0.14f, 0.14f, 1.00f);
-    colors[ImGuiCol_PopupBg] = ImVec4(0.14f, 0.14f, 0.14f, 1.00f);
-    colors[ImGuiCol_Border] = ImVec4(0.43f, 0.43f, 0.50f, 0.50f);
-    colors[ImGuiCol_BorderShadow] = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
-    colors[ImGuiCol_FrameBg] = ImVec4(0.20f, 0.20f, 0.20f, 1.00f);
-    colors[ImGuiCol_FrameBgHovered] = ImVec4(0.24f, 0.24f, 0.24f, 1.00f);
-    colors[ImGuiCol_FrameBgActive] = ImVec4(0.24f, 0.24f, 0.24f, 1.00f);
-    colors[ImGuiCol_TitleBg] = ImVec4(0.14f, 0.14f, 0.14f, 1.00f);
-    colors[ImGuiCol_TitleBgActive] = ImVec4(0.14f, 0.14f, 0.14f, 1.00f);
-    colors[ImGuiCol_TitleBgCollapsed] = ImVec4(0.14f, 0.14f, 0.14f, 1.00f);
-    colors[ImGuiCol_MenuBarBg] = ImVec4(0.20f, 0.20f, 0.20f, 1.00f);
-    colors[ImGuiCol_ScrollbarBg] = ImVec4(0.14f, 0.14f, 0.14f, 1.00f);
-    colors[ImGuiCol_ScrollbarGrab] = ImVec4(0.24f, 0.24f, 0.24f, 1.00f);
-    colors[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.24f, 0.24f, 0.24f, 1.00f);
-    colors[ImGuiCol_ScrollbarGrabActive] = ImVec4(0.24f, 0.24f, 0.24f, 1.00f);
-    colors[ImGuiCol_CheckMark] = ImVec4(0.86f, 0.93f, 0.89f, 1.00f);
-    colors[ImGuiCol_SliderGrab] = ImVec4(0.24f, 0.24f, 0.24f, 1.00f);
-    colors[ImGuiCol_SliderGrabActive] = ImVec4(0.24f, 0.24f, 0.24f, 1.00f);
-    colors[ImGuiCol_Button] = ImVec4(0.20f, 0.20f, 0.20f, 1.00f);
-    colors[ImGuiCol_ButtonHovered] = ImVec4(0.24f, 0.24f, 0.24f, 1.00f);
-    colors[ImGuiCol_ButtonActive] = ImVec4(0.24f, 0.24f, 0.24f, 1.00f);
-    colors[ImGuiCol_Header] = ImVec4(0.24f, 0.24f, 0.24f, 1.00f);
-    colors[ImGuiCol_HeaderHovered] = ImVec4(0.24f, 0.24f, 0.24f, 1.00f);
-    colors[ImGuiCol_HeaderActive] = ImVec4(0.24f, 0.24f, 0.24f, 1.00f);
-    colors[ImGuiCol_Separator] = ImVec4(0.43f, 0.43f, 0.50f, 0.50f);
-    colors[ImGuiCol_SeparatorHovered] = ImVec4(0.43f, 0.43f, 0.50f, 0.50f);
-    colors[ImGuiCol_SeparatorActive] = ImVec4(0.43f, 0.43f, 0.50f, 0.50f);
-    colors[ImGuiCol_ResizeGrip] = ImVec4(0.24f, 0.24f, 0.24f, 1.00f);
-    colors[ImGuiCol_ResizeGripHovered] = ImVec4(0.24f, 0.24f, 0.24f, 1.00f);
-    colors[ImGuiCol_ResizeGripActive] = ImVec4(0.24f, 0.24f, 0.24f, 1.00f);
-    colors[ImGuiCol_Tab] = ImVec4(0.14f, 0.14f, 0.14f, 1.00f);
-    colors[ImGuiCol_TabHovered] = ImVec4(0.24f, 0.24f, 0.24f, 1.00f);
-    colors[ImGuiCol_TabActive] = ImVec4(0.24f, 0.24f, 0.24f, 1.00f);
-    colors[ImGuiCol_TabUnfocused] = ImVec4(0.14f, 0.14f, 0.14f, 1.00f);
-    colors[ImGuiCol_TabUnfocusedActive] = ImVec4(0.24f, 0.24f, 0.24f, 1.00f);
-    colors[ImGuiCol_PlotLines] = ImVec4(0.86f, 0.93f, 0.89f, 1.00f);
-    colors[ImGuiCol_PlotLinesHovered] = ImVec4(0.86f, 0.93f, 0.89f, 1.00f);
-    colors[ImGuiCol_PlotHistogram] = ImVec4(0.86f, 0.93f, 0.89f, 1.00f);
-    colors[ImGuiCol_PlotHistogramHovered] = ImVec4(0.86f, 0.93f, 0.89f, 1.00f);
-    colors[ImGuiCol_TextSelectedBg] = ImVec4(0.24f, 0.24f, 0.24f, 1.00f);
-    colors[ImGuiCol_DragDropTarget] = ImVec4(0.86f, 0.93f, 0.89f, 1.00f);
-    colors[ImGuiCol_NavHighlight] = ImVec4(0.86f, 0.93f, 0.89f, 1.00f);
-    colors[ImGuiCol_NavWindowingHighlight] = ImVec4(0.86f, 0.93f, 0.89f, 1.00f);
-    colors[ImGuiCol_NavWindowingDimBg] = ImVec4(0.14f, 0.14f, 0.14f, 1.00f);
-    colors[ImGuiCol_ModalWindowDimBg] = ImVec4(0.14f, 0.14f, 0.14f, 1.00f);
-
-    style.WindowRounding = 0.0f;
-    style.FrameRounding = 0.0f;
-    style.GrabRounding = 0.0f;
-    style.ScrollbarRounding = 0.0f;
-    style.TabRounding = 0.0f;
+    
+    // Refined color palette with enhanced visual clarity
+    ImVec4 bg_dark          = ImVec4(0.13f, 0.12f, 0.15f, 1.00f); // Darker base for gradient
+    ImVec4 bg_light         = ImVec4(0.17f, 0.16f, 0.19f, 1.00f); // Lighter top for gradient
+    ImVec4 bg_alt           = ImVec4(0.15f, 0.15f, 0.17f, 1.00f);
+    
+    // Refined orange tones for better clarity and distinction
+    ImVec4 accent           = ImVec4(1.00f, 0.56f, 0.15f, 1.00f); // More vibrant base orange
+    ImVec4 accent_hover     = ImVec4(1.00f, 0.67f, 0.25f, 1.00f); // Brighter, more distinct hover
+    ImVec4 accent_active    = ImVec4(1.00f, 0.42f, 0.00f, 1.00f); // Deeper, richer active state
+    ImVec4 accent_muted     = ImVec4(0.85f, 0.48f, 0.12f, 1.00f); // Muted orange for secondary elements
+    
+    ImVec4 text             = ImVec4(0.98f, 0.98f, 0.98f, 1.00f);
+    ImVec4 text_secondary   = ImVec4(0.80f, 0.80f, 0.80f, 1.00f);
+    ImVec4 frame_bg         = ImVec4(0.16f, 0.16f, 0.18f, 1.00f);
+    
+    // Apply the new color palette
+    colors[ImGuiCol_Text]                  = text;
+    colors[ImGuiCol_TextDisabled]          = ImVec4(0.60f, 0.60f, 0.60f, 1.00f);
+    colors[ImGuiCol_WindowBg]              = bg_dark; // Base color for gradient (will be modified in rendering)
+    colors[ImGuiCol_ChildBg]               = ImVec4(0.18f, 0.18f, 0.21f, 0.80f); // Slightly transparent
+    colors[ImGuiCol_PopupBg]               = ImVec4(0.12f, 0.12f, 0.14f, 0.94f);
+    colors[ImGuiCol_Border]                = ImVec4(0.30f, 0.30f, 0.32f, 0.50f);
+    colors[ImGuiCol_BorderShadow]          = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
+    colors[ImGuiCol_FrameBg]               = frame_bg;
+    colors[ImGuiCol_FrameBgHovered]        = ImVec4(accent_hover.x, accent_hover.y, accent_hover.z, 0.40f);
+    colors[ImGuiCol_FrameBgActive]         = ImVec4(accent_active.x, accent_active.y, accent_active.z, 0.67f);
+    colors[ImGuiCol_TitleBg]               = bg_alt;
+    colors[ImGuiCol_TitleBgActive]         = accent_muted;
+    colors[ImGuiCol_TitleBgCollapsed]      = ImVec4(bg_dark.x, bg_dark.y, bg_dark.z, 0.75f);
+    colors[ImGuiCol_MenuBarBg]             = ImVec4(0.18f, 0.18f, 0.21f, 1.00f);
+    colors[ImGuiCol_ScrollbarBg]           = ImVec4(0.18f, 0.18f, 0.21f, 0.80f);
+    colors[ImGuiCol_ScrollbarGrab]         = ImVec4(0.35f, 0.35f, 0.37f, 1.00f);
+    colors[ImGuiCol_ScrollbarGrabHovered]  = accent_hover;
+    colors[ImGuiCol_ScrollbarGrabActive]   = accent_active;
+    colors[ImGuiCol_CheckMark]             = ImVec4(1.00f, 0.65f, 0.20f, 1.00f); // Brighter, more visible
+    colors[ImGuiCol_SliderGrab]            = accent;
+    colors[ImGuiCol_SliderGrabActive]      = accent_active;
+    colors[ImGuiCol_Button]                = ImVec4(accent.x, accent.y, accent.z, 0.85f);
+    colors[ImGuiCol_ButtonHovered]         = accent_hover;
+    colors[ImGuiCol_ButtonActive]          = accent_active;
+    colors[ImGuiCol_Header]                = ImVec4(accent.x, accent.y, accent.z, 0.55f);
+    colors[ImGuiCol_HeaderHovered]         = ImVec4(accent_hover.x, accent_hover.y, accent_hover.z, 0.80f);
+    colors[ImGuiCol_HeaderActive]          = accent_active;
+    colors[ImGuiCol_Separator]             = ImVec4(0.43f, 0.43f, 0.50f, 0.50f);
+    colors[ImGuiCol_SeparatorHovered]      = ImVec4(accent_hover.x, accent_hover.y, accent_hover.z, 0.78f);
+    colors[ImGuiCol_SeparatorActive]       = accent_active;
+    colors[ImGuiCol_ResizeGrip]            = ImVec4(accent.x, accent.y, accent.z, 0.25f);
+    colors[ImGuiCol_ResizeGripHovered]     = ImVec4(accent_hover.x, accent_hover.y, accent_hover.z, 0.67f);
+    colors[ImGuiCol_ResizeGripActive]      = accent_active;
+    colors[ImGuiCol_Tab]                   = ImVec4(0.18f, 0.18f, 0.20f, 1.00f);
+    colors[ImGuiCol_TabHovered]            = accent_hover;
+    colors[ImGuiCol_TabActive]             = accent;
+    colors[ImGuiCol_TabUnfocused]          = ImVec4(0.18f, 0.18f, 0.21f, 1.00f);
+    colors[ImGuiCol_TabUnfocusedActive]    = ImVec4(accent_muted.x, accent_muted.y, accent_muted.z, 0.60f);
+    colors[ImGuiCol_DockingPreview]        = ImVec4(accent.x, accent.y, accent.z, 0.50f);
+    colors[ImGuiCol_DockingEmptyBg]        = ImVec4(0.12f, 0.12f, 0.13f, 1.00f);
+    colors[ImGuiCol_PlotLines]             = ImVec4(0.90f, 0.70f, 0.40f, 1.00f);
+    colors[ImGuiCol_PlotLinesHovered]      = accent_hover;
+    colors[ImGuiCol_PlotHistogram]         = ImVec4(0.90f, 0.60f, 0.30f, 1.00f);
+    colors[ImGuiCol_PlotHistogramHovered]  = ImVec4(1.00f, 0.70f, 0.35f, 1.00f);
+    colors[ImGuiCol_TextSelectedBg]        = ImVec4(accent.x, accent.y, accent.z, 0.35f);
+    colors[ImGuiCol_DragDropTarget]        = ImVec4(1.00f, 0.65f, 0.30f, 0.90f);
+    colors[ImGuiCol_NavHighlight]          = accent;
+    colors[ImGuiCol_NavWindowingHighlight] = ImVec4(1.00f, 1.00f, 1.00f, 0.70f);
+    colors[ImGuiCol_NavWindowingDimBg]     = ImVec4(0.80f, 0.80f, 0.80f, 0.20f);
+    colors[ImGuiCol_ModalWindowDimBg]      = ImVec4(0.10f, 0.10f, 0.10f, 0.65f);
+    
+    // Style adjustments for a premium look
+    style.WindowPadding     = ImVec2(8, 8);
+    style.WindowRounding    = 6.0f;
+    style.FramePadding      = ImVec2(6, 4);
+    style.FrameRounding     = 5.0f;
+    style.ItemSpacing       = ImVec2(8, 6);
+    style.ItemInnerSpacing  = ImVec2(6, 4);
+    style.IndentSpacing     = 25.0f;
+    style.ScrollbarSize     = 12.0f;
+    style.ScrollbarRounding = 6.0f;
+    style.GrabMinSize       = 10.0f;
+    style.GrabRounding      = 4.0f;
+    style.TabRounding       = 5.0f;
+    style.WindowTitleAlign  = ImVec2(0.5f, 0.5f);
+    style.WindowBorderSize  = 1.0f;
+    style.FrameBorderSize   = 0.0f;
+    style.PopupRounding     = 5.0f;
+    style.Alpha             = 1.0f;
+    
+    // Store gradient colors in user data for later use
+    // We'll store them as floats in ImGui's UserData (if you have space available)
+    ImGui::GetIO().UserData = IM_NEW(GradientData)();
+    GradientData* gradient_data = (GradientData*)ImGui::GetIO().UserData;
+    gradient_data->window_grad_top = bg_light;
+    gradient_data->window_grad_bottom = bg_dark;
 }
+
+// Create a gradient texture once
+GLuint CreateGradientTexture(ImVec4 top_color, ImVec4 bottom_color, int height = 1280) {
+    GLuint texture_id;
+    glGenTextures(1, &texture_id);
+    glBindTexture(GL_TEXTURE_2D, texture_id);
+    
+    // Create a 2D texture with dithering
+    const int width = 32; // Wider for better dithering pattern
+    unsigned char* data = new unsigned char[width * height * 4];
+    
+    // Bayer dithering matrix 8x8
+    const float bayer8x8[64] = {
+        0/64.0f,  32/64.0f,  8/64.0f, 40/64.0f,  2/64.0f, 34/64.0f, 10/64.0f, 42/64.0f,
+        48/64.0f, 16/64.0f, 56/64.0f, 24/64.0f, 50/64.0f, 18/64.0f, 58/64.0f, 26/64.0f,
+        12/64.0f, 44/64.0f,  4/64.0f, 36/64.0f, 14/64.0f, 46/64.0f,  6/64.0f, 38/64.0f,
+        60/64.0f, 28/64.0f, 52/64.0f, 20/64.0f, 62/64.0f, 30/64.0f, 54/64.0f, 22/64.0f,
+        3/64.0f,  35/64.0f, 11/64.0f, 43/64.0f,  1/64.0f, 33/64.0f,  9/64.0f, 41/64.0f,
+        51/64.0f, 19/64.0f, 59/64.0f, 27/64.0f, 49/64.0f, 17/64.0f, 57/64.0f, 25/64.0f,
+        15/64.0f, 47/64.0f,  7/64.0f, 39/64.0f, 13/64.0f, 45/64.0f,  5/64.0f, 37/64.0f,
+        63/64.0f, 31/64.0f, 55/64.0f, 23/64.0f, 61/64.0f, 29/64.0f, 53/64.0f, 21/64.0f
+    };
+    
+    // Dithering strength - adjust as needed
+    const float dither_strength = 1.0f/255.0f * 1.5f;
+    
+    for (int y = 0; y < height; y++) {
+        float t = (float)y / (float)(height - 1);
+        // Improved easing function
+        float eased_t = t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
+        
+        // Blend colors in linear space for perceptual correctness
+        ImVec4 col_mix;
+        col_mix.x = powf(powf(bottom_color.x, 2.2f) * (1.0f - eased_t) + powf(top_color.x, 2.2f) * eased_t, 1.0f/2.2f);
+        col_mix.y = powf(powf(bottom_color.y, 2.2f) * (1.0f - eased_t) + powf(top_color.y, 2.2f) * eased_t, 1.0f/2.2f);
+        col_mix.z = powf(powf(bottom_color.z, 2.2f) * (1.0f - eased_t) + powf(top_color.z, 2.2f) * eased_t, 1.0f/2.2f);
+        col_mix.w = bottom_color.w * (1.0f - eased_t) + top_color.w * eased_t;
+        
+        for (int x = 0; x < width; x++) {
+            // Apply dithering pattern
+            int pattern_x = x % 8;
+            int pattern_y = y % 8;
+            float dither_value = bayer8x8[pattern_y * 8 + pattern_x];
+            
+            // Apply dithering to each component
+            float r = col_mix.x + (dither_value - 0.5f) * dither_strength;
+            float g = col_mix.y + (dither_value - 0.5f) * dither_strength;
+            float b = col_mix.z + (dither_value - 0.5f) * dither_strength;
+            
+            // Clamp values
+            r = r < 0.0f ? 0.0f : (r > 1.0f ? 1.0f : r);
+            g = g < 0.0f ? 0.0f : (g > 1.0f ? 1.0f : g);
+            b = b < 0.0f ? 0.0f : (b > 1.0f ? 1.0f : b);
+            
+            int idx = (y * width + x) * 4;
+            data[idx + 0] = (unsigned char)(r * 255.0f);
+            data[idx + 1] = (unsigned char)(g * 255.0f);
+            data[idx + 2] = (unsigned char)(b * 255.0f);
+            data[idx + 3] = (unsigned char)(col_mix.w * 255.0f);
+        }
+    }
+    
+    // Upload to texture with proper dimensions
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
+    
+    // Use trilinear filtering
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    
+    // Generate mipmaps
+    glGenerateMipmap(GL_TEXTURE_2D);
+    
+    delete[] data;
+    return texture_id;
+}
+
+void ApplyWindowBackgroundGradients() {
+    static GLuint gradient_texture = 0;
+    static ImVec4 last_top_color = ImVec4(0,0,0,0);
+    static ImVec4 last_bottom_color = ImVec4(0,0,0,0);
+    
+    GradientData* gradient_data = (GradientData*)ImGui::GetIO().UserData;
+    if (!gradient_data)
+        return;
+    
+    // Recreate texture if colors have changed
+    if (gradient_texture == 0 || 
+        memcmp(&last_top_color, &gradient_data->window_grad_top, sizeof(ImVec4)) != 0 ||
+        memcmp(&last_bottom_color, &gradient_data->window_grad_bottom, sizeof(ImVec4)) != 0) {
+        
+        if (gradient_texture != 0)
+            glDeleteTextures(1, &gradient_texture);
+            
+        gradient_texture = CreateGradientTexture(gradient_data->window_grad_top, gradient_data->window_grad_bottom);
+        last_top_color = gradient_data->window_grad_top;
+        last_bottom_color = gradient_data->window_grad_bottom;
+    }
+    
+    // Now draw the texture
+    ImDrawList* draw_list = ImGui::GetWindowDrawList();
+    if (!draw_list || gradient_texture == 0)
+        return;
+    
+    ImVec2 window_pos = ImGui::GetWindowPos();
+    ImVec2 window_size = ImGui::GetWindowSize();
+    
+    // Convert OpenGL texture to ImGui texture ID
+    ImTextureID tex_id = (ImTextureID)(intptr_t)gradient_texture;
+    
+    // Draw the texture stretched to cover the window
+    draw_list->AddImage(
+        tex_id,
+        window_pos,
+        ImVec2(window_pos.x + window_size.x, window_pos.y + window_size.y),
+        ImVec2(0, 0),
+        ImVec2(1, 1)
+    );
+    
+    // Add a subtle highlight at the top (optional)
+    draw_list->AddRectFilled(
+        ImVec2(window_pos.x, window_pos.y),
+        ImVec2(window_pos.x + window_size.x, window_pos.y + 1.5f),
+        IM_COL32(255, 255, 255, 15)
+    );
+}
+
+
 
 void AddNewClip(std::vector<Clip>& clips, const std::string& input_path, float video_duration, int layer = 0) {
     std::string clip_name = std::filesystem::path(input_path).filename().string();
@@ -210,6 +382,32 @@ static const char* av_err2str(int errnum) {
     memset(str, 0, sizeof(str));
     return av_make_error_string(str, AV_ERROR_MAX_STRING_SIZE, errnum);
 }
+
+void RenderDockSpace() {
+    static ImGuiDockNodeFlags dockspace_flags = ImGuiDockNodeFlags_None;
+
+    ImGuiWindowFlags window_flags = ImGuiWindowFlags_MenuBar | ImGuiWindowFlags_NoDocking;
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(viewport->WorkPos);
+    ImGui::SetNextWindowSize(viewport->WorkSize);
+    ImGui::SetNextWindowViewport(viewport->ID);
+
+    window_flags |= ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse |
+                    ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove;
+    window_flags |= ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNavFocus;
+
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+
+    ImGui::Begin("DockSpace Demo", nullptr, window_flags);
+    ImGui::PopStyleVar(2);
+
+    ImGuiID dockspace_id = ImGui::GetID("MyDockSpace");
+    ImGui::DockSpace(dockspace_id, ImVec2(0.0f, 0.0f), dockspace_flags);
+
+    ImGui::End();
+}
+
 
 int main(int argc, char* argv[]) {
     avformat_network_init();
@@ -250,6 +448,7 @@ int main(int argc, char* argv[]) {
     ImGuiIO& io = ImGui::GetIO(); (void)io;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+    io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
 
     ImGui::StyleColorsDark();
     io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 18.0f);
@@ -365,9 +564,12 @@ int main(int argc, char* argv[]) {
         // === ImGui Frame ===
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplSDL3_NewFrame();
-        ImGui::NewFrame();     
+        ImGui::NewFrame();   
+        
+        RenderDockSpace();
 
         ImGui::Begin("FFmpeg Video Editor");
+        ApplyWindowBackgroundGradients();
         ImGui::Text("Drag and drop a video file or enter the file path:");
         ImGui::InputText("Input Path", input_path, IM_ARRAYSIZE(input_path));
         ImGui::Text("Set output file path:");
@@ -451,11 +653,13 @@ int main(int argc, char* argv[]) {
         ImGui::End();
 
         ImGui::Begin("Timeline");
+        ApplyWindowBackgroundGradients();
         ImGui::Text("Playhead: %.2f sec", playhead_time);
         ImGui::SliderFloat("Seek", &playhead_time, 0.0f, 60.0f); // replace 60 with actual duration if needed
         ImGui::End();
 
         ImGui::Begin("Inspector");
+        ApplyWindowBackgroundGradients();
 
         if (selected_clip) {
             ImGui::Text("Selected Clip: %s", selected_clip->name.c_str());
@@ -492,6 +696,16 @@ int main(int argc, char* argv[]) {
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         SDL_GL_SwapWindow(window);
+
+        if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
+            SDL_Window* backup_current_window = SDL_GL_GetCurrentWindow();
+            SDL_GLContext backup_context = SDL_GL_GetCurrentContext();
+        
+            ImGui::UpdatePlatformWindows();
+            ImGui::RenderPlatformWindowsDefault();
+        
+            SDL_GL_MakeCurrent(backup_current_window, backup_context);
+        }
     }
 
     // Cleanup
@@ -518,6 +732,7 @@ void DrawTimelineEditor(
     bool& layers_changed
 ) {
     ImGui::Begin("Timeline Editor");
+    ApplyWindowBackgroundGradients();
 
     float timeline_width = ImGui::GetContentRegionAvail().x;
     const float resize_edge_area = 10.0f;
@@ -583,7 +798,7 @@ void DrawTimelineEditor(
 
         // Highlight selected
         if (&clip == selected_clip) {
-            draw_list->AddRect(clip_rect_min, clip_rect_max, IM_COL32(255, 255, 0, 255), 0.0f, 0, 3.0f);
+            draw_list->AddRect(clip_rect_min, clip_rect_max, IM_COL32(255, 107, 0, 255), 0.0f, 0, 3.0f);
             clip.selected = true;
         } else {
             clip.selected = false;
@@ -605,7 +820,7 @@ void DrawTimelineEditor(
         ImGui::InvisibleButton(("clip_move" + std::to_string(i)).c_str(), ImVec2(drag_area_end.x - drag_area_start.x, layer_height - layer_padding));
 
         if (ImGui::IsItemHovered()) {
-            draw_list->AddRect(drag_area_start, drag_area_end, IM_COL32(255, 255, 0, 255));
+            draw_list->AddRect(drag_area_start, drag_area_end, IM_COL32(255, 171, 64, 255));
             ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
         }
 
@@ -707,7 +922,7 @@ void DrawTimelineEditor(
         const float line_width = 2.5f;
         const float head_width = 12.5f;
         const float head_height = 18.0f;
-        const ImU32 playhead_color = IM_COL32(255, 255, 0, 255);
+        const ImU32 playhead_color = IM_COL32(255, 143, 38, 255);
         const ImU32 shadow_color = IM_COL32(0, 0, 0, 80);
 
         // ===== PRECISE SHADOW ALIGNMENT =====
@@ -799,6 +1014,7 @@ void DrawTimelineEditor(
     ImGui::End();
 
     ImGui::Begin("Active Clips");
+    ApplyWindowBackgroundGradients();
     ImGui::Text("Clip List:");
     ImGui::Separator();
 
@@ -836,6 +1052,7 @@ void UpdatePreview(GLResources& res, const std::vector<Clip>& clips, int width, 
 
 void RenderPreviewWindow(GLuint preview_tex, int preview_width, int preview_height) {
     ImGui::Begin("Video Preview");
+    ApplyWindowBackgroundGradients();
 
     if (preview_tex) {
         // Maintain aspect ratio
