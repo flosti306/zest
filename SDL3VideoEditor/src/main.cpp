@@ -365,7 +365,7 @@ void AddNewClip(std::vector<Clip>& clips, const std::string& input_path, float v
     
     // Attempt to load audio
     PreloadedAudio audio;
-    if (preload_audio_file(input_path, audio)) {
+    if (preload_audio_file(input_path, audio, 0.0f, video_duration)) {
         size_t audio_index = clips.size();
         clips.emplace_back();
         Clip& audio_clip = clips[audio_index]; // Get reference that won't change
@@ -375,7 +375,7 @@ void AddNewClip(std::vector<Clip>& clips, const std::string& input_path, float v
         audio_clip.type = ClipType::Audio;
         audio_clip.start_time = 0.0f;
         audio_clip.duration = video_duration;
-        audio_clip.layer = layer + 1;
+        audio_clip.layer = layer;
         audio_clip.waveform = std::move(audio.waveform);
         
         // Link both ways using pointers that are now safe (no reallocation will happen)
@@ -556,24 +556,94 @@ int main(int argc, char* argv[]) {
                 // Check if the cut is within clip bounds
                 float clip_start_global = selected_clip->start_time;
                 float clip_end_global = selected_clip->start_time + selected_clip->duration;
+                
                 if (cut_time <= clip_start_global || cut_time >= clip_end_global) {
                     std::cout << "Cut is outside clip bounds: " << cut_time << "\n";
                 } else {
+                    // Store a pointer to the linked clip before any operations
+                    Clip* linked_clip_ptr = selected_clip->linked_clip;
+                    
+                    // Calculate relative position of cut within the clip
                     float relative_cut = cut_time - selected_clip->start_time;
                     float new_media_start = selected_clip->media_start + relative_cut;
-            
-                    // First clip: update duration
-                    selected_clip->duration = relative_cut;
-            
-                    // Second clip: create from remaining duration
+                    
+                    // Prepare the second clip (the right part after the cut)
                     Clip new_clip = *selected_clip;
                     new_clip.start_time = cut_time;
                     new_clip.media_start = new_media_start;
                     new_clip.duration = clip_end_global - cut_time;
-            
+                    new_clip.linked_clip = nullptr; // Clear linked clip reference for now
                     new_clip.name += " (cut)";
-                    clips.push_back(new_clip);
-            
+                    
+                    // Store the index before adding the new clip
+                    size_t original_clip_index = 0;
+                    for (size_t i = 0; i < clips.size(); ++i) {
+                        if (&clips[i] == selected_clip) {
+                            original_clip_index = i;
+                            break;
+                        }
+                    }
+                    
+                    // First clip: update duration (the left part of the cut)
+                    selected_clip->duration = relative_cut;
+                    selected_clip->linked_clip = nullptr; // Clear linked clip reference temporarily
+                    
+                    // Handle linked clips if present
+                    if (linked_clip_ptr) {
+                        // Find the index of the linked clip
+                        size_t linked_clip_index = 0;
+                        bool found_linked = false;
+                        
+                        for (size_t i = 0; i < clips.size(); ++i) {
+                            if (&clips[i] == linked_clip_ptr) {
+                                linked_clip_index = i;
+                                found_linked = true;
+                                break;
+                            }
+                        }
+                        
+                        if (found_linked) {
+                            // Create a new clip for the second part of the linked clip
+                            Clip linked_new_clip = *linked_clip_ptr;
+                            linked_new_clip.start_time = cut_time;
+                            linked_new_clip.media_start = linked_clip_ptr->media_start + relative_cut;
+                            linked_new_clip.duration = clip_end_global - cut_time;
+                            linked_new_clip.name += " (cut)";
+                            linked_new_clip.linked_clip = nullptr; // Clear temporarily
+                            
+                            // Adjust the first part of the linked clip
+                            linked_clip_ptr->duration = relative_cut;
+                            linked_clip_ptr->linked_clip = nullptr; // Clear temporarily
+                            
+                            // Add the new linked clip
+                            clips.push_back(linked_new_clip);
+                            Clip* linked_new_clip_ptr = &clips.back();
+                            
+                            // Add the main new clip
+                            clips.push_back(new_clip);
+                            Clip* new_clip_ptr = &clips.back();
+                            
+                            // Re-establish linking between the first parts
+                            selected_clip->linked_clip = linked_clip_ptr;
+                            linked_clip_ptr->linked_clip = selected_clip;
+                            
+                            // Re-establish linking between the second parts
+                            new_clip_ptr->linked_clip = linked_new_clip_ptr;
+                            linked_new_clip_ptr->linked_clip = new_clip_ptr;
+                        } else {
+                            // If we couldn't find the linked clip (shouldn't happen), just add the new clip
+                            clips.push_back(new_clip);
+                            std::cout << "Warning: Linked clip not found during cut operation.\n";
+                        }
+                    } else {
+                        // No linked clip, just add the new clip
+                        clips.push_back(new_clip);
+                    }
+                    
+                    // Update the selected clip to the new (right) clip if desired
+                    // This ensures the user can see the result of the cut and potentially continue cutting
+                    selected_clip = &clips.back();
+                    
                     std::cout << "Blade tool: split clip at " << cut_time << "s\n";
                 }
             }
@@ -764,18 +834,49 @@ void DrawTimelineEditor(
     ImGui::Begin("Timeline Editor");
     ApplyWindowBackgroundGradients();
 
-    const float timeline_width = ImGui::GetContentRegionAvail().x;
+    // Constants
+    const float label_width = 120.0f; // Wider area for labels
+    const float timeline_width = ImGui::GetContentRegionAvail().x - label_width;
     const float layer_height = 60.0f;
     const float layer_padding = 10.0f;
 
-    // Determine the number of layers
-    int max_layer = 0;
-    for (const auto& clip : clips) {
-        max_layer = std::max(max_layer, clip.layer);
-    }
-    max_layer += 1;
+    // Styling constants from theme
+    ImVec4 bg_dark = ImVec4(0.13f, 0.12f, 0.15f, 1.00f);
+    ImVec4 bg_light = ImVec4(0.17f, 0.16f, 0.19f, 1.00f);
+    ImVec4 accent = ImVec4(1.00f, 0.56f, 0.15f, 1.00f);
+    ImVec4 accent_hover = ImVec4(1.00f, 0.67f, 0.25f, 1.00f);
+    ImVec4 accent_active = ImVec4(1.00f, 0.42f, 0.00f, 1.00f);
+    ImVec4 accent_muted = ImVec4(0.85f, 0.48f, 0.12f, 1.00f);
+    ImVec4 text = ImVec4(0.98f, 0.98f, 0.98f, 1.00f);
+    ImVec4 text_secondary = ImVec4(0.80f, 0.80f, 0.80f, 1.00f);
+    ImVec4 frame_bg = ImVec4(0.16f, 0.16f, 0.18f, 1.00f);
 
-    float timeline_height = max_layer * (layer_height + layer_padding);
+    // Convert to IM_COL32 for draw list use
+    ImU32 col_bg_dark = ImGui::ColorConvertFloat4ToU32(bg_dark);
+    ImU32 col_bg_light = ImGui::ColorConvertFloat4ToU32(bg_light);
+    ImU32 col_accent = ImGui::ColorConvertFloat4ToU32(accent);
+    ImU32 col_accent_hover = ImGui::ColorConvertFloat4ToU32(accent_hover);
+    ImU32 col_accent_active = ImGui::ColorConvertFloat4ToU32(accent_active);
+    ImU32 col_accent_muted = ImGui::ColorConvertFloat4ToU32(accent_muted);
+    ImU32 col_text = ImGui::ColorConvertFloat4ToU32(text);
+    ImU32 col_text_secondary = ImGui::ColorConvertFloat4ToU32(text_secondary);
+    ImU32 col_frame_bg = ImGui::ColorConvertFloat4ToU32(frame_bg);
+
+
+    // Determine the number of layers
+    int max_video_layer = 0;
+    int max_audio_layer = 0;
+
+    for (const auto& clip : clips) {
+        if (clip.type == ClipType::Video)
+            max_video_layer = std::max(max_video_layer, clip.layer);
+        else if (clip.type == ClipType::Audio)
+            max_audio_layer = std::max(max_audio_layer, clip.layer);
+    }
+    max_video_layer += 1;
+    max_audio_layer += 1;
+
+    float timeline_height = (max_video_layer + max_audio_layer) * (layer_height + layer_padding);
 
     // === Compute true visible project length
     float project_duration = 0.0f;
@@ -803,16 +904,129 @@ void DrawTimelineEditor(
         playhead_time = std::clamp(focus_ratio * project_duration, 0.0f, project_duration);
     }
 
-    // Draw timeline background
-    ImVec2 timeline_start = ImGui::GetCursorScreenPos();
-    ImVec2 timeline_end = ImVec2(timeline_start.x + timeline_width, timeline_start.y + timeline_height);
+    // Get starting positions for labels and timeline
+    ImVec2 cursor_pos = ImGui::GetCursorScreenPos();
+    ImVec2 labels_start = cursor_pos;
+    ImVec2 timeline_start = ImVec2(labels_start.x + label_width, labels_start.y);
+    
     ImDrawList* draw_list = ImGui::GetWindowDrawList();
-    draw_list->AddRectFilled(timeline_start, timeline_end, IM_COL32(100, 100, 100, 255));
+    
+    // Draw labels background with gradient (top to bottom)
+    ImVec2 labels_end = ImVec2(labels_start.x + label_width, labels_start.y + timeline_height);
+    draw_list->AddRectFilledMultiColor(
+        labels_start, 
+        labels_end,
+        ImGui::ColorConvertFloat4ToU32(ImVec4(0.18f, 0.17f, 0.20f, 1.00f)), // Top color
+        ImGui::ColorConvertFloat4ToU32(ImVec4(0.18f, 0.17f, 0.20f, 1.00f)), // Top right
+        ImGui::ColorConvertFloat4ToU32(ImVec4(0.15f, 0.14f, 0.17f, 1.00f)), // Bottom right
+        ImGui::ColorConvertFloat4ToU32(ImVec4(0.15f, 0.14f, 0.17f, 1.00f))  // Bottom left
+    );
+    
+    // Draw a separator line between labels and timeline
+    draw_list->AddLine(
+        ImVec2(labels_start.x + label_width, labels_start.y),
+        ImVec2(labels_start.x + label_width, labels_start.y + timeline_height),
+        ImGui::ColorConvertFloat4ToU32(ImVec4(0.40f, 0.40f, 0.42f, 0.80f)),
+        2.0f
+    );
 
-    // Layer lines
-    for (int layer = 0; layer < max_layer; ++layer) {
+    // Draw timeline background with subtle gradient
+    ImVec2 timeline_end = ImVec2(timeline_start.x + timeline_width, timeline_start.y + timeline_height);
+    draw_list->AddRectFilledMultiColor(
+        timeline_start, 
+        timeline_end,
+        ImGui::ColorConvertFloat4ToU32(ImVec4(0.16f, 0.16f, 0.18f, 1.00f)), // Top color
+        ImGui::ColorConvertFloat4ToU32(ImVec4(0.16f, 0.16f, 0.18f, 1.00f)), // Top right
+        ImGui::ColorConvertFloat4ToU32(ImVec4(0.14f, 0.14f, 0.16f, 1.00f)), // Bottom right
+        ImGui::ColorConvertFloat4ToU32(ImVec4(0.14f, 0.14f, 0.16f, 1.00f))  // Bottom left
+    );
+
+    // Draw the labels in their own area
+    // Video track labels
+    for (int i = 0; i < max_video_layer; ++i) {
+        float y = labels_start.y + (max_video_layer - i - 1) * (layer_height + layer_padding);
+        
+        // Better styling for labels
+        ImVec2 label_rect_min = ImVec2(labels_start.x, y);
+        ImVec2 label_rect_max = ImVec2(labels_start.x + label_width - 2, y + layer_height);
+        
+         // Gradient background for label using theme colors
+         draw_list->AddRectFilledMultiColor(
+            label_rect_min,
+            label_rect_max,
+            ImGui::ColorConvertFloat4ToU32(ImVec4(0.60f, 0.30f, 0.20f, 1.00f)), // Top
+            ImGui::ColorConvertFloat4ToU32(ImVec4(0.45f, 0.22f, 0.15f, 1.00f)), // Top right
+            ImGui::ColorConvertFloat4ToU32(ImVec4(0.17f, 0.16f, 0.19f, 1.00f)), // Bottom right
+            ImGui::ColorConvertFloat4ToU32(ImVec4(0.17f, 0.16f, 0.19f, 1.00f))  // Bottom left
+        );
+        
+        // Add subtle accent color border
+        draw_list->AddRect(
+            label_rect_min,
+            label_rect_max,
+            ImGui::ColorConvertFloat4ToU32(ImVec4(accent.x, accent.y, accent.z, 0.3f)),
+            4.0f, // Rounded corners
+            0,
+            1.0f  // Line width
+        );
+        
+        // Label text with better positioning and styling
+        std::string label = "Video " + std::to_string(i + 1);
+        ImVec2 text_size = ImGui::CalcTextSize(label.c_str());
+        draw_list->AddText(
+            ImVec2(labels_start.x + (label_width - text_size.x) / 2, y + (layer_height - text_size.y) / 2),
+            col_text,
+            label.c_str()
+        );
+    }
+    
+    // Audio track labels
+    for (int i = 0; i < max_audio_layer; ++i) {
+        float y = labels_start.y + (max_video_layer + i) * (layer_height + layer_padding);
+        
+        // Better styling for labels
+        ImVec2 label_rect_min = ImVec2(labels_start.x, y);
+        ImVec2 label_rect_max = ImVec2(labels_start.x + label_width - 2, y + layer_height);
+        
+        // Gradient background for label with slightly different hue
+        draw_list->AddRectFilledMultiColor(
+            label_rect_min,
+            label_rect_max,
+            ImGui::ColorConvertFloat4ToU32(ImVec4(0.19f, 0.18f, 0.22f, 1.00f)), // Top
+            ImGui::ColorConvertFloat4ToU32(ImVec4(0.19f, 0.18f, 0.22f, 1.00f)), // Top right
+            ImGui::ColorConvertFloat4ToU32(ImVec4(0.25f, 0.30f, 0.45f, 1.00f)), // Bottom right
+            ImGui::ColorConvertFloat4ToU32(ImVec4(0.18f, 0.22f, 0.35f, 1.00f))  // Bottom left
+        );
+        
+        // Add subtle accent color border
+        draw_list->AddRect(
+            label_rect_min,
+            label_rect_max,
+            ImGui::ColorConvertFloat4ToU32(ImVec4(accent.x, accent.y, accent.z, 0.3f)),
+            4.0f, // Rounded corners
+            0,
+            1.0f  // Line width
+        );
+        
+        // Label text with better positioning and styling
+        std::string label = "Audio " + std::to_string(i + 1);
+        ImVec2 text_size = ImGui::CalcTextSize(label.c_str());
+        draw_list->AddText(
+            ImVec2(labels_start.x + (label_width - text_size.x) / 2, y + (layer_height - text_size.y) / 2),
+            col_text,
+            label.c_str()
+        );
+    }
+
+    // Layer lines with subtle styling
+    for (int layer = 0; layer <= (max_video_layer + max_audio_layer); ++layer) {
         float y = timeline_start.y + layer * (layer_height + layer_padding);
-        draw_list->AddLine(ImVec2(timeline_start.x, y), ImVec2(timeline_end.x, y), IM_COL32(255, 255, 255, 255));
+        // Subtle grid lines
+        draw_list->AddLine(
+            ImVec2(timeline_start.x, y),
+            ImVec2(timeline_end.x, y),
+            ImGui::ColorConvertFloat4ToU32(ImVec4(1.0f, 1.0f, 1.0f, 0.12f))
+        );
     }
 
     // === Draw Ruler Overlay ===
@@ -822,6 +1036,13 @@ void DrawTimelineEditor(
     const float tick_alpha_major = 90;
     const float tick_alpha_minor = 40;
     const float label_alpha = 160;
+
+    draw_list->AddLine(
+        ImVec2(timeline_start.x, timeline_start.y),
+        ImVec2(timeline_end.x, timeline_start.y),
+        ImGui::ColorConvertFloat4ToU32(ImVec4(accent.x, accent.y, accent.z, 0.5f)),
+        1.0f
+    );
 
     int major_step = 1;
     while (pixels_per_second * major_step < 80.0f)
@@ -835,14 +1056,16 @@ void DrawTimelineEditor(
             continue;
 
         bool is_major = (t % major_step == 0);
-        ImU32 color = IM_COL32(255, 255, 255, is_major ? tick_alpha_major : tick_alpha_minor);
+        ImU32 tick_color = is_major ? 
+            ImGui::ColorConvertFloat4ToU32(ImVec4(1.0f, 0.71f, 0.52f, 0.3f)) : 
+            ImGui::ColorConvertFloat4ToU32(ImVec4(1.0f, 0.69f, 0.46f, 0.18f));
 
         float tick_height = is_major ? tick_major_height : tick_minor_height;
 
         draw_list->AddLine(
             ImVec2(x, timeline_start.y),
             ImVec2(x, timeline_start.y + tick_height),
-            color
+            tick_color
         );
 
         if (is_major) {
@@ -851,8 +1074,6 @@ void DrawTimelineEditor(
             draw_list->AddText(ImVec2(x + 3, label_y), IM_COL32(255, 255, 255, label_alpha), label);
         }
     }
-
-
 
     static int dragging_clip_index = -1;
     static float drag_offset_time = 0.0f;
@@ -863,35 +1084,121 @@ void DrawTimelineEditor(
     for (size_t i = 0; i < clips.size(); ++i) {
         auto& clip = clips[i];
 
-        float layer_offset_y = clip.layer * (layer_height + layer_padding);
         float clip_start_x = timeline_start.x + (clip.start_time * pixels_per_second);
         float clip_end_x = clip_start_x + (clip.duration * pixels_per_second);
 
-        ImVec2 clip_rect_min = ImVec2(clip_start_x, timeline_start.y + layer_offset_y + layer_padding);
-        ImVec2 clip_rect_max = ImVec2(clip_end_x, timeline_start.y + layer_offset_y + layer_height);
+        int y_index = clip.type == ClipType::Video
+        ? max_video_layer - clip.layer - 1
+        : max_video_layer + clip.layer;
 
-        // Draw clip body
-        ImU32 fill_color = (clip.type == ClipType::Audio) ? IM_COL32(80, 120, 200, 255) : IM_COL32(255, 100, 100, 255);
-        draw_list->AddRectFilled(clip_rect_min, clip_rect_max, fill_color);
-        draw_list->AddRect(clip_rect_min, clip_rect_max, IM_COL32(255, 255, 255, 255));
+        float layer_y = timeline_start.y + y_index * (layer_height + layer_padding);
 
-        // If audio clip, draw waveform
+        ImVec2 clip_rect_min = ImVec2(clip_start_x, layer_y + layer_padding);
+        ImVec2 clip_rect_max = ImVec2(clip_end_x, layer_y + layer_height);
+
+        // Draw clip body with gradient and themed colors
+        ImU32 fill_color_top, fill_color_bottom;
+        if (clip.type == ClipType::Audio) {
+            // Blue gradient for audio with orange tint
+            fill_color_top = ImGui::ColorConvertFloat4ToU32(ImVec4(0.25f, 0.30f, 0.45f, 1.00f));
+            fill_color_bottom = ImGui::ColorConvertFloat4ToU32(ImVec4(0.18f, 0.22f, 0.35f, 1.00f));
+        } else {
+            // Red-orange gradient for video
+            fill_color_top = ImGui::ColorConvertFloat4ToU32(ImVec4(0.60f, 0.30f, 0.20f, 1.00f));
+            fill_color_bottom = ImGui::ColorConvertFloat4ToU32(ImVec4(0.45f, 0.22f, 0.15f, 1.00f));
+        }
+        
+        // Draw clip body with gradient
+        draw_list->AddRectFilledMultiColor(
+            clip_rect_min,
+            clip_rect_max,
+            fill_color_top,
+            fill_color_top,
+            fill_color_bottom,
+            fill_color_bottom
+        );
+        
+        // Draw clip border with slight rounding
+        ImU32 border_color = ImGui::ColorConvertFloat4ToU32(ImVec4(0.65f, 0.65f, 0.68f, 0.8f));
+        draw_list->AddRect(
+            clip_rect_min,
+            clip_rect_max,
+            border_color,
+            4.0f, // Rounded corners
+            0,
+            1.0f  // Line width
+        );
+
+        // Clip title with shadow effect for better readability
+        std::string clip_title = clip.name;
+        ImVec2 title_size = ImGui::CalcTextSize(clip_title.c_str());
+        ImVec2 title_pos = ImVec2(clip_rect_min.x + 6, clip_rect_min.y + 6);
+        
+        // Text shadow
+        draw_list->AddText(
+            ImVec2(title_pos.x + 1, title_pos.y + 1),
+            ImGui::ColorConvertFloat4ToU32(ImVec4(0.0f, 0.0f, 0.0f, 0.6f)),
+            clip_title.c_str()
+        );
+        
+        // Actual text
+        draw_list->AddText(
+            title_pos,
+            ImGui::ColorConvertFloat4ToU32(ImVec4(0.95f, 0.95f, 0.95f, 0.95f)),
+            clip_title.c_str()
+        );
+
+        // If audio clip, draw stylized waveform
         if (clip.type == ClipType::Audio && !clip.waveform.empty()) {
             int waveform_samples = clip.waveform.size();
+            ImU32 waveform_color = ImGui::ColorConvertFloat4ToU32(ImVec4(1.0f, 0.9f, 0.7f, 0.8f));
+            ImU32 waveform_highlight = ImGui::ColorConvertFloat4ToU32(ImVec4(1.0f, 0.75f, 0.4f, 0.9f));
+            
+            float center_y = (clip_rect_min.y + clip_rect_max.y) / 2.0f;
+            float max_height = (clip_rect_max.y - clip_rect_min.y) * 0.7f;
+            
             for (int s = 0; s < waveform_samples; ++s) {
                 float amp = clip.waveform[s];
                 float norm = float(s) / waveform_samples;
                 float x = clip_rect_min.x + norm * (clip_rect_max.x - clip_rect_min.x);
-                float center_y = (clip_rect_min.y + clip_rect_max.y) / 2.0f;
-                float height = (clip_rect_max.y - clip_rect_min.y) * amp * 0.8f;
-                draw_list->AddLine(ImVec2(x, center_y - height), ImVec2(x, center_y + height), IM_COL32(255, 200, 200, 255));
+                float height = max_height * amp;
+                
+                // Gradient color based on amplitude
+                auto Lerp = [](const ImVec4& a, const ImVec4& b, float t) {
+                    return ImVec4(
+                        a.x + t * (b.x - a.x),
+                        a.y + t * (b.y - a.y),
+                        a.z + t * (b.z - a.z),
+                        a.w + t * (b.w - a.w)
+                    );
+                };
+                ImU32 line_color = ImGui::GetColorU32(Lerp(
+                    ImVec4(0.6f, 0.7f, 0.9f, 0.7f),
+                    ImVec4(accent.x, accent.y, accent.z, 0.9f),
+                    amp
+                ));
+                
+                draw_list->AddLine(
+                    ImVec2(x, center_y - height), 
+                    ImVec2(x, center_y + height), 
+                    line_color,
+                    1.0f
+                );
             }
         }
 
-        
 
+        // Selection highlight with accent color
         if (&clip == selected_clip) {
-            draw_list->AddRect(clip_rect_min, clip_rect_max, IM_COL32(255, 171, 64, 255), 0.0f, 0, 3.0f);
+            // Highlight with orange accent color from theme
+            draw_list->AddRect(
+                clip_rect_min, 
+                clip_rect_max, 
+                col_accent,
+                4.0f, // Rounded corners
+                0,
+                2.0f  // Thicker line for selection
+            );
             clip.selected = true;
         } else {
             clip.selected = false;
@@ -945,6 +1252,7 @@ void DrawTimelineEditor(
         float handle_w = 6.0f;
         ImVec2 left_min = ImVec2(clip_start_x - handle_w / 2, clip_rect_min.y);
         ImVec2 left_max = ImVec2(clip_start_x + handle_w / 2, clip_rect_max.y);
+
         ImGui::SetCursorScreenPos(left_min);
         ImGui::InvisibleButton(("clip_resize_L" + std::to_string(i)).c_str(), ImVec2(handle_w, clip_rect_max.y - clip_rect_min.y));
         if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
@@ -970,6 +1278,7 @@ void DrawTimelineEditor(
         // Right resizing
         ImVec2 right_min = ImVec2(clip_end_x - handle_w / 2, clip_rect_min.y);
         ImVec2 right_max = ImVec2(clip_end_x + handle_w / 2, clip_rect_max.y);
+
         ImGui::SetCursorScreenPos(right_min);
         ImGui::InvisibleButton(("clip_resize_R" + std::to_string(i)).c_str(), ImVec2(handle_w, clip_rect_max.y - clip_rect_min.y));
         if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
@@ -994,15 +1303,21 @@ void DrawTimelineEditor(
         ImGui::InvisibleButton(("clip_context" + std::to_string(i)).c_str(), 
                             ImVec2(clip_rect_max.x - clip_rect_min.x, clip_rect_max.y - clip_rect_min.y));
 
-        // Context menu for linking
+        // Context menu for linking with themed style
         if (ImGui::BeginPopupContextItem(("clip_context" + std::to_string(i)).c_str())) {
+            ImGui::PushStyleColor(ImGuiCol_Text, text);
+            ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(accent.x, accent.y, accent.z, 0.55f));
+            ImGui::PushStyleColor(ImGuiCol_HeaderHovered, accent_hover);
+            ImGui::PushStyleColor(ImGuiCol_HeaderActive, accent_active);
+            
             if (clip.linked_clip && ImGui::MenuItem("Unlink Audio/Video")) {
                 clip.linked_clip->linked_clip = nullptr;
                 clip.linked_clip = nullptr;
             }
+            
+            ImGui::PopStyleColor(4);
             ImGui::EndPopup();
         }      
-        
     }
 
     // Playhead rendering
@@ -1073,7 +1388,7 @@ void DrawTimelineEditor(
         playhead_color
     );
 
-    // Dragging the playhead
+    // Dragging the playhead (only within timeline area)
     static bool dragging_playhead = false;
     ImGui::SetCursorScreenPos(ImVec2(playhead_x - 3, timeline_start.y));
     ImGui::InvisibleButton("##Playhead", ImVec2(6, timeline_height));
@@ -1086,14 +1401,18 @@ void DrawTimelineEditor(
         dragging_playhead = false;
     }
 
-    // Clicking anywhere to move playhead
+    // Clicking anywhere to move playhead (only within timeline area)
     if (!clicked_on_clip && ImGui::IsWindowHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
         ImVec2 mouse = ImGui::GetMousePos();
-        if (mouse.y > timeline_start.y && mouse.y < timeline_end.y) {
+        if (mouse.y > timeline_start.y && mouse.y < timeline_end.y && 
+            mouse.x > timeline_start.x && mouse.x < timeline_end.x) {
             playhead_time = (mouse.x - timeline_start.x) / pixels_per_second;
             playhead_time = std::clamp(playhead_time, 0.0f, max_duration);
         }
     }
+
+    // Need to advance cursor past the timeline for future components
+    ImGui::SetCursorScreenPos(ImVec2(labels_start.x, labels_start.y + timeline_height + 5));
 
     ImGui::End();
 

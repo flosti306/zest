@@ -734,7 +734,7 @@ bool start_video_export(const std::string& output_path, int width, int height, i
 
     // Preload audio
     for (const auto& clip : sorted_clips) {
-        if (is_video_file(clip.path)) {
+        if (is_video_file(clip.path) && clip.type == ClipType::Audio) {
             PreloadedAudio preload;
             if (preload_audio_file(clip.path, preload, clip.media_start, clip.duration)) {
                 res.preloaded_audio[clip.path] = std::move(preload);
@@ -781,6 +781,8 @@ bool start_video_export(const std::string& output_path, int width, int height, i
         // Mix audio from preloaded buffers
         std::fill(audio_float.begin(), audio_float.end(), 0.0f);
         for (const auto& clip : sorted_clips) {
+            if (clip.type != ClipType::Audio) continue; // <<< ONLY MIX AUDIO CLIPS
+        
             if (current_time >= clip.start_time && current_time < clip.start_time + clip.duration) {
                 float local_time = current_time - clip.start_time;
                 auto it = res.preloaded_audio.find(clip.path);
@@ -788,12 +790,12 @@ bool start_video_export(const std::string& output_path, int width, int height, i
                     const PreloadedAudio& audio = it->second;
                     int start_sample = static_cast<int>(local_time * audio.sample_rate);
                     int max_samples = samples_per_frame;
-
+        
                     for (int i = 0; i < max_samples; ++i) {
                         int sample_idx = start_sample + i;
                         if (sample_idx * audio.channels + 1 >= (int)audio.samples.size())
                             break;
-
+        
                         for (int ch = 0; ch < audio.channels; ++ch) {
                             int16_t s = audio.samples[sample_idx * audio.channels + ch];
                             audio_float[i * audio.channels + ch] += s / 32768.0f;
@@ -802,6 +804,7 @@ bool start_video_export(const std::string& output_path, int width, int height, i
                 }
             }
         }
+        
 
         // Convert float to int16 and write
         for (size_t j = 0; j < audio_float.size(); ++j) {
