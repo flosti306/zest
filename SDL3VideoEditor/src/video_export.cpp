@@ -237,6 +237,11 @@ bool init_video(GLResources& res, const std::string& path) {
 }
 
 bool update_video_frame(VideoData& video, float target_time_seconds) {
+    if (video.texture_id == 0) {
+        std::cerr << "Texture not initialized!\n";
+    }
+    
+
     // Make sure time base is initialized
     if (video.time_base == 0) {
         video.time_base = av_q2d(video.format_ctx->streams[video.video_stream_idx]->time_base);
@@ -483,7 +488,7 @@ void render_frame(GLResources& res, float current_time,
     // Render clips sorted by layer
     for (const auto& clip : sorted_clips) {
         if (current_time >= clip.start_time && 
-            current_time <= (clip.start_time + clip.duration)) {
+            current_time <= (clip.start_time + clip.duration) && clip.type == ClipType::Video) {
             
             std::cout << "Rendering clip: " << clip.path << " at time " << current_time << std::endl;
             
@@ -669,6 +674,9 @@ done:
     out.channels = 2;
     out.duration = (float)out.samples.size() / (2.0f * 44100.0f); // stereo
 
+    out.waveform = GenerateWaveformPreview(out.samples, out.channels, 256);
+
+
     av_channel_layout_uninit(&stereo);
     av_frame_free(&frame);
     av_packet_free(&pkt);
@@ -844,4 +852,22 @@ bool start_video_export(const std::string& output_path, int width, int height, i
     glBindTexture(GL_TEXTURE_2D, previous_texture);
 
     return true;
+}
+
+std::vector<float> GenerateWaveformPreview(const std::vector<int16_t>& samples, int channels, int samples_per_pixel = 256) {
+    std::vector<float> waveform;
+    int total_samples = samples.size() / channels;
+
+    for (int i = 0; i < total_samples; i += samples_per_pixel) {
+        float max_amp = 0.0f;
+        for (int j = 0; j < samples_per_pixel && (i + j) < total_samples; ++j) {
+            for (int ch = 0; ch < channels; ++ch) {
+                float sample = samples[(i + j) * channels + ch] / 32768.0f;
+                max_amp = std::max(max_amp, std::abs(sample));
+            }
+        }
+        waveform.push_back(max_amp);
+    }
+
+    return waveform;
 }

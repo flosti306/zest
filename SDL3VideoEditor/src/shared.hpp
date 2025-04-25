@@ -1,6 +1,11 @@
 #pragma once
 #include <string>
 
+enum class ClipType {
+    Video,
+    Audio
+};
+
 struct Clip {
     std::string name;
     
@@ -12,6 +17,8 @@ struct Clip {
 
     float media_start = 0.0f; // where in the source video to start
 
+    ClipType type = ClipType::Video;
+
     // Transform attributes
     float pos_x = 0.0f;      // normalized [-1, 1] or pixel values (we can decide)
     float pos_y = 0.0f;
@@ -19,4 +26,11 @@ struct Clip {
     float opacity = 1.0f;    // 0.0 to 1.0
 
     bool selected = false;
+
+    bool has_audio = true;
+    bool is_audio_only = false;
+    std::vector<float> waveform;     // normalized audio samples [-1.0, 1.0]
+
+    Clip* linked_clip = nullptr; // for audio/video pairs
+
 };

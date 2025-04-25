@@ -107,12 +107,9 @@ if (condition) { \
 // Forward declaration
 void DrawTimelineEditor(
     std::vector<Clip>& clips,
-    int& playhead_position,
-    float& start_time,
-    float& duration,
+    float& playhead_time,
     float& max_duration,
     float& zoom_factor,
-    int& last_playhead_position,
     bool& layers_changed
 );
 
@@ -349,9 +346,44 @@ void ApplyWindowBackgroundGradients() {
 
 
 void AddNewClip(std::vector<Clip>& clips, const std::string& input_path, float video_duration, int layer = 0) {
-    std::string clip_name = std::filesystem::path(input_path).filename().string();
-    clips.push_back(Clip{clip_name, 0, video_duration, layer, input_path});  // Default start at 0 and a default duration
+    // Reserve space for 2 potential new clips
+    clips.reserve(clips.size() + 2);
+    
+    std::string base_name = std::filesystem::path(input_path).filename().string();
+    
+    // Create video clip
+    size_t video_index = clips.size();
+    clips.emplace_back();
+    Clip& video_clip = clips[video_index]; // Get reference that won't change
+    
+    video_clip.name = base_name + " [Video]";
+    video_clip.path = input_path;
+    video_clip.type = ClipType::Video;
+    video_clip.start_time = 0.0f;
+    video_clip.duration = video_duration;
+    video_clip.layer = layer;
+    
+    // Attempt to load audio
+    PreloadedAudio audio;
+    if (preload_audio_file(input_path, audio)) {
+        size_t audio_index = clips.size();
+        clips.emplace_back();
+        Clip& audio_clip = clips[audio_index]; // Get reference that won't change
+        
+        audio_clip.name = base_name + " [Audio]";
+        audio_clip.path = input_path;
+        audio_clip.type = ClipType::Audio;
+        audio_clip.start_time = 0.0f;
+        audio_clip.duration = video_duration;
+        audio_clip.layer = layer + 1;
+        audio_clip.waveform = std::move(audio.waveform);
+        
+        // Link both ways using pointers that are now safe (no reallocation will happen)
+        audio_clip.linked_clip = &clips[video_index];
+        video_clip.linked_clip = &clips[audio_index];
+    }
 }
+
 
 // Modified get_video_duration using FFmpeg
 float get_video_duration(const std::string& input_path) {
@@ -510,6 +542,7 @@ int main(int argc, char* argv[]) {
                     AddNewClip(clips, input_path, video_duration);
                     load_textures(gl_resources, clips);
                     UpdatePreview(gl_resources, clips, preview_width, preview_height, playhead_time);
+                    
                 }
             }
 
@@ -575,7 +608,7 @@ int main(int argc, char* argv[]) {
         ImGui::Text("Set output file path:");
         ImGui::InputText("Output Path", output_path, IM_ARRAYSIZE(output_path));
 
-        DrawTimelineEditor(clips, playhead_position, start_time, duration, max_duration, zoom_factor, last_playhead_position, layers_changed);
+        DrawTimelineEditor(clips, playhead_time, max_duration, zoom_factor, layers_changed);
 
         if (playhead_position != last_playhead_position || layers_changed) {
             UpdatePreview(gl_resources, clips, preview_width, preview_height, playhead_time);
@@ -655,7 +688,7 @@ int main(int argc, char* argv[]) {
         ImGui::Begin("Timeline");
         ApplyWindowBackgroundGradients();
         ImGui::Text("Playhead: %.2f sec", playhead_time);
-        ImGui::SliderFloat("Seek", &playhead_time, 0.0f, 60.0f); // replace 60 with actual duration if needed
+        ImGui::SliderFloat("Seek", &playhead_time, 0.0f, max_duration); // replace 60 with actual duration if needed
         ImGui::End();
 
         ImGui::Begin("Inspector");
@@ -723,23 +756,19 @@ int main(int argc, char* argv[]) {
 
 void DrawTimelineEditor(
     std::vector<Clip>& clips,
-    int& playhead_position,
-    float& start_time,
-    float& duration,
+    float& playhead_time,
     float& max_duration,
     float& zoom_factor,
-    int& last_playhead_position,
     bool& layers_changed
 ) {
     ImGui::Begin("Timeline Editor");
     ApplyWindowBackgroundGradients();
 
-    float timeline_width = ImGui::GetContentRegionAvail().x;
-    const float resize_edge_area = 10.0f;
-    const float move_area_width = 20.0f;
+    const float timeline_width = ImGui::GetContentRegionAvail().x;
     const float layer_height = 60.0f;
     const float layer_padding = 10.0f;
 
+    // Determine the number of layers
     int max_layer = 0;
     for (const auto& clip : clips) {
         max_layer = std::max(max_layer, clip.layer);
@@ -748,269 +777,324 @@ void DrawTimelineEditor(
 
     float timeline_height = max_layer * (layer_height + layer_padding);
 
-    ImGui::Text("Timeline:");
-    ImGui::Separator();
+    // === Compute true visible project length
+    float project_duration = 0.0f;
+    for (const auto& clip : clips) {
+        float clip_end = clip.start_time + clip.duration;
+        if (clip_end > project_duration)
+            project_duration = clip_end;
+    }
 
-    if (ImGui::Button("Zoom In")) zoom_factor *= 1.1f;
+    max_duration = project_duration;
+
+    float pixels_per_second = 100.0f * zoom_factor;
+    float timeline_size = project_duration * pixels_per_second;
+
+    // Zoom buttons
+    float focus_ratio = playhead_time / max_duration;
+
+    if (ImGui::Button("Zoom In")) {
+        zoom_factor *= 1.1f;
+        playhead_time = std::clamp(focus_ratio * project_duration, 0.0f, project_duration);
+    }
     ImGui::SameLine();
     if (ImGui::Button("Zoom Out")) {
         zoom_factor /= 1.1f;
-        max_duration *= 1.1f;
+        playhead_time = std::clamp(focus_ratio * project_duration, 0.0f, project_duration);
     }
 
-    for (const auto& clip : clips) {
-        max_duration = std::max(max_duration, clip.start_time + clip.duration);
-    }
-
-    int timeline_size = max_duration / zoom_factor;
-
+    // Draw timeline background
     ImVec2 timeline_start = ImGui::GetCursorScreenPos();
     ImVec2 timeline_end = ImVec2(timeline_start.x + timeline_width, timeline_start.y + timeline_height);
     ImDrawList* draw_list = ImGui::GetWindowDrawList();
     draw_list->AddRectFilled(timeline_start, timeline_end, IM_COL32(100, 100, 100, 255));
 
+    // Layer lines
     for (int layer = 0; layer < max_layer; ++layer) {
         float y = timeline_start.y + layer * (layer_height + layer_padding);
         draw_list->AddLine(ImVec2(timeline_start.x, y), ImVec2(timeline_end.x, y), IM_COL32(255, 255, 255, 255));
     }
 
+    // === Draw Ruler Overlay ===
+    const float tick_major_height = timeline_height;
+    const float tick_minor_height = timeline_height;
+    const float label_y = timeline_start.y - 18.0f; // above timeline
+    const float tick_alpha_major = 90;
+    const float tick_alpha_minor = 40;
+    const float label_alpha = 160;
+
+    int major_step = 1;
+    while (pixels_per_second * major_step < 80.0f)
+        major_step *= 2;
+
+    int num_ticks = int(project_duration) + 4;
+    for (int t = 0; t < num_ticks; ++t) {
+        float x = timeline_start.x + t * pixels_per_second;
+
+        if (x < timeline_start.x - 100 || x > timeline_end.x + 100)
+            continue;
+
+        bool is_major = (t % major_step == 0);
+        ImU32 color = IM_COL32(255, 255, 255, is_major ? tick_alpha_major : tick_alpha_minor);
+
+        float tick_height = is_major ? tick_major_height : tick_minor_height;
+
+        draw_list->AddLine(
+            ImVec2(x, timeline_start.y),
+            ImVec2(x, timeline_start.y + tick_height),
+            color
+        );
+
+        if (is_major) {
+            char label[16];
+            snprintf(label, sizeof(label), "%d", t);
+            draw_list->AddText(ImVec2(x + 3, label_y), IM_COL32(255, 255, 255, label_alpha), label);
+        }
+    }
+
+
+
     static int dragging_clip_index = -1;
-    static float drag_offset_x = 0.0f;
+    static float drag_offset_time = 0.0f;
     static bool resizing_left = false;
     static bool resizing_right = false;
-
-    // Deselect if clicked empty space
     bool clicked_on_clip = false;
 
     for (size_t i = 0; i < clips.size(); ++i) {
         auto& clip = clips[i];
 
         float layer_offset_y = clip.layer * (layer_height + layer_padding);
-        float clip_start_x = timeline_start.x + (clip.start_time / max_duration) * timeline_width * zoom_factor;
-        float clip_end_x = clip_start_x + (clip.duration / max_duration) * timeline_width * zoom_factor;
+        float clip_start_x = timeline_start.x + (clip.start_time * pixels_per_second);
+        float clip_end_x = clip_start_x + (clip.duration * pixels_per_second);
 
         ImVec2 clip_rect_min = ImVec2(clip_start_x, timeline_start.y + layer_offset_y + layer_padding);
         ImVec2 clip_rect_max = ImVec2(clip_end_x, timeline_start.y + layer_offset_y + layer_height);
 
-        // Draw base and border
-        draw_list->AddRectFilled(clip_rect_min, clip_rect_max, IM_COL32(255, 100, 100, 255));
+        // Draw clip body
+        ImU32 fill_color = (clip.type == ClipType::Audio) ? IM_COL32(80, 120, 200, 255) : IM_COL32(255, 100, 100, 255);
+        draw_list->AddRectFilled(clip_rect_min, clip_rect_max, fill_color);
         draw_list->AddRect(clip_rect_min, clip_rect_max, IM_COL32(255, 255, 255, 255));
 
-        // Highlight selected
+        // If audio clip, draw waveform
+        if (clip.type == ClipType::Audio && !clip.waveform.empty()) {
+            int waveform_samples = clip.waveform.size();
+            for (int s = 0; s < waveform_samples; ++s) {
+                float amp = clip.waveform[s];
+                float norm = float(s) / waveform_samples;
+                float x = clip_rect_min.x + norm * (clip_rect_max.x - clip_rect_min.x);
+                float center_y = (clip_rect_min.y + clip_rect_max.y) / 2.0f;
+                float height = (clip_rect_max.y - clip_rect_min.y) * amp * 0.8f;
+                draw_list->AddLine(ImVec2(x, center_y - height), ImVec2(x, center_y + height), IM_COL32(255, 200, 200, 255));
+            }
+        }
+
+        
+
         if (&clip == selected_clip) {
-            draw_list->AddRect(clip_rect_min, clip_rect_max, IM_COL32(255, 107, 0, 255), 0.0f, 0, 3.0f);
+            draw_list->AddRect(clip_rect_min, clip_rect_max, IM_COL32(255, 171, 64, 255), 0.0f, 0, 3.0f);
             clip.selected = true;
         } else {
             clip.selected = false;
         }
 
-        // Only select if not dragging or resizing
-        bool hovering_entire_clip = ImGui::IsMouseHoveringRect(clip_rect_min, clip_rect_max);
+        // Selection
         if (!resizing_left && !resizing_right && dragging_clip_index == -1 &&
-            hovering_entire_clip && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            ImGui::IsMouseHoveringRect(clip_rect_min, clip_rect_max) && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
             selected_clip = &clip;
             clicked_on_clip = true;
         }
 
-
-        // Dragging
-        ImVec2 drag_area_start = ImVec2(clip_start_x + move_area_width, clip_rect_min.y);
-        ImVec2 drag_area_end = ImVec2(clip_end_x - move_area_width, clip_rect_max.y);
-        ImGui::SetCursorScreenPos(drag_area_start);
-        ImGui::InvisibleButton(("clip_move" + std::to_string(i)).c_str(), ImVec2(drag_area_end.x - drag_area_start.x, layer_height - layer_padding));
-
-        if (ImGui::IsItemHovered()) {
-            draw_list->AddRect(drag_area_start, drag_area_end, IM_COL32(255, 171, 64, 255));
-            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
+        // Deselect if clicked outside any clips
+        if (!clicked_on_clip && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && ImGui::IsWindowHovered()) {
+            selected_clip = nullptr;
         }
 
+        // Clip dragging
+        ImVec2 drag_area_start = ImVec2(clip_start_x + 10.0f, clip_rect_min.y);
+        ImVec2 drag_area_end = ImVec2(clip_end_x - 10.0f, clip_rect_max.y);
+        ImGui::SetCursorScreenPos(drag_area_start);
+        ImGui::InvisibleButton(("clip_drag" + std::to_string(i)).c_str(), ImVec2(drag_area_end.x - drag_area_start.x, drag_area_end.y - drag_area_start.y));
+
+        if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
+
         if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
-            if (dragging_clip_index == -1 && !resizing_left && !resizing_right) {
+            if (dragging_clip_index == -1) {
                 dragging_clip_index = i;
-                drag_offset_x = ImGui::GetMousePos().x - clip_start_x;
+                float mouse_x = ImGui::GetMousePos().x;
+                drag_offset_time = (mouse_x - clip_start_x) / pixels_per_second;
             }
 
             if (dragging_clip_index == i) {
                 float mouse_x = ImGui::GetMousePos().x;
-                float new_start_time = ((mouse_x - drag_offset_x - timeline_start.x) / timeline_width * zoom_factor) * max_duration;
-                new_start_time = std::max(0.0f, new_start_time);
-                new_start_time = std::min(new_start_time, max_duration - clip.duration);
-                clip.start_time = new_start_time;
+                float new_start = (mouse_x - timeline_start.x) / pixels_per_second - drag_offset_time;
+                new_start = std::max(0.0f, new_start);
+                float old_start = clip.start_time;
+                clip.start_time = new_start;
+
+                // Sync linked clip's start_time if it's not actively being dragged or resized
+                if (clip.linked_clip && clip.linked_clip != selected_clip) {
+                    float delta = new_start - old_start;
+                    clip.linked_clip->start_time += delta;
+                }
             }
         } else if (dragging_clip_index == i) {
             dragging_clip_index = -1;
         }
 
-        // Resizing (left and right)
-        float resize_handle_size = 6.0f;
-        ImVec2 left_handle_min = ImVec2(clip_start_x - resize_handle_size / 2, clip_rect_min.y);
-        ImVec2 left_handle_max = ImVec2(clip_start_x + resize_handle_size / 2, clip_rect_max.y);
-        ImVec2 right_handle_min = ImVec2(clip_end_x - resize_handle_size / 2, clip_rect_min.y);
-        ImVec2 right_handle_max = ImVec2(clip_end_x + resize_handle_size / 2, clip_rect_max.y);
-
-        draw_list->AddRectFilled(left_handle_min, left_handle_max, IM_COL32(255, 255, 255, 255));
-        draw_list->AddRectFilled(right_handle_min, right_handle_max, IM_COL32(255, 255, 255, 255));
-
-        // Left resize
-        ImGui::SetCursorScreenPos(left_handle_min);
-        ImGui::InvisibleButton(("clip_resize_left" + std::to_string(i)).c_str(), ImVec2(resize_handle_size, layer_height - layer_padding));
+        // Left resizing
+        float handle_w = 6.0f;
+        ImVec2 left_min = ImVec2(clip_start_x - handle_w / 2, clip_rect_min.y);
+        ImVec2 left_max = ImVec2(clip_start_x + handle_w / 2, clip_rect_max.y);
+        ImGui::SetCursorScreenPos(left_min);
+        ImGui::InvisibleButton(("clip_resize_L" + std::to_string(i)).c_str(), ImVec2(handle_w, clip_rect_max.y - clip_rect_min.y));
         if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
 
         if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
             if (!resizing_right) {
                 resizing_left = true;
                 float mouse_x = ImGui::GetMousePos().x;
-                float new_start_time = ((mouse_x - timeline_start.x) / timeline_width * zoom_factor) * max_duration;
-                float new_duration = clip.duration + (clip.start_time - new_start_time);
-                new_start_time = std::max(0.0f, new_start_time);
-                new_duration = std::max(1.0f, std::min(max_duration - new_start_time, new_duration));
-                
-                float delta = new_start_time - clip.start_time;
+                float new_start = (mouse_x - timeline_start.x) / pixels_per_second;
+                float new_duration = clip.start_time + clip.duration - new_start;
+                float delta = new_start - clip.start_time;
+                if (delta > 0.0f) clip.media_start += delta;
+                clip.start_time = std::max(0.0f, new_start);
+                clip.duration = std::max(0.1f, new_duration);
 
-                if (delta > 0) {
-                    clip.media_start += delta;
+                if (clip.linked_clip && clip.linked_clip != selected_clip) {
+                    clip.linked_clip->start_time += delta;
+                    clip.linked_clip->duration = clip.duration;
                 }
-                clip.start_time = new_start_time;
-                clip.duration = new_duration;
             }
-        } else if (resizing_left) {
-            resizing_left = false;
-        }
+        } else if (resizing_left) resizing_left = false;
 
-        // Right resize
-        ImGui::SetCursorScreenPos(right_handle_min);
-        ImGui::InvisibleButton(("clip_resize_right" + std::to_string(i)).c_str(), ImVec2(resize_handle_size, layer_height - layer_padding));
+        // Right resizing
+        ImVec2 right_min = ImVec2(clip_end_x - handle_w / 2, clip_rect_min.y);
+        ImVec2 right_max = ImVec2(clip_end_x + handle_w / 2, clip_rect_max.y);
+        ImGui::SetCursorScreenPos(right_min);
+        ImGui::InvisibleButton(("clip_resize_R" + std::to_string(i)).c_str(), ImVec2(handle_w, clip_rect_max.y - clip_rect_min.y));
         if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
 
         if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
             if (!resizing_left) {
                 resizing_right = true;
                 float mouse_x = ImGui::GetMousePos().x;
-                float new_duration = ((mouse_x - clip_start_x) / timeline_width / zoom_factor) * max_duration;
-                new_duration = std::max(1.0f, std::min(max_duration - clip.start_time, new_duration));
-                clip.duration = new_duration;
-            }
-        } else if (resizing_right) {
-            resizing_right = false;
-        }
+                float new_end = (mouse_x - timeline_start.x) / pixels_per_second;
+                float old_duration = clip.duration;
+                clip.duration = std::max(0.1f, new_end - clip.start_time);
 
-        // Layer buttons
-        ImGui::SetCursorScreenPos(ImVec2(clip_start_x, clip_rect_max.y + 5));
-        ImGui::Text("Layer:");
-        ImGui::SameLine();
-        if (ImGui::Button(("<##" + std::to_string(i)).c_str())) {
-            clip.layer = std::max(0, clip.layer - 1);
-            layers_changed = true;
-        }
-        ImGui::SameLine();
-        if (ImGui::Button((">##" + std::to_string(i)).c_str())) {
-            clip.layer = clip.layer + 1;
-            layers_changed = true;
+                float delta = clip.duration - old_duration;
+                if (clip.linked_clip && clip.linked_clip != selected_clip) {
+                    clip.linked_clip->duration += delta;
+                }
+            }
+        } else if (resizing_right) resizing_right = false;
+
+        // Create unique ID and hit area for context menu
+        ImGui::SetCursorScreenPos(clip_rect_min);
+        ImGui::InvisibleButton(("clip_context" + std::to_string(i)).c_str(), 
+                            ImVec2(clip_rect_max.x - clip_rect_min.x, clip_rect_max.y - clip_rect_min.y));
+
+        // Context menu for linking
+        if (ImGui::BeginPopupContextItem(("clip_context" + std::to_string(i)).c_str())) {
+            if (clip.linked_clip && ImGui::MenuItem("Unlink Audio/Video")) {
+                clip.linked_clip->linked_clip = nullptr;
+                clip.linked_clip = nullptr;
+            }
+            ImGui::EndPopup();
+        }      
+        
+    }
+
+    // Playhead rendering
+    float playhead_x = timeline_start.x + playhead_time * pixels_per_second;
+    
+    const float line_width = 2.5f;
+    const float head_width = 12.5f;
+    const float head_height = 18.0f;
+    const ImU32 playhead_color = IM_COL32(255, 143, 38, 255);
+    const ImU32 shadow_color = IM_COL32(0, 0, 0, 80);
+
+    // ===== PRECISE SHADOW ALIGNMENT =====
+    const float shadow_offset = 1.5f;
+    const float shadow_blur = 3.0f;
+
+    // Head shadow (mathematically offset path)
+    draw_list->PathClear();
+    draw_list->PathLineTo(ImVec2(playhead_x + shadow_offset, timeline_start.y + head_height + shadow_offset));
+    draw_list->PathBezierCubicCurveTo(
+        ImVec2(playhead_x - head_width*0.42f + shadow_offset, timeline_start.y + head_height*0.66f + shadow_offset),
+        ImVec2(playhead_x - head_width*0.66f + shadow_offset, timeline_start.y + line_width + shadow_offset),
+        ImVec2(playhead_x + shadow_offset, timeline_start.y + shadow_offset)
+    );
+    draw_list->PathBezierCubicCurveTo(
+        ImVec2(playhead_x + head_width*0.66f + shadow_offset, timeline_start.y + line_width + shadow_offset),
+        ImVec2(playhead_x + head_width*0.42f + shadow_offset, timeline_start.y + head_height*0.66f + shadow_offset),
+        ImVec2(playhead_x + shadow_offset, timeline_start.y + head_height + shadow_offset)
+    );
+    draw_list->PathStroke(shadow_color, false, shadow_blur);
+
+    // Line shadow with perfect width matching
+    draw_list->AddLine(
+        ImVec2(playhead_x + shadow_offset, timeline_start.y + head_height + shadow_offset - line_width/2),
+        ImVec2(playhead_x + shadow_offset, timeline_start.y + timeline_height),
+        shadow_color, line_width + shadow_blur
+    );
+
+    // ===== MATHEMATICALLY PERFECT HEAD-LINE CONNECTION =====
+    const float connection_radius = line_width * 0.8f;
+    const ImVec2 connection_point = ImVec2(playhead_x, timeline_start.y + head_height - connection_radius);
+
+    // Head shape with exact line-width termination
+    draw_list->PathClear();
+    draw_list->PathLineTo(connection_point);
+    draw_list->PathBezierCubicCurveTo(
+        ImVec2(playhead_x - head_width*0.47f, timeline_start.y + head_height*0.6f),
+        ImVec2(playhead_x - head_width*0.65f, timeline_start.y + line_width*1.95f),
+        ImVec2(playhead_x, timeline_start.y)
+    );
+    draw_list->PathBezierCubicCurveTo(
+        ImVec2(playhead_x + head_width*0.65f, timeline_start.y + line_width*1.95f),
+        ImVec2(playhead_x + head_width*0.47f, timeline_start.y + head_height*0.6f),
+        connection_point
+    );
+    draw_list->PathFillConvex(playhead_color);
+
+    // Vertical line with exact width matching
+    draw_list->AddLine(
+        connection_point,
+        ImVec2(playhead_x - 1.0f, timeline_start.y + timeline_height),
+        playhead_color, line_width
+    );
+
+    // Connection reinforcement
+    draw_list->AddCircleFilled(
+        connection_point,
+        connection_radius,
+        playhead_color
+    );
+
+    // Dragging the playhead
+    static bool dragging_playhead = false;
+    ImGui::SetCursorScreenPos(ImVec2(playhead_x - 3, timeline_start.y));
+    ImGui::InvisibleButton("##Playhead", ImVec2(6, timeline_height));
+    if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+        dragging_playhead = true;
+        float mouse_x = ImGui::GetMousePos().x;
+        playhead_time = (mouse_x - timeline_start.x) / pixels_per_second;
+        playhead_time = std::clamp(playhead_time, 0.0f, max_duration);
+    } else if (dragging_playhead && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        dragging_playhead = false;
+    }
+
+    // Clicking anywhere to move playhead
+    if (!clicked_on_clip && ImGui::IsWindowHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        ImVec2 mouse = ImGui::GetMousePos();
+        if (mouse.y > timeline_start.y && mouse.y < timeline_end.y) {
+            playhead_time = (mouse.x - timeline_start.x) / pixels_per_second;
+            playhead_time = std::clamp(playhead_time, 0.0f, max_duration);
         }
     }
 
-    // Deselect if clicked outside any clips
-    if (!clicked_on_clip && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && ImGui::IsWindowHovered()) {
-        selected_clip = nullptr;
-    }
-
-        // === Playhead rendering & interaction ===
-
-        float normalized_time = playhead_time / max_duration;
-        float playhead_x = timeline_start.x + normalized_time * timeline_width * zoom_factor;
-    
-        const float line_width = 2.5f;
-        const float head_width = 12.5f;
-        const float head_height = 18.0f;
-        const ImU32 playhead_color = IM_COL32(255, 143, 38, 255);
-        const ImU32 shadow_color = IM_COL32(0, 0, 0, 80);
-
-        // ===== PRECISE SHADOW ALIGNMENT =====
-        const float shadow_offset = 1.5f;
-        const float shadow_blur = 3.0f;
-
-        // Head shadow (mathematically offset path)
-        draw_list->PathClear();
-        draw_list->PathLineTo(ImVec2(playhead_x + shadow_offset, timeline_start.y + head_height + shadow_offset));
-        draw_list->PathBezierCubicCurveTo(
-            ImVec2(playhead_x - head_width*0.42f + shadow_offset, timeline_start.y + head_height*0.66f + shadow_offset),
-            ImVec2(playhead_x - head_width*0.66f + shadow_offset, timeline_start.y + line_width + shadow_offset),
-            ImVec2(playhead_x + shadow_offset, timeline_start.y + shadow_offset)
-        );
-        draw_list->PathBezierCubicCurveTo(
-            ImVec2(playhead_x + head_width*0.66f + shadow_offset, timeline_start.y + line_width + shadow_offset),
-            ImVec2(playhead_x + head_width*0.42f + shadow_offset, timeline_start.y + head_height*0.66f + shadow_offset),
-            ImVec2(playhead_x + shadow_offset, timeline_start.y + head_height + shadow_offset)
-        );
-        draw_list->PathStroke(shadow_color, false, shadow_blur);
-
-        // Line shadow with perfect width matching
-        draw_list->AddLine(
-            ImVec2(playhead_x + shadow_offset, timeline_start.y + head_height + shadow_offset - line_width/2),
-            ImVec2(playhead_x + shadow_offset, timeline_start.y + timeline_height),
-            shadow_color, line_width + shadow_blur
-        );
-
-        // ===== MATHEMATICALLY PERFECT HEAD-LINE CONNECTION =====
-        const float connection_radius = line_width * 0.8f;
-        const ImVec2 connection_point = ImVec2(playhead_x, timeline_start.y + head_height - connection_radius);
-
-        // Head shape with exact line-width termination
-        draw_list->PathClear();
-        draw_list->PathLineTo(connection_point);
-        draw_list->PathBezierCubicCurveTo(
-            ImVec2(playhead_x - head_width*0.47f, timeline_start.y + head_height*0.6f),
-            ImVec2(playhead_x - head_width*0.65f, timeline_start.y + line_width*1.95f),
-            ImVec2(playhead_x, timeline_start.y)
-        );
-        draw_list->PathBezierCubicCurveTo(
-            ImVec2(playhead_x + head_width*0.65f, timeline_start.y + line_width*1.95f),
-            ImVec2(playhead_x + head_width*0.47f, timeline_start.y + head_height*0.6f),
-            connection_point
-        );
-        draw_list->PathFillConvex(playhead_color);
-
-        // Vertical line with exact width matching
-        draw_list->AddLine(
-            connection_point,
-            ImVec2(playhead_x - 1.0f, timeline_start.y + timeline_height),
-            playhead_color, line_width
-        );
-
-        // Connection reinforcement
-        draw_list->AddCircleFilled(
-            connection_point,
-            connection_radius,
-            playhead_color
-        );
-
-        // Handle dragging or clicking to set playhead
-        static bool dragging_playhead = false;
-    
-        ImGui::SetCursorScreenPos(ImVec2(playhead_x - 4, timeline_start.y));
-        ImGui::InvisibleButton("##PlayheadGrab", ImVec2(8, timeline_height));
-    
-        if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
-            dragging_playhead = true;
-            float mouse_x = ImGui::GetMousePos().x;
-            float new_normalized = (mouse_x - timeline_start.x) / (timeline_width * zoom_factor);
-            new_normalized = std::clamp(new_normalized, 0.0f, 1.0f);
-            playhead_time = new_normalized * max_duration;
-        } else if (dragging_playhead && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-            dragging_playhead = false;
-        }
-    
-        // Allow clicking anywhere on timeline (but not on clips) to move playhead
-        if (!clicked_on_clip && ImGui::IsWindowHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-            ImVec2 mouse = ImGui::GetMousePos();
-            if (mouse.y > timeline_start.y && mouse.y < timeline_end.y) {
-                float new_normalized = (mouse.x - timeline_start.x) / (timeline_width * zoom_factor);
-                new_normalized = std::clamp(new_normalized, 0.0f, 1.0f);
-                playhead_time = new_normalized * max_duration;
-            }
-        }
-    
-    
     ImGui::End();
 
     ImGui::Begin("Active Clips");
@@ -1021,7 +1105,7 @@ void DrawTimelineEditor(
     for (size_t i = 0; i < clips.size(); ++i) {
         auto& clip = clips[i];
         if (&clip == selected_clip)
-            ImGui::TextColored(ImVec4(1, 1, 0, 1), "->");
+            ImGui::TextColored(ImVec4(1.00f, 0.56f, 0.15f, 1.00f), "->");
         ImGui::SameLine();
         ImGui::Text("%zu: %s (Start: %f, Duration: %f, Layer: %d)", i, clip.name.c_str(), clip.start_time, clip.duration, clip.layer);
         if (ImGui::Button(("Delete##" + std::to_string(i)).c_str())) {
@@ -1033,6 +1117,7 @@ void DrawTimelineEditor(
 
     ImGui::End();
 }
+
 
 
 void UpdatePreview(GLResources& res, const std::vector<Clip>& clips, int width, int height, float playhead_time) {

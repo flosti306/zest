@@ -63,6 +63,8 @@ struct PreloadedAudio {
     int sample_rate = 44100;
     int channels = 2;
     float duration = 0.0f;
+
+    std::vector<float> waveform;
 };
 
 // Add a map for video data to the GLResources struct
@@ -79,6 +81,7 @@ bool setup_gl_resources(GLResources& res, int width, int height);
 void load_textures(GLResources& res, const std::vector<Clip>& clips);
 void render_frame(GLResources& res, float time, const std::vector<Clip>&, int width, int height);
 void cleanup_video_resources(GLResources& res);
+bool preload_audio_file(const std::string& path, PreloadedAudio& out, float media_start, float media_duration);
 
 bool start_video_export(const std::string& output_path, 
                        int width, int height, int fps,
@@ -86,3 +89,4 @@ bool start_video_export(const std::string& output_path,
                        const std::vector<Clip>& clips,
                        SDL_Window* window);
 
+std::vector<float> GenerateWaveformPreview(const std::vector<int16_t>& samples, int channels, int samples_per_pixel);
