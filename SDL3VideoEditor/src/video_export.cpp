@@ -608,52 +608,88 @@ void render_frame(GLResources& res, float current_time,
 
     bool rendered_any = false;
     for (const auto& clip : sorted_clips) {
-    // Check if clip is active and is visual (Video type)
-    if (clip.type == ClipType::Video &&
-    current_time >= clip.start_time &&
-    current_time < (clip.start_time + clip.duration))
-    {
-    GLuint tex_id = 0;
-    bool is_video = is_video_file(clip.path);
+        // Set blending mode based on clip
+        switch (clip.blend_mode) {
+            case BlendMode::Normal:
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                break;
+            case BlendMode::Additive:
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+                break;
+            case BlendMode::Multiply:
+                glBlendFunc(GL_DST_COLOR, GL_ZERO);
+                break;
+            case BlendMode::Screen:
+                glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_COLOR);
+                break;
+            case BlendMode::Darken:
+                glBlendFunc(GL_MIN, GL_ONE); // approximate
+                break;
+            case BlendMode::Lighten:
+                glBlendFunc(GL_MAX, GL_ONE); // approximate
+                break;
+            case BlendMode::Difference:
+                glBlendFunc(GL_ONE_MINUS_DST_COLOR, GL_ONE_MINUS_SRC_COLOR);
+                break;
+            case BlendMode::Subtract:
+                glBlendFunc(GL_ZERO, GL_ONE_MINUS_SRC_COLOR);
+                break;
+            case BlendMode::Divide:
+                // Not directly possible with glBlendFunc, would need shader
+                glBlendFunc(GL_ONE, GL_ONE); // approximate
+                break;
+            case BlendMode::Overlay:
+                // Overlay needs a shader normally. Approximate with multiply/screen hybrid
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+                break;
+        }
 
-    // Find the appropriate texture ID
-    if (is_video) {
-    auto vid_it = res.video_cache.find(clip.path);
-    if (vid_it != res.video_cache.end() && vid_it->second.is_initialized) {
-        tex_id = vid_it->second.texture_id;
-    }
-    } else {
-    auto img_it = res.texture_cache.find(clip.path);
-    if (img_it != res.texture_cache.end()) {
-        tex_id = img_it->second;
-    }
-    }
+        // Check if clip is active and is visual (Video type)
+        if (clip.type == ClipType::Video &&
+        current_time >= clip.start_time &&
+        current_time < (clip.start_time + clip.duration))
+        {
+            GLuint tex_id = 0;
+            bool is_video = is_video_file(clip.path);
 
-    if (tex_id != 0) {
-    glBindTexture(GL_TEXTURE_2D, tex_id);
-    glPushMatrix();
+            // Find the appropriate texture ID
+            if (is_video) {
+                auto vid_it = res.video_cache.find(clip.path);
+                if (vid_it != res.video_cache.end() && vid_it->second.is_initialized) {
+                    tex_id = vid_it->second.texture_id;
+                }
+            } else {
+                auto img_it = res.texture_cache.find(clip.path);
+                if (img_it != res.texture_cache.end()) {
+                    tex_id = img_it->second;
+                }
+            }
 
-    // Apply transforms
-    glTranslatef(clip.pos_x, clip.pos_y, 0.0f);
-    glScalef(clip.scale, clip.scale, 1.0f);
-    glColor4f(1.0f, 1.0f, 1.0f, clip.opacity); // Apply opacity
+            if (tex_id != 0) {
+                glBindTexture(GL_TEXTURE_2D, tex_id);
+                glPushMatrix();
 
-    // Draw quad (centered at origin, size 2x2 fits ortho)
-    glBegin(GL_QUADS);
-        glTexCoord2f(0.0f, 0.0f); glVertex2f(-1.0f, -1.0f); // Bottom-Left Texel -> Bottom-Left Vertex
-        glTexCoord2f(1.0f, 0.0f); glVertex2f( 1.0f, -1.0f); // Bottom-Right Texel -> Bottom-Right Vertex
-        glTexCoord2f(1.0f, 1.0f); glVertex2f( 1.0f,  1.0f); // Top-Right Texel -> Top-Right Vertex
-        glTexCoord2f(0.0f, 1.0f); glVertex2f(-1.0f,  1.0f); // Top-Left Texel -> Top-Left Vertex
-    glEnd();
+                // Apply transforms
+                glTranslatef(clip.pos_x, clip.pos_y, 0.0f);
+                glScalef(clip.scale, clip.scale, 1.0f);
+                glColor4f(1.0f, 1.0f, 1.0f, clip.opacity); // Apply opacity
+
+                // Draw quad (centered at origin, size 2x2 fits ortho)
+                glBegin(GL_QUADS);
+                glTexCoord2f(0.0f, 0.0f); glVertex2f(-1.0f, -1.0f); // Bottom-Left Texel -> Bottom-Left Vertex
+                glTexCoord2f(1.0f, 0.0f); glVertex2f( 1.0f, -1.0f); // Bottom-Right Texel -> Bottom-Right Vertex
+                glTexCoord2f(1.0f, 1.0f); glVertex2f( 1.0f,  1.0f); // Top-Right Texel -> Top-Right Vertex
+                glTexCoord2f(0.0f, 1.0f); glVertex2f(-1.0f,  1.0f); // Top-Left Texel -> Top-Left Vertex
+                glEnd();
 
 
-    glPopMatrix();
-    rendered_any = true;
-    } else {
-    // Optionally render a placeholder if texture is missing/not ready
-    // std::cerr << "Texture ID 0 for active clip: " << clip.path << std::endl;
-    }
-    }
+                glPopMatrix();
+                rendered_any = true;
+            } else {
+            // Optionally render a placeholder if texture is missing/not ready
+            // std::cerr << "Texture ID 0 for active clip: " << clip.path << std::endl;
+            }
+        }
     }
 
     // Reset color and disable states

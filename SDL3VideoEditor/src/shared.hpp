@@ -6,6 +6,19 @@ enum class ClipType {
     Audio
 };
 
+enum class BlendMode {
+    Normal,
+    Additive,
+    Multiply,
+    Screen,
+    Darken,
+    Lighten,
+    Difference,
+    Subtract,
+    Divide,
+    Overlay
+};
+
 struct Clip {
     std::string name;
     
@@ -24,6 +37,7 @@ struct Clip {
     float pos_y = 0.0f;
     float scale = 1.0f;      // uniform scale for now
     float opacity = 1.0f;    // 0.0 to 1.0
+    BlendMode blend_mode = BlendMode::Normal;
 
     bool selected = false;
 

@@ -756,6 +756,13 @@ int main(int argc, char* argv[]) {
             changed |= ImGui::InputFloat("Duration", &selected_clip->duration, 0.1f, 1.0f, "%.2f"); selected_clip->duration = std::max(0.01f, selected_clip->duration);
             ImGui::SeparatorText("Layering");
             changed |= ImGui::InputInt("Layer", &selected_clip->layer); selected_clip->layer = std::max(0, selected_clip->layer);
+            const char* blend_modes[] = { "Normal", "Additive", "Multiply", "Screen", "Darken", "Lighten", "Difference", "Subtract", "Divide", "Overlay"};
+            int current_mode = static_cast<int>(selected_clip->blend_mode);
+
+            if (ImGui::Combo("Blend Mode", &current_mode, blend_modes, IM_ARRAYSIZE(blend_modes))) {
+                selected_clip->blend_mode = static_cast<BlendMode>(current_mode);
+                changed = true;
+            }
             if (changed) {
                 layers_changed = true;
                 if (selected_clip->linked_clip) {
