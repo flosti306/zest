@@ -20,12 +20,36 @@ extern "C" {
 #include <deque> // For frame queue
 #include <mutex> // For thread safety (if adding threads later)
 #include <atomic> // For atomic flags
+#include <thread>
+#include <condition_variable>
+#include <queue> // Can use queue or deque
 #include <SDL.h>
 #include <SDL_render.h>
 #include <string>
 #include "shared.hpp"
 
+// Forward declare structs if needed by function signatures below
 struct Clip;
+struct GLResources;
+struct ThumbnailRequest;
+struct ThumbnailResult;
+
+extern std::thread thumbnail_worker;
+extern std::queue<ThumbnailRequest> thumbnail_request_queue;
+extern std::queue<ThumbnailResult> thumbnail_result_queue;
+extern std::mutex request_mutex;
+extern std::mutex result_mutex;
+extern std::condition_variable worker_cv;
+extern std::atomic<bool> stop_thumbnail_worker_flag;
+
+constexpr int THUMBNAIL_WIDTH = 64;
+constexpr int THUMBNAIL_HEIGHT = 36;
+
+// --- Add these function declarations globally ---
+void start_thumbnail_worker();
+void stop_thumbnail_worker();
+void ProcessThumbnailResults(GLResources& res, int max_per_frame);
+void thumbnail_worker_func(); // Declaration for the worker thread function itself
 
 // Holds RGB data for a single decoded frame
 struct DecodedFrame {
@@ -102,10 +126,26 @@ struct GLResources {
     std::map<std::string, VideoData> video_cache; // Video state and textures
     std::map<std::string, AudioData> audio_cache; // Audio state
     std::map<std::string, PreloadedAudio> preloaded_audio; // Preloaded audio for waveforms/export
-    std::unordered_map<std::string, std::vector<GLuint>> preloaded_thumbs;
+    // Store the actual textures here, mapped by clip path
+    std::unordered_map<std::string, std::vector<GLuint>> clip_thumbnail_textures;
+    // Add a map to track which timestamps have generated textures for a clip
+    std::unordered_map<std::string, std::unordered_map<float, GLuint>> generated_thumbnails_map;
+};
 
-    // Current frame texture IDs for active video clips (updated by decoder logic)
-    // We can just use video_cache[path].texture_id directly
+struct ThumbnailRequest {
+    std::string clip_path; // Use path to identify clip safely
+    float timestamp = 0.0f;
+    // Optional: add a unique ID if needed for complex scenarios
+};
+
+struct ThumbnailResult {
+    std::string clip_path;
+    float timestamp = 0.0f;
+    std::vector<uint8_t> pixels; // Decoded RGB pixels
+    int width = 0;
+    int height = 0;
+    bool success = false;
+    std::string error_message;
 };
 
 bool setup_gl_resources(GLResources& res, int width, int height);
@@ -144,3 +184,9 @@ bool start_video_export(const std::string& output_path,
                        SDL_Window* window); // Keep signature, implementation needs update
 
 std::vector<float> GenerateWaveformPreview(const std::vector<int16_t>& samples, int channels, int samples_per_pixel);
+
+void QueueClipThumbnails(GLResources& res, const Clip& clip);
+void ProcessThumbnailTasks(GLResources& res, int max_per_frame);
+
+void start_thumbnail_worker();
+void stop_thumbnail_worker();

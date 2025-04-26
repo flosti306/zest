@@ -32,7 +32,4 @@ struct Clip {
     std::vector<float> waveform;     // normalized audio samples [-1.0, 1.0]
 
     Clip* linked_clip = nullptr; // for audio/video pairs
-
-    std::vector<GLuint>* thumbnails = nullptr;
-
 };

@@ -62,6 +62,8 @@ int preview_height = 720;
 
 Clip* selected_clip = nullptr; // Keep track of selected clip
 
+bool show_thumbs = false;
+
 // Error checking macros
 #define CHECK_AV_ERROR(ret, message) \
     if (ret < 0) { \
@@ -341,6 +343,8 @@ void AddNewClip(std::vector<Clip>& clips, const std::string& input_path, float v
     video_clip.pos_y = 0.0f;
     video_clip.selected = false;
 
+    if(show_thumbs) QueueClipThumbnails(res, video_clip);
+
     auto audio_it = res.preloaded_audio.find(input_path);
     if (audio_it != res.preloaded_audio.end() && !audio_it->second.samples.empty()) {
         size_t audio_index = clips.size();
@@ -418,7 +422,7 @@ float get_video_duration(const std::string& input_path) {
 }
 
 // --- Forward Declarations ---
-void DrawTimelineEditor(std::vector<Clip>& clips, float& playhead_time, float& max_duration, float& zoom_factor, std::atomic<bool>& layers_changed, Clip*& selected_clip);
+void DrawTimelineEditor(std::vector<Clip>& clips, float& playhead_time, float& max_duration, float& zoom_factor, std::atomic<bool>& layers_changed, Clip*& selected_clip, GLResources& res);
 void UpdatePreview(GLResources& res, const std::vector<Clip>& sorted_clips, int width, int height, float playhead_time, bool force_update);
 void RenderPreviewWindow(GLuint preview_tex, int preview_width, int preview_height);
 
@@ -498,6 +502,8 @@ int main(int argc, char* argv[]) {
         SDL_DestroyWindow(window); SDL_Quit();
         return 1;
     }
+
+    if(show_thumbs) start_thumbnail_worker();
 
     bool running = true;
     last_frame_ticks = SDL_GetTicks();
@@ -643,6 +649,7 @@ int main(int argc, char* argv[]) {
             }
         }
         update_video_previews(gl_resources, active_clips_for_preview, playhead_time);
+        if(show_thumbs) ProcessThumbnailResults(gl_resources, 2);
 
         ImGui_ImplOpenGL3_NewFrame(); ImGui_ImplSDL3_NewFrame(); ImGui::NewFrame();
         RenderDockSpace();
@@ -706,6 +713,7 @@ int main(int argc, char* argv[]) {
                         if (clip.type == ClipType::Audio) {
                             // Force reload audio data
                             load_resources_for_clip(gl_resources, clip);
+                            if(show_thumbs) QueueClipThumbnails(gl_resources, clip);
                             // Link waveform pointer after reload
                             auto audio_it = gl_resources.preloaded_audio.find(clip.path);
                             if (audio_it != gl_resources.preloaded_audio.end()) {
@@ -721,7 +729,7 @@ int main(int argc, char* argv[]) {
         }
         ImGui::End(); // End Controls
 
-        DrawTimelineEditor(clips, playhead_time, max_duration, zoom_factor, layers_changed, selected_clip);
+        DrawTimelineEditor(clips, playhead_time, max_duration, zoom_factor, layers_changed, selected_clip, gl_resources);
 
         bool force_preview_update = layers_changed.load();
         if (force_preview_update || std::abs(playhead_time - last_preview_update_time) > PREVIEW_UPDATE_INTERVAL) {
@@ -798,6 +806,9 @@ int main(int argc, char* argv[]) {
     } // End main loop
 
     std::cout << "Cleaning up resources..." << std::endl;
+
+    stop_thumbnail_worker();
+
     if (ImGui::GetIO().UserData) { IM_DELETE((GradientData*)ImGui::GetIO().UserData); ImGui::GetIO().UserData = nullptr; }
     cleanup_gl_resources(gl_resources); cleanup_video_resources(gl_resources);
     ImGui_ImplOpenGL3_Shutdown(); ImGui_ImplSDL3_Shutdown(); ImGui::DestroyContext();
@@ -846,7 +857,8 @@ void DrawTimelineEditor(
     float& max_duration,
     float& zoom_factor,
     std::atomic<bool>& layers_changed,
-    Clip*& selected_clip
+    Clip*& selected_clip,
+    GLResources& res
 ) {
     ImGui::Begin("Timeline Editor");
     ApplyWindowBackgroundGradients();
@@ -1146,6 +1158,62 @@ void DrawTimelineEditor(
             1.0f  // Line width
         );
 
+        // Draw thumbnails if video
+        if (clip.type == ClipType::Video && is_video_file(clip.path) && show_thumbs) {
+            // Find the thumbnails vector in GLResources using the clip path
+            auto thumb_it = res.clip_thumbnail_textures.find(clip.path); // Need access to GLResources 'res' here! Pass it in.
+           if (thumb_it != res.clip_thumbnail_textures.end()) {
+                const auto& thumbnails = thumb_it->second; // Get reference to vector<GLuint>
+
+               if (!thumbnails.empty()) {
+                    const float thumb_spacing = 2.0f;
+                    const float thumb_height = (clip_rect_max.y - clip_rect_min.y) - 8.0f;
+                    const float thumb_width = thumb_height * (static_cast<float>(THUMBNAIL_WIDTH) / static_cast<float>(THUMBNAIL_HEIGHT)); // Use defined aspect ratio
+                    const float total_thumb_area_width = clip_rect_max.x - clip_rect_min.x;
+                    const float available_width_per_thumb = total_thumb_area_width / static_cast<float>(thumbnails.size());
+
+                    float current_x = clip_rect_min.x + thumb_spacing;
+                    float thumb_y = clip_rect_min.y + 4.0f;
+
+                    for (size_t t = 0; t < thumbnails.size(); ++t) {
+                        // Calculate position based on index, distribute evenly
+                        float thumb_x = clip_rect_min.x + (t * available_width_per_thumb);
+                        // Clamp width to available space per thumb or actual thumb width
+                        float display_thumb_width = std::min(thumb_width, available_width_per_thumb - thumb_spacing);
+
+                        ImVec2 thumb_min(thumb_x + thumb_spacing / 2.0f, thumb_y);
+                        ImVec2 thumb_max(thumb_x + thumb_spacing / 2.0f + display_thumb_width, thumb_y + thumb_height);
+
+                        // Ensure thumbnail doesn't exceed clip bounds
+                        thumb_max.x = std::min(thumb_max.x, clip_rect_max.x - thumb_spacing / 2.0f);
+                        if (thumb_min.x >= thumb_max.x || thumb_min.y >= thumb_max.y) continue; // Skip if zero size
+
+                        GLuint tex = thumbnails[t];
+                        if (tex != 0) { // Check if texture ID is valid
+                            draw_list->AddImage(
+                                (ImTextureID)(intptr_t)tex,
+                                thumb_min, thumb_max,
+                                ImVec2(0, 0), ImVec2(1, 1),
+                                IM_COL32_WHITE
+                            );
+                           // Optional: Add border around actual thumbnail
+                           // draw_list->AddRect(thumb_min, thumb_max, IM_COL32(255, 255, 255, 50), 2.0f);
+                        } else {
+                            // Optionally draw a placeholder if texture ID is 0 (still loading?)
+                            draw_list->AddRectFilled(thumb_min, thumb_max, IM_COL32(50, 50, 55, 150), 2.0f);
+                        }
+                    }
+                } else {
+                    // Draw a placeholder if the vector exists but is empty (loading)
+                    ImVec2 placeholder_min = ImVec2(clip_rect_min.x + 4, clip_rect_min.y + 4);
+                    ImVec2 placeholder_max = ImVec2(clip_rect_max.x - 4, clip_rect_max.y - 4);
+                    draw_list->AddRectFilled(placeholder_min, placeholder_max, IM_COL32(50, 50, 55, 100), 4.0f);
+                    draw_list->AddText(placeholder_min, IM_COL32_WHITE, "...");
+                }
+           }
+           // else: Thumbnails haven't been queued yet or clip path not found (shouldn't happen if queued correctly)
+       }
+
         // Clip title with shadow effect for better readability
         std::string clip_title = clip.name;
         ImVec2 title_size = ImGui::CalcTextSize(clip_title.c_str());
@@ -1154,7 +1222,7 @@ void DrawTimelineEditor(
         // Text shadow
         draw_list->AddText(
             ImVec2(title_pos.x + 1, title_pos.y + 1),
-            ImGui::ColorConvertFloat4ToU32(ImVec4(0.0f, 0.0f, 0.0f, 0.6f)),
+            ImGui::ColorConvertFloat4ToU32(ImVec4(0.0f, 0.0f, 0.0f, 0.8f)),
             clip_title.c_str()
         );
         

@@ -29,6 +29,17 @@ extern "C" {
     #include <libavutil/channel_layout.h>
 }
 
+std::thread thumbnail_worker;
+std::queue<ThumbnailRequest> thumbnail_request_queue;
+std::queue<ThumbnailResult> thumbnail_result_queue;
+std::mutex request_mutex;
+std::mutex result_mutex;
+std::condition_variable worker_cv;
+std::atomic<bool> stop_thumbnail_worker_flag = false;
+
+void start_thumbnail_worker();
+void stop_thumbnail_worker();
+
 // Debug function to check OpenGL context status
 void check_gl_context() {
     if (SDL_GL_GetCurrentContext()) {
@@ -690,6 +701,16 @@ void cleanup_gl_resources(GLResources& res) {
     }
     res.texture_cache.clear();
 
+    // Clean up thumbnail textures
+    std::cout << "Cleaning up thumbnail textures..." << std::endl;
+    for (auto& [path, tex_vec] : res.clip_thumbnail_textures) {
+        for (GLuint tex_id : tex_vec) {
+            if (tex_id) glDeleteTextures(1, &tex_id);
+        }
+    }
+    res.clip_thumbnail_textures.clear();
+    res.generated_thumbnails_map.clear(); // Clear the tracking map too
+
     // Also delete video textures managed by VideoData
     for (auto const& [path, video_data] : res.video_cache) {
          if (video_data.texture_id) {
@@ -1085,4 +1106,329 @@ std::vector<float> GenerateWaveformPreview(const std::vector<int16_t>& samples, 
     }
 
     return waveform;
+}
+
+void QueueClipThumbnails(GLResources& res, const Clip& clip) { // Pass const Clip&
+    if (clip.type == ClipType::Video && is_video_file(clip.path)) {
+        // Check if thumbnails are already being generated or are done for this clip path
+        if (res.clip_thumbnail_textures.count(clip.path)) {
+             // Already processed or processing started, could add logic to re-queue if needed
+             // std::cout << "Thumbnails already queued/generated for " << clip.path << std::endl;
+            return;
+        }
+
+        const int max_thumbs = static_cast<int>(clip.duration); // Generate more thumbs if needed
+        const float interval = std::max(0.5f, clip.duration / static_cast<float>(max_thumbs)); // Ensure minimum interval
+
+        // Create placeholder entry in the map immediately so we know processing started
+        res.clip_thumbnail_textures[clip.path] = {}; // Empty vector initially
+        res.generated_thumbnails_map[clip.path] = {}; // Empty map for generated timestamps
+
+
+        { // Lock the request queue
+            std::lock_guard<std::mutex> lock(request_mutex);
+            for (int i = 0; i < max_thumbs; ++i) {
+                float timestamp = i * interval + clip.media_start; // Use media_start
+                 // Clamp timestamp to be within the actual media duration if known
+                 // (Need media duration - maybe get it during AddNewClip or load_resources)
+                // float media_duration = get_media_duration(clip.path); // Hypothetical function
+                // if (media_duration > 0) timestamp = std::min(timestamp, media_duration - 0.1f);
+
+                timestamp = std::max(0.0f, timestamp); // Ensure non-negative
+
+                ThumbnailRequest req;
+                req.clip_path = clip.path;
+                req.timestamp = timestamp;
+                thumbnail_request_queue.push(req);
+                 // std::cout << "Queued thumb request for " << clip.path << " at " << timestamp << std::endl;
+            }
+        } // Unlock request_mutex
+
+        worker_cv.notify_one(); // Signal the worker thread
+    }
+}
+
+// Replace the existing ProcessThumbnailTasks in video_export.cpp or main.cpp
+
+void ProcessThumbnailResults(GLResources& res, int max_per_frame = 2) { // Process a couple per frame
+    for (int i = 0; i < max_per_frame; ++i) {
+        ThumbnailResult result;
+
+        // --- Check for results ---
+        {
+            std::lock_guard<std::mutex> lock(result_mutex);
+            if (thumbnail_result_queue.empty()) {
+                break; // No more results pending for now
+            }
+            result = std::move(thumbnail_result_queue.front()); // Move the result
+            thumbnail_result_queue.pop();
+        } // Unlock result_mutex
+
+        // --- Process the result ---
+        if (result.success && !result.pixels.empty()) {
+             // Check if this exact timestamp was already processed (e.g., due to requeueing)
+            auto& gen_map = res.generated_thumbnails_map[result.clip_path];
+            if (gen_map.count(result.timestamp)) {
+                continue; // Already have this one
+            }
+
+
+            // Create OpenGL Texture on Main Thread
+            GLuint tex_id = 0;
+            glGenTextures(1, &tex_id);
+            if (tex_id == 0) {
+                 std::cerr << "Failed to generate texture ID for thumbnail!" << std::endl;
+                 continue; // Skip this one
+            }
+            glBindTexture(GL_TEXTURE_2D, tex_id);
+
+            // Upload pixel data (RGB)
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, result.width, result.height, 0,
+                         GL_RGB, GL_UNSIGNED_BYTE, result.pixels.data());
+
+            GLenum err = glGetError();
+            if (err != GL_NO_ERROR) {
+                std::cerr << "OpenGL error creating thumbnail texture for " << result.clip_path << ": " << err << std::endl;
+                glDeleteTextures(1, &tex_id); // Clean up failed texture
+                continue; // Skip
+            }
+
+            // Set texture parameters (simple bilinear is fine for thumbs)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+            glBindTexture(GL_TEXTURE_2D, 0); // Unbind
+
+            // Store the texture ID in the main resource map
+            // Note: This assumes res.clip_thumbnail_textures[result.clip_path] was initialized in QueueClipThumbnails
+            if (res.clip_thumbnail_textures.count(result.clip_path)) {
+                res.clip_thumbnail_textures[result.clip_path].push_back(tex_id);
+                 gen_map[result.timestamp] = tex_id; // Mark timestamp as generated
+                // std::cout << "Generated thumbnail texture " << tex_id << " for " << result.clip_path << " at " << result.timestamp << std::endl;
+            } else {
+                std::cerr << "Warning: Thumbnail result received for clip path not found in texture map: " << result.clip_path << std::endl;
+                glDeleteTextures(1, &tex_id); // Clean up unused texture
+            }
+        } else {
+            // Handle failure case if needed (e.g., log error)
+            // std::cerr << "Thumbnail generation failed for " << result.clip_path << " at " << result.timestamp << ": " << result.error_message << std::endl;
+        }
+    } // end loop
+}
+
+// Add this new function to video_export.cpp
+
+void thumbnail_worker_func() {
+    std::cout << "Thumbnail worker thread started." << std::endl;
+    while (!stop_thumbnail_worker_flag) {
+        ThumbnailRequest request;
+
+        // --- Wait for a request ---
+        {
+            std::unique_lock<std::mutex> lock(request_mutex);
+            worker_cv.wait(lock, [&] {
+                return !thumbnail_request_queue.empty() || stop_thumbnail_worker_flag;
+            });
+
+            if (stop_thumbnail_worker_flag) {
+                break; // Exit signal received
+            }
+
+            if (thumbnail_request_queue.empty()) {
+                continue; // Spurious wakeup?
+            }
+
+            request = thumbnail_request_queue.front();
+            thumbnail_request_queue.pop();
+        } // Unlock request_mutex
+
+        // --- Process the request ---
+        ThumbnailResult result;
+        result.clip_path = request.clip_path;
+        result.timestamp = request.timestamp;
+        result.width = THUMBNAIL_WIDTH;
+        result.height = THUMBNAIL_HEIGHT;
+        result.success = false; // Assume failure initially
+
+        AVFormatContext* fmt_ctx = nullptr;
+        AVCodecContext* codec_ctx = nullptr;
+        AVFrame* frame = nullptr;
+        AVFrame* rgb_frame = nullptr;
+        AVPacket* packet = nullptr;
+        SwsContext* sws_ctx = nullptr;
+        int video_stream_idx = -1;
+        uint8_t* buffer = nullptr;
+
+        try { // Use try-catch for easier cleanup on error
+            // 1. Open Input
+            if (avformat_open_input(&fmt_ctx, request.clip_path.c_str(), nullptr, nullptr) != 0) {
+                throw std::runtime_error("Could not open video file: " + request.clip_path);
+            }
+            if (avformat_find_stream_info(fmt_ctx, nullptr) < 0) {
+                throw std::runtime_error("Could not find stream info for: " + request.clip_path);
+            }
+
+            // 2. Find Video Stream & Codec
+            video_stream_idx = av_find_best_stream(fmt_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+            if (video_stream_idx < 0) {
+                throw std::runtime_error("No video stream found in: " + request.clip_path);
+            }
+            AVCodecParameters* codec_params = fmt_ctx->streams[video_stream_idx]->codecpar;
+            const AVCodec* codec = avcodec_find_decoder(codec_params->codec_id);
+            if (!codec) {
+                throw std::runtime_error("Unsupported codec in: " + request.clip_path);
+            }
+            codec_ctx = avcodec_alloc_context3(codec);
+            if (!codec_ctx || avcodec_parameters_to_context(codec_ctx, codec_params) < 0 || avcodec_open2(codec_ctx, codec, nullptr) < 0) {
+                throw std::runtime_error("Failed to setup codec context for: " + request.clip_path);
+            }
+
+            AVRational time_base = fmt_ctx->streams[video_stream_idx]->time_base;
+
+            // 3. Seek
+            int64_t target_ts = av_rescale_q(static_cast<int64_t>(request.timestamp * AV_TIME_BASE), AV_TIME_BASE_Q, time_base);
+            // Seek slightly before the target to ensure we get the right frame or the one just before it
+            if (av_seek_frame(fmt_ctx, video_stream_idx, target_ts, AVSEEK_FLAG_BACKWARD) < 0) {
+                 // Don't throw, just log warning and try decoding from start if seek fails near beginning
+                 std::cerr << "Warning: Seek failed for " << request.clip_path << " at " << request.timestamp << "s. Trying from start." << std::endl;
+                 // Optionally seek to 0 if target_ts wasn't 0?
+                 // av_seek_frame(fmt_ctx, video_stream_idx, 0, AVSEEK_FLAG_BACKWARD);
+            }
+            avcodec_flush_buffers(codec_ctx); // Important after seek
+
+            // 4. Allocate Decoding Resources
+            frame = av_frame_alloc();
+            rgb_frame = av_frame_alloc(); // For the RGB conversion result
+            packet = av_packet_alloc();
+            if (!frame || !rgb_frame || !packet) {
+                throw std::runtime_error("Failed to allocate FFmpeg frame/packet.");
+            }
+
+            // Allocate buffer for RGB frame manually
+             int numBytes = av_image_get_buffer_size(AV_PIX_FMT_RGB24, THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT, 1); // Use alignment 1 for simplicity
+             buffer = (uint8_t*)av_malloc(numBytes * sizeof(uint8_t));
+             if (!buffer) {
+                 throw std::runtime_error("Failed to allocate RGB buffer.");
+             }
+            av_image_fill_arrays(rgb_frame->data, rgb_frame->linesize, buffer, AV_PIX_FMT_RGB24, THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT, 1);
+
+
+            // 5. Decode until the target frame is found or passed
+            int decode_ret = 0;
+            bool frame_decoded = false;
+            while (av_read_frame(fmt_ctx, packet) >= 0) {
+                if (packet->stream_index == video_stream_idx) {
+                    decode_ret = avcodec_send_packet(codec_ctx, packet);
+                    if (decode_ret < 0) {
+                        // Error sending packet, might be recoverable or EOF flush needed
+                        break;
+                    }
+
+                    while (decode_ret >= 0) {
+                        decode_ret = avcodec_receive_frame(codec_ctx, frame);
+                        if (decode_ret == AVERROR(EAGAIN) || decode_ret == AVERROR_EOF) {
+                            break; // Need more packets or finished
+                        } else if (decode_ret < 0) {
+                            av_packet_unref(packet);
+                            throw std::runtime_error("Error receiving frame during decoding.");
+                        }
+
+                        // Check if this frame is at or after our target timestamp
+                        double current_pts_sec = (frame->pts == AV_NOPTS_VALUE) ? -1.0 : static_cast<double>(frame->pts) * av_q2d(time_base);
+                        if (current_pts_sec < 0 && frame->pkt_dts != AV_NOPTS_VALUE) { // Fallback to DTS if PTS missing
+                             current_pts_sec = static_cast<double>(frame->pkt_dts) * av_q2d(time_base);
+                        }
+
+
+                        if (current_pts_sec >= request.timestamp || current_pts_sec < 0 ) { // Use frame if >= target or PTS is unknown after seek
+                             // Initialize SWS context *here* now that we have the source frame format
+                            sws_ctx = sws_getCachedContext(sws_ctx, // Reuse context
+                                                           codec_ctx->width, codec_ctx->height, codec_ctx->pix_fmt,
+                                                           THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT, AV_PIX_FMT_RGB24,
+                                                           SWS_BILINEAR, // Use bilinear for speed
+                                                           nullptr, nullptr, nullptr);
+                            if (!sws_ctx) {
+                                throw std::runtime_error("Failed to create SwsContext.");
+                            }
+
+                            // Convert the frame directly to thumbnail size RGB
+                            sws_scale(sws_ctx, (const uint8_t* const*)frame->data, frame->linesize, 0, codec_ctx->height,
+                                      rgb_frame->data, rgb_frame->linesize);
+
+                            // Copy pixels to result vector
+                            result.pixels.resize(numBytes);
+                            memcpy(result.pixels.data(), buffer, numBytes);
+                            result.success = true;
+                            frame_decoded = true;
+                            av_frame_unref(frame); // Release the decoded frame
+                            break; // Found our frame
+                        }
+                        av_frame_unref(frame); // Release frame if it wasn't the target
+                    } // end receive loop
+                } // end if video stream
+                av_packet_unref(packet); // Release packet
+                if (frame_decoded) {
+                    break; // Exit read loop
+                }
+            } // end read loop
+
+            // If loop finished without decoding, maybe try flushing? (Less critical for single frame)
+             if (!frame_decoded) {
+                // Optional: Add flush logic here if needed, similar to ensure_video_decoded_upto EOF handling
+                // but convert the *first* flushed frame if timestamp was near the end.
+                result.error_message = "Reached EOF or error before finding target frame.";
+             }
+
+
+        } catch (const std::runtime_error& e) {
+            result.success = false;
+            result.error_message = e.what();
+            std::cerr << "Thumbnail Error (" << request.clip_path << " @ " << request.timestamp << "s): " << e.what() << std::endl;
+        }
+
+        // --- Cleanup FFmpeg resources ---
+        av_free(buffer); // Free the manually allocated buffer
+        sws_freeContext(sws_ctx);
+        av_frame_free(&frame);
+        av_frame_free(&rgb_frame);
+        av_packet_free(&packet);
+        if (codec_ctx) avcodec_free_context(&codec_ctx);
+        if (fmt_ctx) avformat_close_input(&fmt_ctx);
+
+        // --- Enqueue the result ---
+        {
+            std::lock_guard<std::mutex> lock(result_mutex);
+            thumbnail_result_queue.push(std::move(result));
+        } // Unlock result_mutex
+
+    } // end main worker loop
+    std::cout << "Thumbnail worker thread finished." << std::endl;
+}
+
+// Add these functions, call from main() init and cleanup
+
+void start_thumbnail_worker() {
+    stop_thumbnail_worker_flag = false;
+    thumbnail_worker = std::thread(thumbnail_worker_func);
+}
+
+void stop_thumbnail_worker() {
+    if (thumbnail_worker.joinable()) {
+        stop_thumbnail_worker_flag = true;
+         // Clear queue and notify so the worker wakes up to check the flag
+        {
+            std::lock_guard<std::mutex> lock(request_mutex);
+            std::queue<ThumbnailRequest>().swap(thumbnail_request_queue); // Clear queue
+        }
+        worker_cv.notify_one(); // Wake up worker thread
+        thumbnail_worker.join();
+        std::cout << "Thumbnail worker joined." << std::endl;
+    }
+     // Clear any remaining results
+     {
+        std::lock_guard<std::mutex> lock(result_mutex);
+        std::queue<ThumbnailResult>().swap(thumbnail_result_queue);
+     }
 }
