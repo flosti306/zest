@@ -601,7 +601,7 @@ void render_frame(GLResources& res, float current_time,
     // Simple Ortho projection for [-1, 1] space
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
-    glOrtho(-1.0, 1.0, -1.0, 1.0, -1.0, 1.0);
+    glOrtho(-1.0 * width, 1.0 * width, -1.0 * height, 1.0 * height, -1.0, 1.0);
 
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
@@ -691,33 +691,33 @@ void render_frame(GLResources& res, float current_time,
             glPushMatrix();
 
             // --- Apply evaluated transforms ---
-            glTranslatef(evaluated_pos_x, evaluated_pos_y, 0.0f);
+            glTranslatef(evaluated_pos_x * width, evaluated_pos_y * height, 0.0f);
             glRotatef(evaluated_rotation, 0.0f, 0.0f, 1.0f);
-            glScalef(evaluated_scale, evaluated_scale, 1.0f);
+            glScalef(evaluated_scale, evaluated_scale, 1.0f); // Adjust scaling for new aspect ratio
             glColor4f(1.0f, 1.0f, 1.0f, evaluated_opacity);
 
             glBegin(GL_QUADS);
-                glTexCoord2f(0.0f, 0.0f); glVertex2f(-1.0f, -1.0f);
-                glTexCoord2f(1.0f, 0.0f); glVertex2f( 1.0f, -1.0f);
-                glTexCoord2f(1.0f, 1.0f); glVertex2f( 1.0f,  1.0f);
-                glTexCoord2f(0.0f, 1.0f); glVertex2f(-1.0f,  1.0f);
+                glTexCoord2f(0.0f, 0.0f); glVertex2f(-1.0f * width, -1.0f * height);
+                glTexCoord2f(1.0f, 0.0f); glVertex2f( 1.0f * width, -1.0f * height);
+                glTexCoord2f(1.0f, 1.0f); glVertex2f( 1.0f * width,  1.0f * height);
+                glTexCoord2f(0.0f, 1.0f); glVertex2f(-1.0f * width,  1.0f * height);
             glEnd();
 
             glPopMatrix();
             rendered_any = true;
-            } else {
+        } else {
             // Optionally render a placeholder if texture is missing/not ready
             // std::cerr << "Texture ID 0 for active clip: " << clip.path << std::endl;
-            }
         }
     }
+        }
 
-    // Reset color and disable states
-    glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
-    glDisable(GL_BLEND);
-    glDisable(GL_TEXTURE_2D);
-    glBindTexture(GL_TEXTURE_2D, 0);
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        // Reset color and disable states
+        glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+        glDisable(GL_BLEND);
+        glDisable(GL_TEXTURE_2D);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
     // if (!rendered_any) { std::cout << "Rendered empty frame at " << current_time << std::endl; }
 }
