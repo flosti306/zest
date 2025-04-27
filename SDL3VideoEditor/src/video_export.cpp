@@ -649,42 +649,62 @@ void render_frame(GLResources& res, float current_time,
         current_time >= clip.start_time &&
         current_time < (clip.start_time + clip.duration))
         {
-            GLuint tex_id = 0;
-            bool is_video = is_video_file(clip.path);
+            float local_time = current_time - clip.start_time; // relative to clip start
 
-            // Find the appropriate texture ID
-            if (is_video) {
-                auto vid_it = res.video_cache.find(clip.path);
-                if (vid_it != res.video_cache.end() && vid_it->second.is_initialized) {
-                    tex_id = vid_it->second.texture_id;
-                }
-            } else {
-                auto img_it = res.texture_cache.find(clip.path);
-                if (img_it != res.texture_cache.end()) {
-                    tex_id = img_it->second;
-                }
+        // --- Evaluate keyframes ---
+        float evaluated_pos_x = clip.pos_x_track.Evaluate(local_time);
+        float evaluated_pos_y = clip.pos_y_track.Evaluate(local_time);
+        float evaluated_scale = clip.scale_track.Evaluate(local_time);
+        float evaluated_rotation = clip.rotation_track.Evaluate(local_time);
+        float evaluated_opacity = clip.opacity_track.Evaluate(local_time);
+
+        // Fallback / Clamp
+        if (clip.pos_x_track.keyframes.empty()) evaluated_pos_x = clip.pos_x;
+        if (clip.pos_y_track.keyframes.empty()) evaluated_pos_y = clip.pos_y;
+        if (clip.scale_track.keyframes.empty()) evaluated_scale = clip.scale;
+        if (clip.rotation_track.keyframes.empty()) evaluated_rotation = clip.rotation;
+        if (clip.opacity_track.keyframes.empty()) evaluated_opacity = clip.opacity;
+
+        evaluated_scale = std::max(0.0f, evaluated_scale);     // Never allow 0 scale
+        evaluated_opacity = std::clamp(evaluated_opacity, 0.0f, 1.0f); // Clamp opacity
+
+        // (Optionally: evaluated_rotation if you add that too)
+
+        GLuint tex_id = 0;
+        bool is_video = is_video_file(clip.path);
+
+        // Find the texture
+        if (is_video) {
+            auto vid_it = res.video_cache.find(clip.path);
+            if (vid_it != res.video_cache.end() && vid_it->second.is_initialized) {
+                tex_id = vid_it->second.texture_id;
             }
+        } else {
+            auto img_it = res.texture_cache.find(clip.path);
+            if (img_it != res.texture_cache.end()) {
+                tex_id = img_it->second;
+            }
+        }
 
-            if (tex_id != 0) {
-                glBindTexture(GL_TEXTURE_2D, tex_id);
-                glPushMatrix();
+        if (tex_id != 0) {
+            glBindTexture(GL_TEXTURE_2D, tex_id);
+            glPushMatrix();
 
-                // Apply transforms
-                glTranslatef(clip.pos_x, clip.pos_y, 0.0f);
-                glScalef(clip.scale, clip.scale, 1.0f);
-                glColor4f(1.0f, 1.0f, 1.0f, clip.opacity); // Apply opacity
+            // --- Apply evaluated transforms ---
+            glTranslatef(evaluated_pos_x, evaluated_pos_y, 0.0f);
+            glRotatef(evaluated_rotation, 0.0f, 0.0f, 1.0f);
+            glScalef(evaluated_scale, evaluated_scale, 1.0f);
+            glColor4f(1.0f, 1.0f, 1.0f, evaluated_opacity);
 
-                // Draw quad (centered at origin, size 2x2 fits ortho)
-                glBegin(GL_QUADS);
-                glTexCoord2f(0.0f, 0.0f); glVertex2f(-1.0f, -1.0f); // Bottom-Left Texel -> Bottom-Left Vertex
-                glTexCoord2f(1.0f, 0.0f); glVertex2f( 1.0f, -1.0f); // Bottom-Right Texel -> Bottom-Right Vertex
-                glTexCoord2f(1.0f, 1.0f); glVertex2f( 1.0f,  1.0f); // Top-Right Texel -> Top-Right Vertex
-                glTexCoord2f(0.0f, 1.0f); glVertex2f(-1.0f,  1.0f); // Top-Left Texel -> Top-Left Vertex
-                glEnd();
+            glBegin(GL_QUADS);
+                glTexCoord2f(0.0f, 0.0f); glVertex2f(-1.0f, -1.0f);
+                glTexCoord2f(1.0f, 0.0f); glVertex2f( 1.0f, -1.0f);
+                glTexCoord2f(1.0f, 1.0f); glVertex2f( 1.0f,  1.0f);
+                glTexCoord2f(0.0f, 1.0f); glVertex2f(-1.0f,  1.0f);
+            glEnd();
 
-
-                glPopMatrix();
-                rendered_any = true;
+            glPopMatrix();
+            rendered_any = true;
             } else {
             // Optionally render a placeholder if texture is missing/not ready
             // std::cerr << "Texture ID 0 for active clip: " << clip.path << std::endl;

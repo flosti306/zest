@@ -422,6 +422,8 @@ float get_video_duration(const std::string& input_path) {
 }
 
 // --- Forward Declarations ---
+template<typename T>
+void DrawKeyframeTrackEditor(const std::string& label, KeyframeTrack<T>& track);
 void DrawTimelineEditor(std::vector<Clip>& clips, float& playhead_time, float& max_duration, float& zoom_factor, std::atomic<bool>& layers_changed, Clip*& selected_clip, GLResources& res);
 void UpdatePreview(GLResources& res, const std::vector<Clip>& sorted_clips, int width, int height, float playhead_time, bool force_update);
 void RenderPreviewWindow(GLuint preview_tex, int preview_width, int preview_height);
@@ -748,7 +750,8 @@ int main(int argc, char* argv[]) {
             ImGui::SeparatorText("Transform");
             changed |= ImGui::SliderFloat("Pos X", &selected_clip->pos_x, -1.0f, 1.0f, "%.3f");
             changed |= ImGui::SliderFloat("Pos Y", &selected_clip->pos_y, -1.0f, 1.0f, "%.3f");
-            changed |= ImGui::SliderFloat("Scale", &selected_clip->scale, 0.01f, 10.0f, "%.3f");
+            changed |= ImGui::SliderFloat("Scale", &selected_clip->scale, 0.0f, 10.0f, "%.3f");
+            changed |= ImGui::SliderFloat("Rotation", &selected_clip->rotation, 0.0f, 360.0f, "%.3f");
             changed |= ImGui::SliderFloat("Opacity", &selected_clip->opacity, 0.0f, 1.0f, "%.3f");
             ImGui::SeparatorText("Timing & Trimming");
             changed |= ImGui::InputFloat("Start Time", &selected_clip->start_time, 0.1f, 1.0f, "%.2f"); selected_clip->start_time = std::max(0.0f, selected_clip->start_time);
@@ -763,6 +766,12 @@ int main(int argc, char* argv[]) {
                 selected_clip->blend_mode = static_cast<BlendMode>(current_mode);
                 changed = true;
             }
+            ImGui::SeparatorText("Keying");
+            DrawKeyframeTrackEditor("Opacity Keyframes", selected_clip->opacity_track);
+            DrawKeyframeTrackEditor("Position X Keyframes", selected_clip->pos_x_track);
+            DrawKeyframeTrackEditor("Position Y Keyframes", selected_clip->pos_y_track);
+            DrawKeyframeTrackEditor("Rotation Keyframes", selected_clip->rotation_track);
+            DrawKeyframeTrackEditor("Scale Keyframes", selected_clip->scale_track);
             if (changed) {
                 layers_changed = true;
                 if (selected_clip->linked_clip) {
@@ -1507,4 +1516,58 @@ void DrawTimelineEditor(
     ImGui::SetCursorScreenPos(ImVec2(labels_start.x, labels_start.y + timeline_height + 5));
 
     ImGui::End();
+}
+
+template<typename T>
+void DrawKeyframeTrackEditor(const std::string& label, KeyframeTrack<T>& track) {
+    if (ImGui::TreeNode(label.c_str())) {
+        int to_remove = -1;
+
+        for (size_t i = 0; i < track.keyframes.size(); ++i) {
+            auto& kf = track.keyframes[i];
+
+            ImGui::PushID(static_cast<int>(i));
+            ImGui::Separator();
+
+            // --- Editable Time
+            ImGui::SetNextItemWidth(80);
+            ImGui::DragFloat("Time", &kf.time, 0.01f, 0.0f, 999.0f, "%.3f");
+
+            ImGui::SameLine();
+            // --- Editable Value
+            ImGui::SetNextItemWidth(120);
+            ImGui::DragScalar("Value", ImGuiDataType_Float, &kf.value, 0.01f);
+
+            ImGui::SameLine();
+            // --- Interpolation Type
+            const char* interp_labels[] = {"Linear", "EaseInOut", "Hold"};
+            int interp_idx = static_cast<int>(kf.interp);
+            ImGui::SetNextItemWidth(100);
+            if (ImGui::Combo("Interp", &interp_idx, interp_labels, IM_ARRAYSIZE(interp_labels))) {
+                kf.interp = static_cast<InterpolationType>(interp_idx);
+            }
+
+            ImGui::SameLine();
+            if (ImGui::Button("Delete")) {
+                to_remove = static_cast<int>(i);
+            }
+
+            ImGui::PopID();
+        }
+
+        if (to_remove >= 0) {
+            track.keyframes.erase(track.keyframes.begin() + to_remove);
+        }
+
+        // Add new keyframe button
+        if (ImGui::Button("Add Keyframe")) {
+            track.keyframes.push_back(Keyframe<T>{
+                0.0f,    // time
+                T{},     // value (default-constructed)
+                InterpolationType::Linear
+            });
+        }
+
+        ImGui::TreePop();
+    }
 }

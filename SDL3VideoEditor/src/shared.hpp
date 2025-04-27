@@ -19,6 +19,30 @@ enum class BlendMode {
     Overlay
 };
 
+enum class InterpolationType {
+    Linear,
+    EaseInOut,
+    Hold
+};
+
+template<typename T>
+struct Keyframe {
+    float time;               // Time in seconds
+    T value;                  // The value at that time
+    InterpolationType interp; // How to interpolate to next keyframe
+};
+
+template<typename T>
+struct KeyframeTrack {
+    std::vector<Keyframe<T>> keyframes;
+
+    // Evaluate value at a given time
+    T Evaluate(float time) const;
+};
+
+float Lerp(float a, float b, float t);
+
+
 struct Clip {
     std::string name;
     
@@ -37,7 +61,14 @@ struct Clip {
     float pos_y = 0.0f;
     float scale = 1.0f;      // uniform scale for now
     float opacity = 1.0f;    // 0.0 to 1.0
+    float rotation = 0.0f;
     BlendMode blend_mode = BlendMode::Normal;
+
+    KeyframeTrack<float> pos_x_track;
+    KeyframeTrack<float> pos_y_track;
+    KeyframeTrack<float> scale_track;
+    KeyframeTrack<float> opacity_track;
+    KeyframeTrack<float> rotation_track;
 
     bool selected = false;
 
@@ -47,3 +78,5 @@ struct Clip {
 
     Clip* linked_clip = nullptr; // for audio/video pairs
 };
+
+#include "keyframetrack.inl"
