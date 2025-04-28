@@ -60,6 +60,10 @@ Uint64 last_frame_ticks = 0; // Use SDL_GetTicks for frame delta calculation
 int preview_width = 1280;
 int preview_height = 720;
 
+int render_width = 1920;
+int render_height = 1080;
+int export_fps = 30;
+
 Clip* selected_clip = nullptr; // Keep track of selected clip
 
 bool show_thumbs = false;
@@ -99,7 +103,7 @@ void SetupImGuiStyle() {
 
     ImVec4 text             = ImVec4(0.98f, 0.98f, 0.98f, 1.00f);
     ImVec4 text_secondary   = ImVec4(0.80f, 0.80f, 0.80f, 1.00f);
-    ImVec4 frame_bg         = ImVec4(0.16f, 0.16f, 0.18f, 1.00f);
+    ImVec4 frame_bg         = ImVec4(0.19f, 0.19f, 0.22f, 1.00f);
 
     // Apply the new color palette
     colors[ImGuiCol_Text]                  = text;
@@ -658,9 +662,14 @@ int main(int argc, char* argv[]) {
 
         ImGui::Begin("Controls");
         ApplyWindowBackgroundGradients();
-        ImGui::InputText("Output Path", output_path, sizeof(output_path)); ImGui::Separator();
+        ImGui::InputText("Output Path", output_path, sizeof(output_path));
+        ImGui::InputInt("FPS", &export_fps, 1, 60, 1);
+        ImGui::Text("Resolution");
+        ImGui::InputInt2("##Resolution", &render_width, ImGuiInputTextFlags_CharsDecimal);
+        ImGui::Separator();
         if (ImGui::Button(playing ? "Pause (Space)" : "Play (Space)")) playing = !playing.load();
-        ImGui::SameLine(); ImGui::Text("Time: %.2f / %.2f", playhead_time, max_duration);
+        ImGui::SameLine(); 
+        ImGui::Text("Time: %.2f / %.2f", playhead_time, max_duration);
         if (ImGui::SliderFloat("##Seek", &playhead_time, 0.0f, max_duration, "%.2f s")) {
              layers_changed = true; playing = false;
         }
@@ -670,12 +679,11 @@ int main(int argc, char* argv[]) {
             std::filesystem::path out_p(output_path);
             if (!out_p.has_filename()) { process_message = "Output path is not a valid filename!"; }
             else {
-                 int export_fps = 30;
                  int export_duration_frames = static_cast<int>(std::ceil(max_duration * export_fps));
                  if (export_duration_frames <= 0) { process_message = "Cannot export empty timeline!"; }
                  else {
                     process_message = "Exporting...";
-                    bool success = start_video_export(output_path, preview_width, preview_height, export_fps, export_duration_frames, clips, window);
+                    bool success = start_video_export(output_path, render_width, render_height, export_fps, export_duration_frames, clips, window);
                     process_message = success ? "Export finished successfully!" : "Export failed!";
                 }
             }
