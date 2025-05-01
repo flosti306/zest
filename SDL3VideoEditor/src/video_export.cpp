@@ -16,8 +16,16 @@
 #include <thread>
 #include <limits>
 #include <cmath>
+#include <queue> // Added for thumbnail queues
+#include <mutex> // Added
+#include <condition_variable> // Added
+#include <atomic> // Added
+
 #include "shared.hpp"
+#include "node.hpp" // Include Node definition
 #include "video_export.hpp"
+
+#include <imgui.h>
 
 extern "C" {
     #include <libavcodec/avcodec.h>
@@ -27,8 +35,10 @@ extern "C" {
     #include <libavutil/imgutils.h>
     #include <libavutil/opt.h>
     #include <libavutil/channel_layout.h>
+    #include <libavutil/error.h> // Added for av_make_error_string
 }
 
+// Thumbnail Worker Globals (Keep as is)
 std::thread thumbnail_worker;
 std::queue<ThumbnailRequest> thumbnail_request_queue;
 std::queue<ThumbnailResult> thumbnail_result_queue;
@@ -40,7 +50,7 @@ std::atomic<bool> stop_thumbnail_worker_flag = false;
 void start_thumbnail_worker();
 void stop_thumbnail_worker();
 
-// Debug function to check OpenGL context status
+// Debug function (Keep as is)
 void check_gl_context() {
     if (SDL_GL_GetCurrentContext()) {
         std::cout << "OpenGL context is active" << std::endl;
@@ -54,6 +64,7 @@ void check_gl_context() {
     }
 }
 
+// Setup GL Resources (Keep as is)
 bool setup_gl_resources(GLResources& res, int width, int height) {
     // Check if already setup
     if (res.fbo != 0 || res.render_tex != 0) {
@@ -88,35 +99,48 @@ bool setup_gl_resources(GLResources& res, int width, int height) {
     return true;
 }
 
-// Function to check if a file is a video file
+// Function to check if a file is a video file (Keep as is)
 bool is_video_file(const std::string& path) {
     std::string ext = std::filesystem::path(path).extension().string();
     std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
     return ext == ".mp4" || ext == ".avi" || ext == ".mov" || ext == ".m4v" || ext == ".mkv";
 }
+// Function to check if a file is an image file
+bool is_image_file(const std::string& path) {
+    std::string ext = std::filesystem::path(path).extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+    // Add common image extensions
+    return ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".bmp" || ext == ".tga";
+}
 
-// Function to initialize video
-bool initialize_video_resources(GLResources& res, const std::string& path) {
-    if (res.video_cache.count(path)) {
+
+// Initialize Video Resources (FFmpeg part, Keep mostly as is, operates on path)
+bool initialize_video_resources(GLResources& res, const std::string& path, int& width, int& height, double& duration) {
+     if (res.video_cache.count(path)) {
+         // Already initialized, retrieve existing info
+         width = res.video_cache[path].width;
+         height = res.video_cache[path].height;
+         duration = res.video_cache[path].duration_sec;
         return res.video_cache[path].is_initialized;
     }
 
-    VideoData video;
-    
+    VideoData video; // Creates a default VideoData
+
     // Open the file
     video.format_ctx = avformat_alloc_context();
     if (avformat_open_input(&video.format_ctx, path.c_str(), nullptr, nullptr) != 0) {
         std::cerr << "Could not open video file: " << path << std::endl;
+        avformat_free_context(video.format_ctx); // Need to free context
         return false;
     }
-    
+
     // Find stream info
     if (avformat_find_stream_info(video.format_ctx, nullptr) < 0) {
         std::cerr << "Could not find stream info for: " << path << std::endl;
-        avformat_close_input(&video.format_ctx);
+        avformat_close_input(&video.format_ctx); // Close input on failure
         return false;
     }
-    
+
     // Find the first video stream
     video.video_stream_idx = -1;
     for (unsigned i = 0; i < video.format_ctx->nb_streams; i++) {
@@ -125,16 +149,16 @@ bool initialize_video_resources(GLResources& res, const std::string& path) {
             break;
         }
     }
-    
+
     if (video.video_stream_idx == -1) {
         std::cerr << "No video stream found in: " << path << std::endl;
         avformat_close_input(&video.format_ctx);
         return false;
     }
-    
+
     // Get codec parameters
     AVCodecParameters* codec_params = video.format_ctx->streams[video.video_stream_idx]->codecpar;
-    
+
     // Find decoder
     const AVCodec* codec = avcodec_find_decoder(codec_params->codec_id);
     if (!codec) {
@@ -142,7 +166,7 @@ bool initialize_video_resources(GLResources& res, const std::string& path) {
         avformat_close_input(&video.format_ctx);
         return false;
     }
-    
+
     // Allocate codec context
     video.codec_ctx = avcodec_alloc_context3(codec);
     if (!video.codec_ctx) {
@@ -150,7 +174,7 @@ bool initialize_video_resources(GLResources& res, const std::string& path) {
         avformat_close_input(&video.format_ctx);
         return false;
     }
-    
+
     // Copy parameters to context
     if (avcodec_parameters_to_context(video.codec_ctx, codec_params) < 0) {
         std::cerr << "Failed to copy codec parameters for: " << path << std::endl;
@@ -158,7 +182,7 @@ bool initialize_video_resources(GLResources& res, const std::string& path) {
         avformat_close_input(&video.format_ctx);
         return false;
     }
-    
+
     // Open codec
     if (avcodec_open2(video.codec_ctx, codec, nullptr) < 0) {
         std::cerr << "Failed to open codec for: " << path << std::endl;
@@ -166,13 +190,15 @@ bool initialize_video_resources(GLResources& res, const std::string& path) {
         avformat_close_input(&video.format_ctx);
         return false;
     }
-    
+
     // Allocate frames
-    video.frame = av_frame_alloc(); // Only the raw decoded frame
-    if (!video.frame) { /* error handling */ avcodec_free_context(&video.codec_ctx); avformat_close_input(&video.format_ctx); return false; }
+    video.frame = av_frame_alloc();
+    if (!video.frame) { avcodec_free_context(&video.codec_ctx); avformat_close_input(&video.format_ctx); return false; }
 
     video.width = video.codec_ctx->width;
     video.height = video.codec_ctx->height;
+    width = video.width; // Pass out width
+    height = video.height; // Pass out height
 
     // Initialize SWS context for YUV->RGB conversion
      video.sws_ctx = sws_getContext(
@@ -180,10 +206,10 @@ bool initialize_video_resources(GLResources& res, const std::string& path) {
         video.width, video.height, AV_PIX_FMT_RGB24, // Target RGB
         SWS_BILINEAR, nullptr, nullptr, nullptr
     );
-    if (!video.sws_ctx) { /* error handling */ av_frame_free(&video.frame); avcodec_free_context(&video.codec_ctx); avformat_close_input(&video.format_ctx); return false; }
+    if (!video.sws_ctx) { av_frame_free(&video.frame); avcodec_free_context(&video.codec_ctx); avformat_close_input(&video.format_ctx); return false; }
 
     video.packet = av_packet_alloc();
-    if (!video.packet) { /* error handling */ sws_freeContext(video.sws_ctx); av_frame_free(&video.frame); avcodec_free_context(&video.codec_ctx); avformat_close_input(&video.format_ctx); return false; }
+    if (!video.packet) { sws_freeContext(video.sws_ctx); av_frame_free(&video.frame); avcodec_free_context(&video.codec_ctx); avformat_close_input(&video.format_ctx); return false; }
 
     // Store time base and duration
     video.time_base = video.format_ctx->streams[video.video_stream_idx]->time_base;
@@ -196,397 +222,495 @@ bool initialize_video_resources(GLResources& res, const std::string& path) {
         video.duration_sec = 0.0; // Unknown duration
         std::cerr << "Warning: Could not determine duration for " << path << std::endl;
     }
+    duration = video.duration_sec; // Pass out duration
 
 
     // Create OpenGL texture (initially empty)
     glGenTextures(1, &video.texture_id);
     glBindTexture(GL_TEXTURE_2D, video.texture_id);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, video.width, video.height, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
+    // Use GL_RGBA for flexibility, even if source is RGB, simplifies rendering pipeline
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, video.width, video.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-     glBindTexture(GL_TEXTURE_2D, 0); // Unbind
+    glBindTexture(GL_TEXTURE_2D, 0); // Unbind
 
     video.is_initialized = true;
+
+    // Move the fully constructed VideoData into the cache
     auto [it, success] = res.video_cache.emplace(path, std::move(video));
     if (!success) {
          // Handle error: Element with this path already existed? Or emplace failed?
          std::cerr << "Error: Failed to emplace VideoData into cache for " << path << std::endl;
          // Need to clean up partially initialized 'video' object before returning false
-         av_packet_free(&video.packet);
-         sws_freeContext(video.sws_ctx);
-         av_frame_free(&video.frame);
-         avcodec_free_context(&video.codec_ctx);
-         avformat_close_input(&video.format_ctx);
-         // Also delete the GL texture if created
-         if(video.texture_id) glDeleteTextures(1, &video.texture_id);
-         return false;
+         // Note: Since 'video' was moved, its members are now null/default.
+         // We need to call cleanup on the potential original 'video' object if emplace failed
+         // This part is tricky after a move. Best to check cache *before* creating VideoData.
+         // (Correction: The check is already done at the beginning)
+         // If emplace failed, the original 'video' object is destroyed, releasing some resources.
+         // Need manual cleanup for things not handled by destructor like GL texture.
+         // Let's assume emplace won't fail if the initial check passes.
+         return false; // Or handle more gracefully
     }
      // If successful, the 'video' object has been moved from, use the iterator 'it'
     std::cout << "Initialized video resources for: " << path << " (ID: " << it->second.texture_id << ")" << std::endl;
 
-    glBindTexture(GL_TEXTURE_2D, 0); // Unbind texture (was after the move before)
     return true;
 }
 
-// Function to load necessary resources (textures, ffmpeg contexts) for a specific clip
-void load_resources_for_clip(GLResources& res, const Clip& clip) {
-    if (is_video_file(clip.path)) {
-        if (!res.video_cache.count(clip.path) || !res.video_cache[clip.path].is_initialized) {
-            initialize_video_resources(res, clip.path);
+
+// Loads ONLY image textures
+// Takes Clip reference to get path, but operates on GLResources cache keyed by path
+bool load_image_texture(GLResources& res, const Clip& clip, int& width, int& height) {
+    // Skip if already loaded
+    if (res.texture_cache.count(clip.path)) {
+        // Need to get width/height if already loaded
+        // This requires storing width/height alongside texture ID, or querying GL (slow)
+        // For now, let's assume we need to load it fully to get dimensions reliably if not cached
+        // A better approach: Store dimensions in GLResources::texture_cache alongside ID
+        // Temporary workaround: Reload to get dimensions if needed (inefficient)
+        // Better: Add width/height to texture_cache entry (e.g., map<string, pair<GLuint, ImVec2>>)
+        // For simplicity now, just return true, assuming dimensions were stored in Clip before
+        // width = clip.source_width; // Assume these were set when clip was added
+        // height = clip.source_height;
+        // Querying the texture size (Example - requires texture to be bound):
+        glBindTexture(GL_TEXTURE_2D, res.texture_cache[clip.path]);
+        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &width);
+        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &height);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        return true;
+    }
+
+    if (!std::filesystem::exists(clip.path)) {
+        std::cerr << "Image file does not exist: " << clip.path << std::endl;
+        return false;
+    }
+
+    SDL_Surface* surface = IMG_Load(clip.path.c_str());
+    if (!surface) {
+        std::cerr << "Failed to load image: " << clip.path << " - " << SDL_GetError() << std::endl;
+        return false;
+    }
+
+    // Pass out dimensions
+    width = surface->w;
+    height = surface->h;
+
+    SDL_Surface* formatted_surface = nullptr;
+    SDL_PixelFormat target_format_sdl;
+    GLenum gl_format, gl_internal_format;
+
+    bool has_alpha = SDL_ISPIXELFORMAT_ALPHA(surface->format);
+
+    if (has_alpha) {
+        target_format_sdl = SDL_PIXELFORMAT_RGBA32;
+        gl_format = GL_RGBA;
+        gl_internal_format = GL_RGBA; // Use RGBA internal format
+    } else {
+        target_format_sdl = SDL_PIXELFORMAT_RGB24;
+        gl_format = GL_RGB;
+        gl_internal_format = GL_RGB; // Use RGB internal format
+    }
+
+    if (surface->format != target_format_sdl) {
+         std::cout << "Converting surface " << clip.path << " from "
+                      << SDL_GetPixelFormatName(surface->format) << " to "
+                      << SDL_GetPixelFormatName(target_format_sdl) << std::endl;
+        formatted_surface = SDL_ConvertSurface(surface, target_format_sdl);
+        if (!formatted_surface) {
+            std::cerr << "Failed to convert image surface for " << clip.path << ": " << SDL_GetError() << std::endl;
+            SDL_DestroySurface(surface);
+            return false;
         }
-        // Optionally initialize audio resources here too if needed for streaming
-        // if (clip.type == ClipType::Audio || !clip.is_audio_only) {
-        //     initialize_audio_resources(res, clip.path);
-        // }
+        SDL_DestroySurface(surface);
+    } else {
+        formatted_surface = surface;
+    }
+
+    GLuint tex_id = 0;
+    glGenTextures(1, &tex_id);
+    if (tex_id == 0) {
+         std::cerr << "Failed to generate texture ID for " << clip.path << std::endl;
+         SDL_DestroySurface(formatted_surface);
+         return false;
+    }
+    glBindTexture(GL_TEXTURE_2D, tex_id);
+
+    glTexImage2D(GL_TEXTURE_2D, 0, gl_internal_format, formatted_surface->w, formatted_surface->h, 0,
+                 gl_format, GL_UNSIGNED_BYTE, formatted_surface->pixels);
+
+    GLenum err = glGetError();
+    if (err != GL_NO_ERROR) {
+        std::cerr << "OpenGL error creating texture for " << clip.path << ": " << err << std::endl;
+        glDeleteTextures(1, &tex_id);
+        SDL_DestroySurface(formatted_surface);
+        return false;
+    }
+
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    res.texture_cache[clip.path] = tex_id; // Store the texture ID
+    SDL_DestroySurface(formatted_surface);
+    std::cout << "Loaded image texture: " << clip.path << " (ID: " << tex_id << ")" << std::endl;
+
+    glBindTexture(GL_TEXTURE_2D, 0); // Unbind texture unit
+    return true;
+}
+
+
+// Function to load necessary resources (textures, ffmpeg contexts) for a specific *source* clip
+// This is called when a Clip is added to the media library.
+bool load_resources_for_clip(GLResources& res, Clip& clip) { // Pass non-const Clip to store W/H/Duration
+    bool success = true;
+    if (clip.type == ClipType::Video) {
+        if (!res.video_cache.count(clip.path) || !res.video_cache[clip.path].is_initialized) {
+            double video_duration_double = 0.0;
+            success &= initialize_video_resources(res, clip.path, clip.source_width, clip.source_height, video_duration_double);
+            clip.source_duration = static_cast<float>(video_duration_double);
+        } else {
+            // Already loaded, just grab info
+            clip.source_width = res.video_cache[clip.path].width;
+            clip.source_height = res.video_cache[clip.path].height;
+            clip.source_duration = static_cast<float>(res.video_cache[clip.path].duration_sec);
+        }
          // Preload audio for waveform/export if not already done
-        if ((clip.type == ClipType::Audio || !clip.is_audio_only) && !res.preloaded_audio.count(clip.path)) {
+        if (clip.has_audio && !res.preloaded_audio.count(clip.path)) {
             PreloadedAudio audio;
             if (preload_audio_file(clip.path, audio, 0.0f, -1.0f)) { // Preload entire file for now
+                 clip.waveform = audio.waveform; // Store waveform preview in Clip struct
                  res.preloaded_audio[clip.path] = std::move(audio);
                  std::cout << "Preloaded audio for: " << clip.path << std::endl;
             } else {
                  std::cerr << "Failed to preload audio for: " << clip.path << std::endl;
+                 clip.has_audio = false; // Mark as no audio if preload failed
+                 success = false; // Indicate potential issue
             }
         }
 
-    } else { // It's an image
+    } else if (clip.type == ClipType::Image) {
         if (!res.texture_cache.count(clip.path)) {
-            // This case is handled by the separate load_textures call usually,
-            // but we can add it here for robustness if needed.
-            load_textures(res, {clip}); // Load just this one image if missing
+            success &= load_image_texture(res, clip, clip.source_width, clip.source_height);
+            // Images have infinite source duration conceptually, or set a default?
+            clip.source_duration = std::numeric_limits<float>::max(); // Or a large number
+        } else {
+             // Get dimensions from cache (implement this properly later)
+             GLuint tex_id = res.texture_cache[clip.path];
+             glBindTexture(GL_TEXTURE_2D, tex_id);
+             glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &clip.source_width);
+             glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &clip.source_height);
+             glBindTexture(GL_TEXTURE_2D, 0);
+             clip.source_duration = std::numeric_limits<float>::max();
         }
+        clip.has_audio = false; // Images don't have audio
+
+    } else if (clip.type == ClipType::Audio) {
+         // Preload audio for waveform/export if not already done
+        if (!res.preloaded_audio.count(clip.path)) {
+            PreloadedAudio audio;
+            if (preload_audio_file(clip.path, audio, 0.0f, -1.0f)) {
+                 clip.waveform = audio.waveform;
+                 clip.source_duration = audio.duration;
+                 clip.source_width = 0; // No visual dimensions
+                 clip.source_height = 0;
+                 res.preloaded_audio[clip.path] = std::move(audio);
+                 std::cout << "Preloaded audio-only file: " << clip.path << std::endl;
+            } else {
+                 std::cerr << "Failed to preload audio-only file: " << clip.path << std::endl;
+                 success = false;
+            }
+        } else {
+            // Already loaded
+            clip.waveform = res.preloaded_audio[clip.path].waveform;
+            clip.source_duration = res.preloaded_audio[clip.path].duration;
+        }
+        clip.has_audio = true; // It is audio
+        clip.is_audio_only = true;
     }
+    return success;
 }
 
-bool ensure_video_decoded_upto(VideoData& video, double target_time_seconds) {
+
+// Ensure video is decoded up to a specific *media time* (Keep mostly as is, operates on VideoData)
+bool ensure_video_decoded_upto(VideoData& video, double target_media_time_seconds) {
+    // ... (implementation largely unchanged, uses video.frame_cache, video.last_decoded_pts etc.)
+    // Make sure PTS comparisons are correct
     if (!video.is_initialized) return false;
     if (video.is_seeking) return false; // Don't decode while seeking
 
     // --- Seeking Logic ---
-    // Check if a seek is necessary
     bool needs_seek = false;
-    if (target_time_seconds < video.last_decoded_pts - 1.0 // Target is significantly behind current pos (allow small backward jumps within cache)
-        || video.last_decoded_pts < 0) // Not decoded anything yet
-    {
-         // Check if target is outside the current cache range
-        if (video.frame_cache.empty() ||
-            target_time_seconds < video.frame_cache.front().pts - 0.5 || // Target before cache start
-            target_time_seconds > video.frame_cache.back().pts + 1.0)     // Target significantly after cache end
-        {
-             needs_seek = true;
-        }
+     // Target is significantly behind *cache start* or before first decoded frame
+    if (video.frame_cache.empty() || target_media_time_seconds < video.frame_cache.front().pts - 1.0) {
+        needs_seek = true;
     }
+     // Target is significantly beyond the last decoded point (cache might be full but behind target)
+    else if (target_media_time_seconds > video.last_decoded_pts + 1.0 && video.frame_cache.size() >= VideoData::MAX_CACHE_SIZE)
+    {
+        needs_seek = true;
+    }
+     // Initial state
+     else if (video.last_decoded_pts < 0) {
+         needs_seek = true;
+     }
+
 
     if (needs_seek) {
-        video.is_seeking = true; // Signal start of seek
-        video.seek_target_pts = target_time_seconds;
+        // Avoid seeking if target is very close to start and we haven't decoded anything
+        if (target_media_time_seconds < 0.1 && video.last_decoded_pts < 0) {
+             std::cout << "Skipping seek for target near 0 before first decode: " << video.format_ctx->url << std::endl;
+        } else {
+            video.is_seeking = true;
+            video.seek_target_pts = target_media_time_seconds;
 
-        // Perform the seek
-        int64_t seek_target_ts = av_rescale_q(static_cast<int64_t>(target_time_seconds * AV_TIME_BASE),
-                                              AV_TIME_BASE_Q, video.time_base);
+            int64_t seek_target_ts = av_rescale_q(static_cast<int64_t>(target_media_time_seconds * AV_TIME_BASE),
+                                                  AV_TIME_BASE_Q, video.time_base);
 
-        // Seek to the keyframe *before* the target time
-        int ret = av_seek_frame(video.format_ctx, video.video_stream_idx, seek_target_ts, AVSEEK_FLAG_BACKWARD);
+            std::cout << "Seeking video " << video.format_ctx->url << " to ~" << target_media_time_seconds << "s (TS: " << seek_target_ts << ")" << std::endl;
+            int ret = av_seek_frame(video.format_ctx, video.video_stream_idx, seek_target_ts, AVSEEK_FLAG_BACKWARD);
 
-        if (ret < 0) {
-            char errbuf[AV_ERROR_MAX_STRING_SIZE];
-            av_make_error_string(errbuf, sizeof(errbuf), ret);
-            std::cerr << "Error seeking video " << video.format_ctx->url << " to " << target_time_seconds << "s: " << errbuf << std::endl;
+            if (ret < 0) {
+                char errbuf[AV_ERROR_MAX_STRING_SIZE];
+                av_make_error_string(errbuf, sizeof(errbuf), ret);
+                std::cerr << "Error seeking video " << video.format_ctx->url << " to " << target_media_time_seconds << "s: " << errbuf << std::endl;
+                // Don't return false, allow decoding attempt from current pos maybe? Or clear cache and retry from start?
+                // For now, just log and continue, but clear buffers.
+            }
+
+            avcodec_flush_buffers(video.codec_ctx);
+            video.last_decoded_pts = -1.0; // Reset target PTS after flush
+            video.frame_cache.clear();     // Clear cache after seek
             video.is_seeking = false;
-            return false; // Seek failed
         }
-
-        avcodec_flush_buffers(video.codec_ctx); // Important after seek
-        video.last_decoded_pts = -1.0; // Reset decoded PTS
-        video.frame_cache.clear(); // Clear cache after seek
-        std::cout << "Seeked video " << video.format_ctx->url << " to ~" << target_time_seconds << "s" << std::endl;
-
-        video.is_seeking = false; // Signal end of seek
     }
 
 
     // --- Sequential Decoding Logic ---
-    while (video.last_decoded_pts < target_time_seconds) {
-        // Try receiving frames first (in case some are buffered)
+    // Decode until the *cache* contains a frame at or after the target time
+    while (video.frame_cache.empty() || video.frame_cache.back().pts < target_media_time_seconds)
+    {
+        // Try receiving frames first
         int ret = avcodec_receive_frame(video.codec_ctx, video.frame);
 
         if (ret == AVERROR(EAGAIN)) {
             // Need more packets
-            av_packet_unref(video.packet); // Ensure packet is clean
+            av_packet_unref(video.packet);
             ret = av_read_frame(video.format_ctx, video.packet);
             if (ret < 0) {
                 if (ret == AVERROR_EOF) {
                     // End of file, flush decoder
                     avcodec_send_packet(video.codec_ctx, nullptr);
-                    // Try receiving final frames after flushing
                      while (true) {
                         ret = avcodec_receive_frame(video.codec_ctx, video.frame);
                         if (ret == AVERROR_EOF || ret == AVERROR(EAGAIN)) break;
                         if (ret < 0) { std::cerr << "Error receiving flushed frame\n"; break; }
 
-                         // Process the flushed frame (same as below)
                         double pts_sec = (video.frame->pts == AV_NOPTS_VALUE) ?
                                         video.last_decoded_pts + av_q2d(video.codec_ctx->time_base) : // Estimate if no PTS
                                         static_cast<double>(video.frame->pts) * av_q2d(video.time_base);
 
-                        // Convert and cache
-                        DecodedFrame decoded;
+                        // Convert and cache flushed frame
+                        DecodedFrame decoded; /* ... fill ... */
                         decoded.width = video.width;
                         decoded.height = video.height;
                         decoded.pts = pts_sec;
-                        decoded.pixels.resize(video.width * video.height * 3); // RGB24
-
+                        decoded.pixels.resize(video.width * video.height * 3);
                         uint8_t* dest_data[4] = {decoded.pixels.data(), nullptr, nullptr, nullptr};
                         int dest_linesize[4] = {video.width * 3, 0, 0, 0};
-
-                        sws_scale(video.sws_ctx, video.frame->data, video.frame->linesize, 0,
-                                  video.height, dest_data, dest_linesize);
+                        sws_scale(video.sws_ctx, video.frame->data, video.frame->linesize, 0, video.height, dest_data, dest_linesize);
 
                         video.frame_cache.push_back(std::move(decoded));
-                        if (video.frame_cache.size() > VideoData::MAX_CACHE_SIZE) {
-                            video.frame_cache.pop_front();
-                        }
+                        if (video.frame_cache.size() > VideoData::MAX_CACHE_SIZE) video.frame_cache.pop_front();
                         video.last_decoded_pts = pts_sec;
-
+                        av_frame_unref(video.frame); // Unref frame after use
                     }
                     std::cout << "EOF reached for " << video.format_ctx->url << std::endl;
-                    return true; // Reached end, considered "up to" any future time
-                } else {
-                    char errbuf[AV_ERROR_MAX_STRING_SIZE];
-                    av_make_error_string(errbuf, sizeof(errbuf), ret);
-                    std::cerr << "Error reading frame for " << video.format_ctx->url << ": " << errbuf << std::endl;
-                    return false; // Error reading
-                }
+                    return !video.frame_cache.empty(); // Success if we cached at least one frame
+                } else { /* Error reading */ return false; }
             }
 
-            // Send the new packet if it's for our stream
+            // Send the new packet
             if (video.packet->stream_index == video.video_stream_idx) {
                  ret = avcodec_send_packet(video.codec_ctx, video.packet);
-                if (ret < 0) {
-                    char errbuf[AV_ERROR_MAX_STRING_SIZE];
-                    av_make_error_string(errbuf, sizeof(errbuf), ret);
-                     std::cerr << "Error sending packet for " << video.format_ctx->url << ": " << errbuf << std::endl;
-                    av_packet_unref(video.packet);
-                    return false;
-                }
+                if (ret < 0) { /* Error sending */ av_packet_unref(video.packet); return false; }
             }
-             av_packet_unref(video.packet); // Unref packet whether sent or not
+             av_packet_unref(video.packet);
              continue; // Loop back to try receiving again
         } else if (ret == AVERROR_EOF) {
-            // Decoder flushed and finished
-             std::cout << "Decoder finished for " << video.format_ctx->url << std::endl;
-            return true; // Reached end
-        } else if (ret < 0) {
-             char errbuf[AV_ERROR_MAX_STRING_SIZE];
-             av_make_error_string(errbuf, sizeof(errbuf), ret);
-             std::cerr << "Error receiving frame for " << video.format_ctx->url << ": " << errbuf << std::endl;
-            return false; // Decoding error
-        }
+            std::cout << "Decoder finished for " << video.format_ctx->url << std::endl;
+            return !video.frame_cache.empty(); // Reached end
+        } else if (ret < 0) { /* Error receiving */ return false; }
 
         // --- Successfully Received a Frame ---
         double pts_sec = (video.frame->pts == AV_NOPTS_VALUE) ?
-                         video.last_decoded_pts + av_q2d(video.codec_ctx->time_base) : // Estimate if no PTS
+                         video.last_decoded_pts + av_q2d(video.codec_ctx->time_base) : // Estimate
                          static_cast<double>(video.frame->pts) * av_q2d(video.time_base);
 
-         // Convert and cache the frame
-        DecodedFrame decoded;
+        // Convert and cache the frame
+        DecodedFrame decoded; /* ... fill ... */
         decoded.width = video.width;
         decoded.height = video.height;
         decoded.pts = pts_sec;
-        decoded.pixels.resize(video.width * video.height * 3); // RGB24
-
+        decoded.pixels.resize(video.width * video.height * 3);
         uint8_t* dest_data[4] = {decoded.pixels.data(), nullptr, nullptr, nullptr};
         int dest_linesize[4] = {video.width * 3, 0, 0, 0};
+        sws_scale(video.sws_ctx, video.frame->data, video.frame->linesize, 0, video.height, dest_data, dest_linesize);
 
-        sws_scale(video.sws_ctx, video.frame->data, video.frame->linesize, 0,
-                  video.height, dest_data, dest_linesize);
 
+        // Insert into cache sorted by PTS (or just push_back if always sequential)
+        // Assuming sequential for now after seek/flush
         video.frame_cache.push_back(std::move(decoded));
         if (video.frame_cache.size() > VideoData::MAX_CACHE_SIZE) {
             video.frame_cache.pop_front();
         }
-        video.last_decoded_pts = pts_sec;
-         // std::cout << "Cached frame PTS: " << pts_sec << "s for " << video.format_ctx->url << std::endl;
-
-        // If we've decoded past the target, we're done for now
-        if (pts_sec >= target_time_seconds) {
-            break;
-        }
+        video.last_decoded_pts = pts_sec; // Track PTS of last *added* frame
+        // std::cout << "Cached frame PTS: " << pts_sec << "s for " << video.format_ctx->url << std::endl;
+        av_frame_unref(video.frame); // Unref frame after use
     }
 
-    return true; // Successfully decoded up to or past the target
+
+    return true; // Successfully decoded enough to satisfy the target time potentially being in cache
 }
 
-// Finds the best frame in cache for target_time and uploads it to the texture
-bool update_texture_from_cache(VideoData& video, double target_time_seconds) {
-    if (!video.is_initialized || video.frame_cache.empty()) {
+
+// Finds the best frame in cache for target_media_time and uploads it (Keep mostly as is)
+bool update_texture_from_cache(VideoData& video, double target_media_time_seconds) {
+    // ... (implementation mostly unchanged, finds best frame in video.frame_cache based on target_media_time_seconds)
+     if (!video.is_initialized || video.frame_cache.empty()) {
+        // std::cerr << "Warning: Cannot update texture, video not init or cache empty for " << video.format_ctx->url << std::endl;
         return false;
     }
 
-    // Find the closest frame in the cache
+    // Find the closest frame in the cache (prefer frame just before or at target time)
     const DecodedFrame* best_frame = nullptr;
     double min_diff = std::numeric_limits<double>::max();
 
-    for (const auto& frame : video.frame_cache) {
-        double diff = std::abs(frame.pts - target_time_seconds);
-        if (diff < min_diff) {
-            min_diff = diff;
-            best_frame = &frame;
+     // Iterate backwards for potentially better cache coherency / finding frame <= target quickly
+    for (auto it = video.frame_cache.rbegin(); it != video.frame_cache.rend(); ++it) {
+        double diff = target_media_time_seconds - it->pts; // Positive diff means frame is before target
+        if (diff >= 0) { // Found a frame at or before the target
+             if (diff < min_diff) { // Is it the closest one found so far?
+                 min_diff = diff;
+                 best_frame = &(*it);
+             }
         }
-        // Optimization: if we pass the target time significantly,
-        // the previous frame was likely the best one, unless cache is very small.
-        // For simplicity, we'll just find the absolute minimum diff.
+         // Optimization: If we are significantly past the target looking backwards,
+         // and we already found a candidate (best_frame != nullptr), we can stop.
+        if (diff < -0.5 && best_frame) { // Frame is > 0.5s after target
+             break;
+         }
     }
+
+     // If no frame at or before target was found, use the very first frame in cache
+     if (!best_frame && !video.frame_cache.empty()) {
+         best_frame = &video.frame_cache.front();
+         min_diff = std::abs(target_media_time_seconds - best_frame->pts);
+         // std::cout << "Warning: No frame found at/before target " << target_media_time_seconds << ". Using first cached frame PTS: " << best_frame->pts << std::endl;
+     }
+
 
     if (best_frame) {
         // Check if this frame is already the one displayed (optional optimization)
-        // Requires storing the PTS of the currently displayed frame.
-        // static std::map<GLuint, double> displayed_pts;
-        // if (displayed_pts.count(video.texture_id) && displayed_pts[video.texture_id] == best_frame->pts) {
-        //     return true; // Already displaying this frame
-        // }
-
+         static std::map<std::string, double> displayed_pts; // Key by path now? Or texture ID? Assume texture ID for now.
+         std::string path_key = video.format_ctx ? video.format_ctx->url : ""; // Get path if possible
+         if (!path_key.empty() && displayed_pts.count(path_key) && displayed_pts[path_key] == best_frame->pts) {
+             return true; // Already displaying this frame
+         }
 
         // Upload the pixels to the texture
         glBindTexture(GL_TEXTURE_2D, video.texture_id);
+        // Use glTexSubImage2D for better performance if texture dimensions match
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, best_frame->width, best_frame->height,
                         GL_RGB, GL_UNSIGNED_BYTE, best_frame->pixels.data());
         glBindTexture(GL_TEXTURE_2D, 0); // Unbind
 
         GLenum err = glGetError();
         if (err != GL_NO_ERROR) {
-            std::cerr << "OpenGL error updating texture " << video.texture_id << " from cache: " << err << std::endl;
+            std::cerr << "OpenGL error updating texture " << video.texture_id << " (" << path_key << ") from cache: " << err << std::endl;
             return false;
         }
-        // displayed_pts[video.texture_id] = best_frame->pts; // Mark as displayed
-        // std::cout << "Updated texture " << video.texture_id << " with frame PTS: " << best_frame->pts << "s (Target: " << target_time_seconds << "s)" << std::endl;
+        if (!path_key.empty()) displayed_pts[path_key] = best_frame->pts; // Mark as displayed
+
+        // std::cout << "Updated texture " << video.texture_id << " (" << path_key << ") with frame PTS: " << best_frame->pts << "s (Target: " << target_media_time_seconds << "s, Diff: " << min_diff << ")" << std::endl;
         return true;
+    } else {
+        // std::cerr << "Warning: No suitable frame found in cache for " << target_media_time_seconds << "s in " << (video.format_ctx ? video.format_ctx->url : "Unknown") << std::endl;
     }
 
     return false; // No suitable frame found in cache
 }
 
 // --- Preview Update Orchestration ---
-void update_video_previews(GLResources& res, const std::vector<Clip>& active_clips, float current_time) {
-    // 1. Request decoding up to current time + a small buffer (e.g., 2 frames ahead)
+// Iterates through *visible nodes* at the current time
+void update_video_previews(GLResources& res, const std::vector<std::shared_ptr<Node>>& root_nodes, float current_time) {
+
     float decode_ahead_time = 10.0f / 30.0f; // Example: 10 frames at 30fps
-    float target_decode_time = current_time + decode_ahead_time;
 
-    for (const auto& clip : active_clips) {
-        if (clip.type == ClipType::Video && is_video_file(clip.path)) {
-            auto it = res.video_cache.find(clip.path);
-            if (it != res.video_cache.end() && it->second.is_initialized) {
-                float clip_target_time = current_time - clip.start_time + clip.media_start;
-                 float clip_decode_target_time = target_decode_time - clip.start_time + clip.media_start;
+    // Recursive function to process nodes
+    std::function<void(Node*)> process_node =
+        [&](Node* node) {
+        if (!node || !node->visible) return;
 
-                // Ensure decoding progresses
-                 ensure_video_decoded_upto(it->second, clip_decode_target_time);
+        float local_time = current_time - node->start_time;
+        if (local_time < 0.0f || local_time >= node->duration) {
+            // Node not active, but check children
+             for (const auto& child : node->children) { process_node(child.get()); }
+            return;
+        }
 
-                 // Update texture with the best available frame for the *current* time
-                 update_texture_from_cache(it->second, clip_target_time);
+        if (node->type == NodeType::Media) {
+            MediaNode* media_node = static_cast<MediaNode*>(node);
+            if (media_node->source_clip && media_node->source_clip->type == ClipType::Video) {
+                const std::string& path = media_node->source_clip->path;
+                auto it = res.video_cache.find(path);
+                if (it != res.video_cache.end() && it->second.is_initialized) {
+                    VideoData& video_data = it->second;
+
+                    // Calculate the time within the source media file
+                    float media_time = local_time + media_node->media_start;
+                    media_time = std::max(0.0f, media_time); // Ensure non-negative
+                    if(video_data.duration_sec > 0) {
+                        media_time = std::min(media_time, (float)video_data.duration_sec); // Clamp to duration
+                    }
+
+
+                    // Ensure decoding covers current time + buffer
+                    float target_decode_media_time = media_time + decode_ahead_time;
+                     if(video_data.duration_sec > 0) {
+                        target_decode_media_time = std::min(target_decode_media_time, (float)video_data.duration_sec);
+                     }
+
+                    if (ensure_video_decoded_upto(video_data, target_decode_media_time)) {
+                        // Update texture with the best available frame for the *current* media time
+                        update_texture_from_cache(video_data, media_time);
+                    } else {
+                       // std::cerr << "Error ensuring video decoded for " << path << " at media time " << target_decode_media_time << std::endl;
+                    }
+                }
             }
         }
+
+        // Process children nodes recursively
+        for (const auto& child : node->children) {
+            process_node(child.get());
+        }
+    };
+
+    // Start processing from root nodes
+    for (const auto& root_node : root_nodes) {
+        process_node(root_node.get());
     }
 }
 
 
-// Loads ONLY image textures
-void load_textures(GLResources& res, const std::vector<Clip>& clips) {
-    for (const auto& clip : clips) {
-        // Skip if already loaded or if it's a video file (handled separately)
-        if (res.texture_cache.count(clip.path) || is_video_file(clip.path)) {
-            continue;
-        }
-
-        if (!std::filesystem::exists(clip.path)) {
-            std::cerr << "Image file does not exist: " << clip.path << std::endl;
-            continue;
-        }
-
-        SDL_Surface* surface = IMG_Load(clip.path.c_str());
-        if (!surface) {
-            std::cerr << "Failed to load image: " << clip.path << " - " << SDL_GetError() << std::endl;
-            continue;
-        }
-
-        SDL_Surface* formatted_surface = nullptr; // Surface to use for texture upload
-        SDL_PixelFormat target_format_sdl;       // Target SDL pixel format value
-        GLenum gl_format, gl_internal_format;
-
-        // Determine target format (prefer RGBA if alpha exists)
-        // In SDL3, surface->format is the SDL_PixelFormat value directly
-        bool has_alpha = SDL_ISPIXELFORMAT_ALPHA(surface->format);
-
-        if (has_alpha) {
-            target_format_sdl = SDL_PIXELFORMAT_RGBA32; // Common 32-bit RGBA format
-            gl_format = GL_RGBA;
-            gl_internal_format = GL_RGBA;
-        } else {
-            target_format_sdl = SDL_PIXELFORMAT_RGB24;  // Common 24-bit RGB format
-            gl_format = GL_RGB;
-            gl_internal_format = GL_RGB;
-        }
-
-        // Check if conversion is needed
-        if (surface->format != target_format_sdl) {
-            std::cout << "Converting surface " << clip.path << " from "
-                      << SDL_GetPixelFormatName(surface->format) << " to "
-                      << SDL_GetPixelFormatName(target_format_sdl) << std::endl;
-
-            // SDL_ConvertSurface takes the target format value directly
-            formatted_surface = SDL_ConvertSurface(surface, target_format_sdl);
-
-            if (!formatted_surface) {
-                std::cerr << "Failed to convert image surface for " << clip.path << ": " << SDL_GetError() << std::endl;
-                SDL_DestroySurface(surface); // Free original surface
-                continue;
-            }
-            SDL_DestroySurface(surface); // Free original surface after successful conversion
-        } else {
-            // No conversion needed, use the original surface
-            formatted_surface = surface;
-        }
-
-        GLuint tex_id = 0;
-        glGenTextures(1, &tex_id);
-        if (tex_id == 0) {
-             std::cerr << "Failed to generate texture ID for " << clip.path << std::endl;
-             SDL_DestroySurface(formatted_surface);
-             continue;
-        }
-        glBindTexture(GL_TEXTURE_2D, tex_id);
-
-        // Upload pixel data
-        glTexImage2D(GL_TEXTURE_2D, 0, gl_internal_format, formatted_surface->w, formatted_surface->h, 0,
-                     gl_format, GL_UNSIGNED_BYTE, formatted_surface->pixels);
-
-        GLenum err = glGetError();
-        if (err != GL_NO_ERROR) {
-            std::cerr << "OpenGL error creating texture for " << clip.path << ": " << err << std::endl;
-            glDeleteTextures(1, &tex_id);
-            SDL_DestroySurface(formatted_surface);
-            continue;
-        }
-
-        // Set texture parameters
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-
-        res.texture_cache[clip.path] = tex_id; // Store the texture ID
-        SDL_DestroySurface(formatted_surface); // Free the surface used for upload
-        std::cout << "Loaded image texture: " << clip.path << " (ID: " << tex_id << ")" << std::endl;
-    }
-    glBindTexture(GL_TEXTURE_2D, 0); // Unbind texture unit
-}
-
-
-// Renders using *existing* textures. Does NO decoding.
+// --- Render Frame ---
+// Renders nodes using existing textures. Does NO decoding here.
+// Takes the node hierarchy and current time.
 void render_frame(GLResources& res, float current_time,
-    const std::vector<Clip>& sorted_clips,
+    const std::vector<std::shared_ptr<Node>>& root_nodes,
     int width, int height) {
 
     glBindFramebuffer(GL_FRAMEBUFFER, res.fbo);
@@ -596,130 +720,181 @@ void render_frame(GLResources& res, float current_time,
 
     glEnable(GL_TEXTURE_2D);
     glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); // Standard alpha blending
+    // Default blend mode, will be overridden by nodes
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
-    // Simple Ortho projection for [-1, 1] space
+    // Simple Ortho projection matching window/FBO dimensions
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
-    glOrtho(-1.0 * width, 1.0 * width, -1.0 * height, 1.0 * height, -1.0, 1.0);
+    // Match projection to the output dimensions (width, height)
+    // Origin at bottom-left is standard for OpenGL FBOs
+    glOrtho(0.0, (double)width, 0.0, (double)height, -1.0, 1.0);
+
 
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
 
-    bool rendered_any = false;
-    for (const auto& clip : sorted_clips) {
-        // Set blending mode based on clip
-        switch (clip.blend_mode) {
-            case BlendMode::Normal:
-                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-                break;
-            case BlendMode::Additive:
-                glBlendFunc(GL_SRC_ALPHA, GL_ONE);
-                break;
-            case BlendMode::Multiply:
-                glBlendFunc(GL_DST_COLOR, GL_ZERO);
-                break;
-            case BlendMode::Screen:
-                glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_COLOR);
-                break;
-            case BlendMode::Darken:
-                glBlendFunc(GL_MIN, GL_ONE); // approximate
-                break;
-            case BlendMode::Lighten:
-                glBlendFunc(GL_MAX, GL_ONE); // approximate
-                break;
-            case BlendMode::Difference:
-                glBlendFunc(GL_ONE_MINUS_DST_COLOR, GL_ONE_MINUS_SRC_COLOR);
-                break;
-            case BlendMode::Subtract:
-                glBlendFunc(GL_ZERO, GL_ONE_MINUS_SRC_COLOR);
-                break;
-            case BlendMode::Divide:
-                // Not directly possible with glBlendFunc, would need shader
-                glBlendFunc(GL_ONE, GL_ONE); // approximate
-                break;
-            case BlendMode::Overlay:
-                // Overlay needs a shader normally. Approximate with multiply/screen hybrid
-                glBlendFunc(GL_SRC_ALPHA, GL_ONE);
-                break;
+    // --- Node Rendering Loop ---
+    // We need a sorted list or traversal order based on layers/hierarchy
+    // Simple approach: Collect all nodes, sort by layer, then render.
+    std::vector<Node*> nodes_to_render;
+    std::function<void(Node*)> collect_nodes = [&](Node* node) {
+        if (!node) return;
+        nodes_to_render.push_back(node);
+        for (const auto& child : node->children) {
+            collect_nodes(child.get()); // Recursive collection
+        }
+    };
+
+    for(const auto& root : root_nodes) {
+        collect_nodes(root.get());
+    }
+
+    // Sort by layer primarily (lower layers first)
+    std::sort(nodes_to_render.begin(), nodes_to_render.end(), [](const Node* a, const Node* b) {
+        return a->layer < b->layer;
+        // Could add secondary sort criteria if needed (e.g., start time)
+    });
+
+    // Render sorted nodes
+    for (Node* node : nodes_to_render) {
+        if (!node->visible) continue;
+
+        float local_time = current_time - node->start_time;
+        if (local_time < 0.0f || local_time >= node->duration) continue; // Node not active
+
+        // Set Blending Mode (TODO: Refine blend mode mapping)
+         switch (node->blend_mode) {
+            case BlendMode::Normal:     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); break;
+            case BlendMode::Additive:   glBlendFunc(GL_SRC_ALPHA, GL_ONE); break;
+            case BlendMode::Multiply:   glBlendFunc(GL_DST_COLOR, GL_ONE_MINUS_SRC_ALPHA); break; // Modulate
+            case BlendMode::Screen:     glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_COLOR); break;
+            // Other modes might require shaders or different blend funcs
+            default: glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); break;
         }
 
-        // Check if clip is active and is visual (Video type)
-        if (clip.type == ClipType::Video &&
-        current_time >= clip.start_time &&
-        current_time < (clip.start_time + clip.duration))
-        {
-            float local_time = current_time - clip.start_time; // relative to clip start
+        glPushMatrix(); // Save current matrix state
 
-        // --- Evaluate keyframes ---
-        float evaluated_pos_x = clip.pos_x_track.Evaluate(local_time);
-        float evaluated_pos_y = clip.pos_y_track.Evaluate(local_time);
-        float evaluated_scale = clip.scale_track.Evaluate(local_time);
-        float evaluated_rotation = clip.rotation_track.Evaluate(local_time);
-        float evaluated_opacity = clip.opacity_track.Evaluate(local_time);
+        // --- Apply Node Transforms (Relative to Parent - parent transform handling not shown here yet) ---
+        // For root nodes, parent transform is identity. For children, multiply by parent's matrix.
+        // This requires passing down the transform matrix during traversal or calculating world transform.
+        // Simplified version assuming root nodes for now:
 
-        // Fallback / Clamp
-        if (clip.pos_x_track.keyframes.empty()) evaluated_pos_x = clip.pos_x;
-        if (clip.pos_y_track.keyframes.empty()) evaluated_pos_y = clip.pos_y;
-        if (clip.scale_track.keyframes.empty()) evaluated_scale = clip.scale;
-        if (clip.rotation_track.keyframes.empty()) evaluated_rotation = clip.rotation;
-        if (clip.opacity_track.keyframes.empty()) evaluated_opacity = clip.opacity;
+        // 1. Evaluate properties at local_time
+        float eval_pos_x = node->EvaluatePosX(local_time);
+        float eval_pos_y = node->EvaluatePosY(local_time);
+        float eval_scale = node->EvaluateScale(local_time);
+        float eval_rotation = node->EvaluateRotation(local_time);
+        float eval_opacity = node->EvaluateOpacity(local_time);
 
-        evaluated_scale = std::max(0.0f, evaluated_scale);     // Never allow 0 scale
-        evaluated_opacity = std::clamp(evaluated_opacity, 0.0f, 1.0f); // Clamp opacity
-
-        // (Optionally: evaluated_rotation if you add that too)
-
+        // 2. Get Node/Media Dimensions
+        float node_width = (float)width; // Default to output width
+        float node_height = (float)height; // Default to output height
         GLuint tex_id = 0;
-        bool is_video = is_video_file(clip.path);
+        float tex_aspect = 1.0f;
+        ImVec2 tex_coords_tl = ImVec2(0,0); // Top-Left UV
+        ImVec2 tex_coords_br = ImVec2(1,1); // Bottom-Right UV
 
-        // Find the texture
-        if (is_video) {
-            auto vid_it = res.video_cache.find(clip.path);
-            if (vid_it != res.video_cache.end() && vid_it->second.is_initialized) {
-                tex_id = vid_it->second.texture_id;
+        if (node->type == NodeType::Media) {
+            MediaNode* media_node = static_cast<MediaNode*>(node);
+            if (media_node->source_clip) {
+                const Clip* source = media_node->source_clip;
+                 // Use source dimensions if available
+                if (source->source_width > 0 && source->source_height > 0) {
+                    node_width = (float)source->source_width;
+                    node_height = (float)source->source_height;
+                    tex_aspect = node_width / node_height;
+                }
+
+                // Find the texture ID from GLResources cache based on source path
+                if (source->type == ClipType::Video) {
+                    auto vid_it = res.video_cache.find(source->path);
+                    if (vid_it != res.video_cache.end() && vid_it->second.is_initialized) {
+                        tex_id = vid_it->second.texture_id;
+                        // Update dimensions from video data if needed
+                        node_width = (float)vid_it->second.width;
+                        node_height = (float)vid_it->second.height;
+                        if(node_height > 0) tex_aspect = node_width / node_height;
+
+                    }
+                } else if (source->type == ClipType::Image) {
+                    auto img_it = res.texture_cache.find(source->path);
+                    if (img_it != res.texture_cache.end()) {
+                        tex_id = img_it->second;
+                         // Query texture size (or use cached size if stored)
+                         glBindTexture(GL_TEXTURE_2D, tex_id);
+                         int w, h;
+                         glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
+                         glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &h);
+                         glBindTexture(GL_TEXTURE_2D, 0);
+                         node_width = (float)w; node_height = (float)h;
+                         if(node_height > 0) tex_aspect = node_width / node_height;
+                    }
+                }
+                 // Note: Texture coordinates might need adjustment based on media_start/duration
+                 // for effects like sprite sheets, but for simple video/image, use full texture (0,0 to 1,1).
+                 // OpenGL textures are typically sampled with Y=0 at bottom, Y=1 at top.
+                 // If image loading (SDL_image) or video decoding gives top-left origin data,
+                 // flip the V coordinate: (0,1) top-left, (1,0) bottom-right.
+                 tex_coords_tl = ImVec2(0, 1); // Top-Left
+                 tex_coords_br = ImVec2(1, 0); // Bottom-Right
+
             }
-        } else {
-            auto img_it = res.texture_cache.find(clip.path);
-            if (img_it != res.texture_cache.end()) {
-                tex_id = img_it->second;
-            }
+        } else if (node->type == NodeType::Group) {
+            // Group nodes don't have their own texture, they just apply transforms
+            // Their rendering comes from their children
+            // Need to handle transform application correctly for children later
         }
 
+
+        // 3. Apply Transforms (Example using immediate mode)
+        // Center of the screen/FBO is (width/2, height/2)
+        // Translate origin to center, apply node transforms, translate back, then draw centered quad
+        glTranslatef(width / 2.0f, height / 2.0f, 0.0f); // Move origin to center
+
+        // Apply node's translation (relative to center)
+        // Assuming node pos_x/y are normalized (-1 to 1 maps to -width/2 to width/2 etc)
+        glTranslatef(eval_pos_x * width * 0.5f, eval_pos_y * height * 0.5f, 0.0f);
+
+        // Apply rotation around the node's center (which is now at the origin)
+        glRotatef(eval_rotation, 0.0f, 0.0f, 1.0f);
+
+        // Apply uniform scale
+        glScalef(eval_scale, eval_scale, 1.0f);
+
+        // --- Render the Quad if texture exists ---
         if (tex_id != 0) {
             glBindTexture(GL_TEXTURE_2D, tex_id);
-            glPushMatrix();
+            glColor4f(1.0f, 1.0f, 1.0f, eval_opacity); // Apply evaluated opacity
 
-            // --- Apply evaluated transforms ---
-            glTranslatef(evaluated_pos_x * width, evaluated_pos_y * height, 0.0f);
-            glRotatef(evaluated_rotation, 0.0f, 0.0f, 1.0f);
-            glScalef(evaluated_scale, evaluated_scale, 1.0f); // Adjust scaling for new aspect ratio
-            glColor4f(1.0f, 1.0f, 1.0f, evaluated_opacity);
+            // Draw a quad centered at the current origin, with size matching the media
+            float half_w = node_width / 2.0f;
+            float half_h = node_height / 2.0f;
 
             glBegin(GL_QUADS);
-                glTexCoord2f(0.0f, 0.0f); glVertex2f(-1.0f * width, -1.0f * height);
-                glTexCoord2f(1.0f, 0.0f); glVertex2f( 1.0f * width, -1.0f * height);
-                glTexCoord2f(1.0f, 1.0f); glVertex2f( 1.0f * width,  1.0f * height);
-                glTexCoord2f(0.0f, 1.0f); glVertex2f(-1.0f * width,  1.0f * height);
+                glTexCoord2f(tex_coords_tl.x, tex_coords_tl.y); glVertex2f(-half_w,  half_h); // Top Left
+                glTexCoord2f(tex_coords_br.x, tex_coords_tl.y); glVertex2f( half_w,  half_h); // Top Right
+                glTexCoord2f(tex_coords_br.x, tex_coords_br.y); glVertex2f( half_w, -half_h); // Bottom Right
+                glTexCoord2f(tex_coords_tl.x, tex_coords_br.y); glVertex2f(-half_w, -half_h); // Bottom Left
             glEnd();
 
-            glPopMatrix();
-            rendered_any = true;
-        } else {
-            // Optionally render a placeholder if texture is missing/not ready
-            // std::cerr << "Texture ID 0 for active clip: " << clip.path << std::endl;
+            glBindTexture(GL_TEXTURE_2D, 0); // Unbind texture
         }
+         // If it's a GroupNode, its children will be rendered relative to this transform state.
+         // If rendering children is handled within Node::Render, this simplified loop might
+         // need adjustment or a full recursive render function. Let's assume Node::Render handles it.
+
+        glPopMatrix(); // Restore matrix state for the next node
     }
-        }
 
-        // Reset color and disable states
-        glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
-        glDisable(GL_BLEND);
-        glDisable(GL_TEXTURE_2D);
-        glBindTexture(GL_TEXTURE_2D, 0);
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
-    // if (!rendered_any) { std::cout << "Rendered empty frame at " << current_time << std::endl; }
+    // Reset color and disable states
+    glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+    glDisable(GL_BLEND);
+    glDisable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
 }
 
 
@@ -728,16 +903,15 @@ void cleanup_video_resources(GLResources& res) {
     std::cout << "Cleaning up video resources..." << std::endl;
     for (auto& [path, video] : res.video_cache) {
         if (video.is_initialized) {
-            std::cout << "  Cleaning: " << path << std::endl;
+            std::cout << "  Cleaning FFmpeg context for: " << path << std::endl;
             av_packet_free(&video.packet);
             sws_freeContext(video.sws_ctx);
             av_frame_free(&video.frame);
-            // av_frame_free(&video.frame_rgb); // Removed
-            // av_free(video.buffer);          // Removed
             avcodec_free_context(&video.codec_ctx);
             avformat_close_input(&video.format_ctx);
-            video.is_initialized = false; // Mark as cleaned
+            video.is_initialized = false; // Mark as cleaned FFmpeg wise
         }
+        // GL texture for video is cleaned in cleanup_gl_resources
     }
      res.video_cache.clear(); // Clear the map itself
 }
@@ -752,34 +926,43 @@ void cleanup_gl_resources(GLResources& res) {
         glDeleteTextures(1, &res.render_tex);
         res.render_tex = 0;
     }
+     // Clean image textures
+    std::cout << "Cleaning up image textures..." << std::endl;
     for (auto const& [path, tex_id] : res.texture_cache) {
+         std::cout << "  Deleting image texture: " << path << " (ID: " << tex_id << ")" << std::endl;
         glDeleteTextures(1, &tex_id);
     }
     res.texture_cache.clear();
+
+    // Clean up video textures
+    std::cout << "Cleaning up video textures..." << std::endl;
+     for (auto const& [path, video_data] : res.video_cache) {
+         if (video_data.texture_id) {
+             std::cout << "  Deleting video texture: " << path << " (ID: " << video_data.texture_id << ")" << std::endl;
+            glDeleteTextures(1, &video_data.texture_id);
+            // No need to modify video_data here as the cache is cleared next
+        }
+    }
+    // Video cache map itself is cleared in cleanup_video_resources, call after this
 
     // Clean up thumbnail textures
     std::cout << "Cleaning up thumbnail textures..." << std::endl;
     for (auto& [path, tex_vec] : res.clip_thumbnail_textures) {
         for (GLuint tex_id : tex_vec) {
-            if (tex_id) glDeleteTextures(1, &tex_id);
+             if (tex_id) {
+                // std::cout << "  Deleting thumbnail texture for: " << path << " (ID: " << tex_id << ")" << std::endl;
+                glDeleteTextures(1, &tex_id);
+             }
         }
     }
     res.clip_thumbnail_textures.clear();
-    res.generated_thumbnails_map.clear(); // Clear the tracking map too
+    res.generated_thumbnails_map.clear();
 
-    // Also delete video textures managed by VideoData
-    for (auto const& [path, video_data] : res.video_cache) {
-         if (video_data.texture_id) {
-            glDeleteTextures(1, &video_data.texture_id);
-            // No need to modify video_data here as it will be cleared
-        }
-    }
-    // The video_cache map itself is cleared in cleanup_video_resources
-     std::cout << "GL resources cleaned." << std::endl;
+    std::cout << "GL resources cleaned." << std::endl;
 }
 
 
-// --- Audio Preloading (Keep as is, but ensure it's called appropriately) ---
+// --- Audio Preloading (Keep as is, operates on path) ---
 bool preload_audio_file(const std::string& path, PreloadedAudio& out, float media_start, float media_duration) {
     AVFormatContext* fmt_ctx = nullptr;
     if (avformat_open_input(&fmt_ctx, path.c_str(), nullptr, nullptr) < 0) { /* error */ return false; }
@@ -956,7 +1139,7 @@ done_preload:
     return !out.samples.empty(); // Return true if some audio was loaded
 }
 
-
+// --- Mix Audio (Keep as is, operates on PreloadedAudio) ---
 void mix_audio_from_memory(const PreloadedAudio& audio, float time_sec, std::vector<float>& mix_buffer) {
     int start_sample = static_cast<int>(time_sec * audio.sample_rate);
     int sample_count = mix_buffer.size();
@@ -974,179 +1157,214 @@ void mix_audio_from_memory(const PreloadedAudio& audio, float time_sec, std::vec
 }
 
 
-// --- Video Export (Needs significant rewrite for performance) ---
-// This version still uses the slower render_frame + glReadPixels approach
-// but incorporates the updated render_frame and resource loading.
-// For faster export, pipe to FFmpeg or use libavcodec directly.
+// --- Video Export ---
+// Needs significant update to use Nodes instead of Clips
 bool start_video_export(const std::string& output_path, int width, int height, int fps,
-    int duration_frames, const std::vector<Clip>& clips, SDL_Window* window) {
+    float total_duration_sec, // Use total duration instead of frames
+    const std::vector<std::shared_ptr<Node>>& root_nodes, // Use nodes
+    const std::map<std::string, Clip>& media_library, // Pass media library
+    SDL_Window* window) {
 
-std::cout << "Starting video export (using glReadPixels method)..." << std::endl;
-SDL_GLContext current_context = SDL_GL_GetCurrentContext();
-if (!current_context) { /* error */ return false; }
+    std::cout << "Starting video export (using glReadPixels method)..." << std::endl;
+    SDL_GLContext current_context = SDL_GL_GetCurrentContext();
+    if (!current_context) { /* error */ return false; }
 
-// Backup GL state (optional but good practice)
-// GLint previous_viewport[4]; glGetIntegerv(GL_VIEWPORT, previous_viewport);
-// GLint previous_fbo; glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previous_fbo);
+    // Prepare resources specifically for export resolution
+    GLResources export_res; // Use a separate resource cache for export? Or main one?
+                            // Using separate avoids polluting main cache, but duplicates loading.
+                            // Let's use a separate one for clarity.
+    if (!setup_gl_resources(export_res, width, height)) {
+        std::cerr << "Failed to setup GL resources for export." << std::endl;
+        return false;
+    }
 
-// Prepare resources specifically for export resolution
-GLResources export_res;
-if (!setup_gl_resources(export_res, width, height)) {
-std::cerr << "Failed to setup GL resources for export." << std::endl;
-return false;
-}
+    // Load all necessary *source* resources referenced by the nodes
+    std::function<void(Node*)> load_node_resources =
+        [&](Node* node) {
+        if (!node) return;
+        if (node->type == NodeType::Media) {
+            MediaNode* mn = static_cast<MediaNode*>(node);
+            if (mn->source_clip) {
+                // Find the clip in the main library (passed in)
+                auto lib_it = media_library.find(mn->source_clip->path);
+                if (lib_it != media_library.end()) {
+                     // Load resource into the *export* cache using the library clip info
+                     Clip temp_clip_copy = lib_it->second; // Make a copy to pass
+                     load_resources_for_clip(export_res, temp_clip_copy); // Load into export_res
+                }
+            }
+        }
+        for (const auto& child : node->children) {
+            load_node_resources(child.get());
+        }
+    };
 
-// Load all necessary resources (textures, video/audio contexts, preload audio)
-for (const auto& clip : clips) {
-load_resources_for_clip(export_res, clip);
-}
-
-// Sort clips by layer once
-auto sorted_clips = clips;
-std::sort(sorted_clips.begin(), sorted_clips.end(), [](const Clip& a, const Clip& b) {
-return a.layer < b.layer;
-});
-
-// Open raw output files
-std::ofstream video_file("video.raw", std::ios::binary);
-std::ofstream audio_file("temp_audio.raw", std::ios::binary);
-if (!video_file || !audio_file) { /* error */ cleanup_gl_resources(export_res); cleanup_video_resources(export_res); return false; }
-
-
-std::vector<uint8_t> pixels(width * height * 3); // RGB
-const int audio_sample_rate = 44100;
-const int audio_channels = 2;
-const int samples_per_frame = audio_sample_rate / fps;
-std::vector<float> audio_float(samples_per_frame * audio_channels, 0.0f);
-std::vector<int16_t> audio_s16(samples_per_frame * audio_channels);
-
-
-// --- Render and Export Loop ---
-for (int frame_idx = 0; frame_idx < duration_frames; ++frame_idx) {
-float current_time = static_cast<float>(frame_idx) / fps;
-
-// 1. Update video textures for this frame time
-// Collect active video clips for this frame
-std::vector<Clip> active_video_clips;
-for(const auto& clip : sorted_clips) {
-if (clip.type == ClipType::Video && is_video_file(clip.path) &&
-current_time >= clip.start_time && current_time < clip.start_time + clip.duration) {
-active_video_clips.push_back(clip);
-}
-}
-// Update previews (decode and upload textures)
-update_video_previews(export_res, active_video_clips, current_time);
+    for (const auto& root : root_nodes) {
+        load_node_resources(root.get());
+    }
 
 
-// 2. Render the composited frame to FBO
-render_frame(export_res, current_time, sorted_clips, width, height);
-
-// 3. Read back pixels (Slow part)
-glBindFramebuffer(GL_FRAMEBUFFER, export_res.fbo);
-glReadBuffer(GL_COLOR_ATTACHMENT0); // Ensure reading from the color attachment
-glReadPixels(0, 0, width, height, GL_RGB, GL_UNSIGNED_BYTE, pixels.data());
-glBindFramebuffer(GL_FRAMEBUFFER, 0); // Unbind FBO
-
-// Flip vertically (OpenGL bottom-left origin vs Image top-left)
-/* size_t row_bytes = width * 3;
-std::vector<uint8_t> row_buffer(row_bytes);
-for (int y = 0; y < height / 2; ++y) {
-uint8_t* top_row = pixels.data() + y * row_bytes;
-uint8_t* bottom_row = pixels.data() + (height - 1 - y) * row_bytes;
-memcpy(row_buffer.data(), top_row, row_bytes);
-memcpy(top_row, bottom_row, row_bytes);
-memcpy(bottom_row, row_buffer.data(), row_bytes);
-} */
-
-// Write video frame
-video_file.write(reinterpret_cast<const char*>(pixels.data()), pixels.size());
+    // Open raw output files
+    std::ofstream video_file("video.raw", std::ios::binary);
+    std::ofstream audio_file("temp_audio.raw", std::ios::binary);
+    if (!video_file || !audio_file) { /* error */ cleanup_gl_resources(export_res); cleanup_video_resources(export_res); return false; }
 
 
-// 4. Mix Audio
-std::fill(audio_float.begin(), audio_float.end(), 0.0f);
-for (const auto& clip : sorted_clips) {
-if (clip.type == ClipType::Audio &&
-current_time >= clip.start_time &&
-current_time < (clip.start_time + clip.duration))
-{
-auto audio_it = export_res.preloaded_audio.find(clip.path);
-if (audio_it != export_res.preloaded_audio.end()) {
- const PreloadedAudio& audio = audio_it->second;
-  // Calculate start sample in the preloaded buffer based on clip timing
-  float time_into_clip = current_time - clip.start_time;
-  float effective_media_start = clip.media_start; // Use the clip's media start
-  float time_in_media = time_into_clip + effective_media_start;
+    std::vector<uint8_t> pixels(width * height * 3); // RGB
+    const int audio_sample_rate = 44100;
+    const int audio_channels = 2; // Stereo output
+    const int samples_per_frame = audio_sample_rate / fps;
+    std::vector<float> audio_float_mix_buffer(samples_per_frame * audio_channels, 0.0f);
+    std::vector<int16_t> audio_s16_output_buffer(samples_per_frame * audio_channels);
 
- int start_sample_idx = static_cast<int>(time_in_media * audio.sample_rate);
+    int total_frames = static_cast<int>(std::ceil(total_duration_sec * fps));
 
- for (int i = 0; i < samples_per_frame; ++i) {
-     int current_sample_idx = start_sample_idx + i;
-      // Check bounds for the preloaded audio samples
-     if (current_sample_idx * audio.channels + (audio.channels - 1) < audio.samples.size() && current_sample_idx >= 0) {
-         for (int ch = 0; ch < audio.channels; ++ch) {
-             int16_t sample_s16 = audio.samples[current_sample_idx * audio.channels + ch];
-             audio_float[i * audio.channels + ch] += static_cast<float>(sample_s16) / 32768.0f;
+    // --- Render and Export Loop ---
+    for (int frame_idx = 0; frame_idx < total_frames; ++frame_idx) {
+        float current_time = static_cast<float>(frame_idx) / fps;
+
+        // 1. Update video textures for nodes active around this frame time
+        // Need to pass the export_res cache here
+        update_video_previews(export_res, root_nodes, current_time);
+
+
+        // 2. Render the composited frame to FBO using nodes
+        // Pass the export_res cache here
+        render_frame(export_res, current_time, root_nodes, width, height);
+
+        // 3. Read back pixels (Slow part)
+        glBindFramebuffer(GL_FRAMEBUFFER, export_res.fbo);
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
+        glReadPixels(0, 0, width, height, GL_RGB, GL_UNSIGNED_BYTE, pixels.data());
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+        // Flip vertically if needed (OpenGL FBO is bottom-left, FFmpeg raw expects top-left)
+        // Re-enable this if FFmpeg input requires top-left origin raw frames
+         size_t row_bytes = width * 3;
+         std::vector<uint8_t> row_buffer(row_bytes);
+         for (int y = 0; y < height / 2; ++y) {
+             uint8_t* top_row = pixels.data() + y * row_bytes;
+             uint8_t* bottom_row = pixels.data() + (height - 1 - y) * row_bytes;
+             memcpy(row_buffer.data(), top_row, row_bytes);
+             memcpy(top_row, bottom_row, row_bytes);
+             memcpy(bottom_row, row_buffer.data(), row_bytes);
          }
-     } else {
-         // Optionally handle running out of samples (e.g., break loop)
-          break;
-     }
- }
+
+        // Write video frame
+        video_file.write(reinterpret_cast<const char*>(pixels.data()), pixels.size());
+
+
+        // 4. Mix Audio from active Audio MediaNodes
+        std::fill(audio_float_mix_buffer.begin(), audio_float_mix_buffer.end(), 0.0f);
+
+        std::function<void(Node*)> mix_audio_node =
+            [&](Node* node) {
+            if (!node || !node->visible) return;
+
+            float local_time = current_time - node->start_time;
+            if (local_time < 0.0f || local_time >= node->duration) {
+                 for (const auto& child : node->children) mix_audio_node(child.get());
+                 return; // Node not active
+            }
+
+            if (node->type == NodeType::Media) {
+                MediaNode* media_node = static_cast<MediaNode*>(node);
+                // Check if it's designated as audio OR if source clip has audio
+                if (media_node->is_audio || (media_node->source_clip && media_node->source_clip->has_audio)) {
+                    if (media_node->source_clip) {
+                        // Find the preloaded audio data in the *export* cache
+                        auto audio_it = export_res.preloaded_audio.find(media_node->source_clip->path);
+                        if (audio_it != export_res.preloaded_audio.end()) {
+                            const PreloadedAudio& audio_data = audio_it->second;
+                            if (audio_data.sample_rate == audio_sample_rate && audio_data.channels > 0 && !audio_data.samples.empty()) {
+                                // Calculate the starting sample index within the preloaded audio buffer
+                                float time_in_media = local_time + media_node->media_start;
+                                time_in_media = std::max(0.0f, time_in_media); // Clamp start
+                                int start_sample_in_source = static_cast<int>(time_in_media * audio_data.sample_rate);
+
+                                // Mix samples for this frame
+                                for (int i = 0; i < samples_per_frame; ++i) {
+                                    int source_sample_index = start_sample_in_source + i;
+                                    // Check bounds for the source audio samples
+                                    size_t source_s16_index_ch0 = (size_t)source_sample_index * audio_data.channels;
+                                    if (source_s16_index_ch0 + (audio_data.channels - 1) < audio_data.samples.size()) {
+                                         // TODO: Apply node opacity/volume factor here?
+                                         float volume = media_node->EvaluateOpacity(local_time); // Use opacity as volume for now
+
+                                         // Mix into stereo output buffer
+                                        for (int out_ch = 0; out_ch < audio_channels; ++out_ch) {
+                                            int source_ch = (audio_data.channels == 1) ? 0 : out_ch % audio_data.channels; // Handle mono -> stereo
+                                            int16_t sample_s16 = audio_data.samples[source_s16_index_ch0 + source_ch];
+                                            // Add to float mix buffer, applying volume
+                                            audio_float_mix_buffer[i * audio_channels + out_ch] += (static_cast<float>(sample_s16) / 32768.0f) * volume;
+                                        }
+                                    } else {
+                                        // Ran out of source samples for this node instance
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+             // Recurse for children
+             for (const auto& child : node->children) mix_audio_node(child.get());
+        };
+
+        for (const auto& root : root_nodes) {
+            mix_audio_node(root.get());
+        }
+
+
+        // Clamp and convert final mix buffer float audio to S16
+        for (size_t i = 0; i < audio_float_mix_buffer.size(); ++i) {
+            float sample_f = std::clamp(audio_float_mix_buffer[i], -1.0f, 1.0f); // Clamp [-1, 1]
+            audio_s16_output_buffer[i] = static_cast<int16_t>(sample_f * 32767.0f);
+        }
+        audio_file.write(reinterpret_cast<const char*>(audio_s16_output_buffer.data()), audio_s16_output_buffer.size() * sizeof(int16_t));
+
+
+        // Progress update
+        if (frame_idx % 30 == 0 || frame_idx == total_frames - 1) {
+            std::cout << "Export progress: Frame " << frame_idx + 1 << "/" << total_frames << " (Time: " << current_time << "s)" << std::endl;
+        }
+    }
+
+    video_file.close();
+    audio_file.close();
+
+    // --- FFmpeg Command (remains similar) ---
+    std::string ffmpeg_cmd =
+        "ffmpeg -y "
+        "-f rawvideo -pix_fmt rgb24 -s " + std::to_string(width) + "x" + std::to_string(height) +
+        " -r " + std::to_string(fps) + " -i video.raw "
+        "-f s16le -ac " + std::to_string(audio_channels) + " -ar " + std::to_string(audio_sample_rate) + " -i temp_audio.raw "
+        "-c:v libx264 -preset fast -crf 22 -pix_fmt yuv420p " // Ensure output format is widely compatible
+        "-c:a aac -b:a 192k "
+        "-shortest \"" + output_path + "\""; // Use shortest if inputs might have slightly different effective lengths
+
+    std::cout << "Running FFmpeg command:\n" << ffmpeg_cmd << std::endl;
+    int ret = system(ffmpeg_cmd.c_str());
+
+    // Cleanup temporary files and export resources
+    std::filesystem::remove("video.raw");
+    std::filesystem::remove("temp_audio.raw");
+    cleanup_gl_resources(export_res);
+    cleanup_video_resources(export_res);
+
+    if (ret != 0) {
+        std::cerr << "FFmpeg export failed with code " << ret << std::endl;
+        return false;
+    }
+
+    std::cout << "Video export finished successfully." << std::endl;
+    return true;
 }
-}
-}
-
-// Clamp and convert float audio to S16
-for (size_t i = 0; i < audio_float.size(); ++i) {
-float sample_f = std::max(-1.0f, std::min(1.0f, audio_float[i])); // Clamp
-audio_s16[i] = static_cast<int16_t>(sample_f * 32767.0f);
-}
-audio_file.write(reinterpret_cast<const char*>(audio_s16.data()), audio_s16.size() * sizeof(int16_t));
 
 
-// Progress update
-if (frame_idx % 30 == 0 || frame_idx == duration_frames - 1) {
-std::cout << "Export progress: Frame " << frame_idx + 1 << "/" << duration_frames << std::endl;
-}
-}
-
-video_file.close();
-audio_file.close();
-
-// --- FFmpeg Command (Keep as is for now) ---
-std::string ffmpeg_cmd =
-"ffmpeg -y "
-"-f rawvideo -pix_fmt rgb24 -s " + std::to_string(width) + "x" + std::to_string(height) + // Use -s for size
-" -r " + std::to_string(fps) + " -i video.raw "
-"-f s16le -ac 2 -ar " + std::to_string(audio_sample_rate) + " -i temp_audio.raw "
-"-c:v libx264 -preset fast -crf 22 -pix_fmt yuv420p " // Use pix_fmt for output
-"-c:a aac -b:a 192k "
-"-shortest \"" + output_path + "\""; // Use shortest to stop when shortest input ends
-
-std::cout << "Running FFmpeg command:\n" << ffmpeg_cmd << std::endl;
-int ret = system(ffmpeg_cmd.c_str());
-
-// Cleanup
-std::filesystem::remove("video.raw");
-std::filesystem::remove("temp_audio.raw");
-cleanup_gl_resources(export_res);
-cleanup_video_resources(export_res); // Cleans up FFmpeg contexts too
-
-// Restore GL state (if backed up)
-// glBindFramebuffer(GL_FRAMEBUFFER, previous_fbo);
-// glViewport(previous_viewport[0], previous_viewport[1], previous_viewport[2], previous_viewport[3]);
-
-
-if (ret != 0) {
-std::cerr << "FFmpeg export failed with code " << ret << std::endl;
-return false;
-}
-
-std::cout << "Video export finished successfully." << std::endl;
-return true;
-}
-
-std::vector<float> GenerateWaveformPreview(const std::vector<int16_t>& samples, int channels, int samples_per_pixel = 256) {
+// Generate Waveform (Keep as is)
+std::vector<float> GenerateWaveformPreview(const std::vector<int16_t>& samples, int channels, int samples_per_pixel) {
     std::vector<float> waveform;
     int total_samples = samples.size() / channels;
 
@@ -1164,294 +1382,295 @@ std::vector<float> GenerateWaveformPreview(const std::vector<int16_t>& samples, 
     return waveform;
 }
 
-void QueueClipThumbnails(GLResources& res, const Clip& clip) { // Pass const Clip&
-    if (clip.type == ClipType::Video && is_video_file(clip.path)) {
-        // Check if thumbnails are already being generated or are done for this clip path
-        if (res.clip_thumbnail_textures.count(clip.path)) {
-             // Already processed or processing started, could add logic to re-queue if needed
-             // std::cout << "Thumbnails already queued/generated for " << clip.path << std::endl;
-            return;
-        }
+// --- Thumbnail Generation ---
+// Queue based on *source clip* path and duration
+void QueueClipThumbnails(GLResources& res, const Clip& clip) { // Takes source Clip
+     // Only queue for Video or Image types that have a path
+     if ((clip.type != ClipType::Video && clip.type != ClipType::Image) || clip.path.empty()) {
+         return;
+     }
 
-        const int max_thumbs = static_cast<int>(clip.duration); // Generate more thumbs if needed
-        const float interval = std::max(0.5f, clip.duration / static_cast<float>(max_thumbs)); // Ensure minimum interval
-
-        // Create placeholder entry in the map immediately so we know processing started
-        res.clip_thumbnail_textures[clip.path] = {}; // Empty vector initially
-        res.generated_thumbnails_map[clip.path] = {}; // Empty map for generated timestamps
-
-
-        { // Lock the request queue
-            std::lock_guard<std::mutex> lock(request_mutex);
-            for (int i = 0; i < max_thumbs; ++i) {
-                float timestamp = i * interval + clip.media_start; // Use media_start
-                 // Clamp timestamp to be within the actual media duration if known
-                 // (Need media duration - maybe get it during AddNewClip or load_resources)
-                // float media_duration = get_media_duration(clip.path); // Hypothetical function
-                // if (media_duration > 0) timestamp = std::min(timestamp, media_duration - 0.1f);
-
-                timestamp = std::max(0.0f, timestamp); // Ensure non-negative
-
-                ThumbnailRequest req;
-                req.clip_path = clip.path;
-                req.timestamp = timestamp;
-                thumbnail_request_queue.push(req);
-                 // std::cout << "Queued thumb request for " << clip.path << " at " << timestamp << std::endl;
-            }
-        } // Unlock request_mutex
-
-        worker_cv.notify_one(); // Signal the worker thread
+    // Check if thumbnails are already being generated or are done for this clip path
+    if (res.clip_thumbnail_textures.count(clip.path)) {
+        return; // Already processed or processing started
     }
+
+    // Determine number of thumbs and interval based on source duration (if video)
+    int max_thumbs = 10; // Default for images or short videos
+    float interval = 0.5f; // Default interval
+    float thumb_duration = clip.source_duration;
+
+    if (clip.type == ClipType::Video && thumb_duration > 1.0f) {
+         max_thumbs = std::max(1, std::min(50, static_cast<int>(thumb_duration))); // More thumbs for longer videos, capped
+         interval = thumb_duration / static_cast<float>(max_thumbs + 1); // Spread out thumbs
+         interval = std::max(0.25f, interval); // Minimum interval
+    } else if (clip.type == ClipType::Image) {
+        max_thumbs = 1; // Only need one thumbnail for images
+        interval = 0;
+        thumb_duration = 0; // Not applicable
+    }
+
+
+    // Create placeholder entry in the map immediately
+    res.clip_thumbnail_textures[clip.path] = {}; // Empty vector initially
+    res.generated_thumbnails_map[clip.path] = {}; // Empty map for generated timestamps
+
+
+    { // Lock the request queue
+        std::lock_guard<std::mutex> lock(request_mutex);
+        for (int i = 0; i < max_thumbs; ++i) {
+            // Timestamp is relative to the start of the source media (media_start is a node property)
+            float timestamp = (i + 0.5f) * interval; // Use midpoint of interval
+
+            // Clamp timestamp for videos
+            if (clip.type == ClipType::Video && thumb_duration > 0) {
+                 timestamp = std::min(timestamp, thumb_duration - 0.05f); // Ensure slightly before end
+            }
+            timestamp = std::max(0.0f, timestamp); // Ensure non-negative
+
+            ThumbnailRequest req;
+            req.clip_path = clip.path;
+            req.timestamp = (clip.type == ClipType::Image) ? 0.0f : timestamp; // Timestamp 0 for images
+            thumbnail_request_queue.push(req);
+             // std::cout << "Queued thumb request for " << req.clip_path << " at " << req.timestamp << std::endl;
+        }
+    } // Unlock request_mutex
+
+    worker_cv.notify_one(); // Signal the worker thread
 }
 
-// Replace the existing ProcessThumbnailTasks in video_export.cpp or main.cpp
 
-void ProcessThumbnailResults(GLResources& res, int max_per_frame = 2) { // Process a couple per frame
-    for (int i = 0; i < max_per_frame; ++i) {
+// Process Thumbnail Results (Keep mostly as is, operates on GLResources cache)
+void ProcessThumbnailResults(GLResources& res, int max_per_frame) {
+    // ... (implementation largely unchanged)
+    // Ensure it correctly stores texture ID in res.clip_thumbnail_textures[result.clip_path]
+    // And updates res.generated_thumbnails_map[result.clip_path]
+     for (int i = 0; i < max_per_frame; ++i) {
         ThumbnailResult result;
-
-        // --- Check for results ---
-        {
+        { // Scope for lock
             std::lock_guard<std::mutex> lock(result_mutex);
-            if (thumbnail_result_queue.empty()) {
-                break; // No more results pending for now
-            }
-            result = std::move(thumbnail_result_queue.front()); // Move the result
+            if (thumbnail_result_queue.empty()) break;
+            result = std::move(thumbnail_result_queue.front());
             thumbnail_result_queue.pop();
-        } // Unlock result_mutex
+        } // Lock released
 
-        // --- Process the result ---
-        if (result.success && !result.pixels.empty()) {
-             // Check if this exact timestamp was already processed (e.g., due to requeueing)
-            auto& gen_map = res.generated_thumbnails_map[result.clip_path];
-            if (gen_map.count(result.timestamp)) {
-                continue; // Already have this one
-            }
-
-
-            // Create OpenGL Texture on Main Thread
-            GLuint tex_id = 0;
-            glGenTextures(1, &tex_id);
-            if (tex_id == 0) {
-                 std::cerr << "Failed to generate texture ID for thumbnail!" << std::endl;
-                 continue; // Skip this one
-            }
-            glBindTexture(GL_TEXTURE_2D, tex_id);
-
-            // Upload pixel data (RGB)
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, result.width, result.height, 0,
-                         GL_RGB, GL_UNSIGNED_BYTE, result.pixels.data());
-
-            GLenum err = glGetError();
-            if (err != GL_NO_ERROR) {
-                std::cerr << "OpenGL error creating thumbnail texture for " << result.clip_path << ": " << err << std::endl;
-                glDeleteTextures(1, &tex_id); // Clean up failed texture
-                continue; // Skip
-            }
-
-            // Set texture parameters (simple bilinear is fine for thumbs)
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-
-            glBindTexture(GL_TEXTURE_2D, 0); // Unbind
-
-            // Store the texture ID in the main resource map
-            // Note: This assumes res.clip_thumbnail_textures[result.clip_path] was initialized in QueueClipThumbnails
-            if (res.clip_thumbnail_textures.count(result.clip_path)) {
-                res.clip_thumbnail_textures[result.clip_path].push_back(tex_id);
-                 gen_map[result.timestamp] = tex_id; // Mark timestamp as generated
-                // std::cout << "Generated thumbnail texture " << tex_id << " for " << result.clip_path << " at " << result.timestamp << std::endl;
-            } else {
-                std::cerr << "Warning: Thumbnail result received for clip path not found in texture map: " << result.clip_path << std::endl;
-                glDeleteTextures(1, &tex_id); // Clean up unused texture
-            }
-        } else {
-            // Handle failure case if needed (e.g., log error)
-            // std::cerr << "Thumbnail generation failed for " << result.clip_path << " at " << result.timestamp << ": " << result.error_message << std::endl;
+        if (!result.success || result.pixels.empty()) {
+             std::cerr << "Thumbnail gen failed for " << result.clip_path << " at " << result.timestamp << ": " << result.error_message << std::endl;
+             // Maybe add a "failed" placeholder texture to the map? For now, just skip.
+             continue;
         }
+
+        // Check if main GLResources still exists and path is relevant
+        if (!res.clip_thumbnail_textures.count(result.clip_path)) {
+             std::cerr << "Warning: Received thumbnail for unknown/removed path: " << result.clip_path << std::endl;
+             continue; // Skip if the clip was removed from the library
+        }
+
+        // Check if this specific timestamp was already generated (e.g., duplicate request)
+        auto& gen_map = res.generated_thumbnails_map[result.clip_path];
+        if (gen_map.count(result.timestamp)) {
+             // std::cout << "Skipping duplicate thumbnail result for " << result.clip_path << " at " << result.timestamp << std::endl;
+             continue;
+        }
+
+        // Create OpenGL Texture on Main Thread
+        GLuint tex_id = 0;
+        glGenTextures(1, &tex_id);
+        if (tex_id == 0) {
+             std::cerr << "Failed to generate texture ID for thumbnail!" << std::endl;
+             continue;
+        }
+        glBindTexture(GL_TEXTURE_2D, tex_id);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, result.width, result.height, 0, GL_RGB, GL_UNSIGNED_BYTE, result.pixels.data());
+
+        GLenum err = glGetError();
+        if (err != GL_NO_ERROR) {
+            std::cerr << "OpenGL error creating thumbnail texture for " << result.clip_path << ": " << err << std::endl;
+            glDeleteTextures(1, &tex_id);
+            continue;
+        }
+
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glBindTexture(GL_TEXTURE_2D, 0);
+
+        // Store texture ID and mark timestamp as generated
+        res.clip_thumbnail_textures[result.clip_path].push_back(tex_id);
+        gen_map[result.timestamp] = tex_id;
+        // std::cout << "Generated thumbnail texture " << tex_id << " for " << result.clip_path << " at " << result.timestamp << std::endl;
+
     } // end loop
 }
 
-// Add this new function to video_export.cpp
-
+// Thumbnail Worker Func (Keep mostly as is, operates on path)
 void thumbnail_worker_func() {
+    // ... (implementation mostly unchanged, takes path and timestamp)
+    // Ensure it handles image files correctly (e.g., load frame 0 or handle separately)
     std::cout << "Thumbnail worker thread started." << std::endl;
     while (!stop_thumbnail_worker_flag) {
         ThumbnailRequest request;
-
-        // --- Wait for a request ---
-        {
+        { // Scope for lock
             std::unique_lock<std::mutex> lock(request_mutex);
-            worker_cv.wait(lock, [&] {
-                return !thumbnail_request_queue.empty() || stop_thumbnail_worker_flag;
-            });
-
-            if (stop_thumbnail_worker_flag) {
-                break; // Exit signal received
-            }
-
-            if (thumbnail_request_queue.empty()) {
-                continue; // Spurious wakeup?
-            }
-
+            worker_cv.wait(lock, [&] { return !thumbnail_request_queue.empty() || stop_thumbnail_worker_flag; });
+            if (stop_thumbnail_worker_flag) break;
+            if (thumbnail_request_queue.empty()) continue; // Spurious wakeup
             request = thumbnail_request_queue.front();
             thumbnail_request_queue.pop();
-        } // Unlock request_mutex
+        } // Lock released
 
         // --- Process the request ---
         ThumbnailResult result;
         result.clip_path = request.clip_path;
         result.timestamp = request.timestamp;
-        result.width = THUMBNAIL_WIDTH;
-        result.height = THUMBNAIL_HEIGHT;
-        result.success = false; // Assume failure initially
+        result.width = THUMBNAIL_WIDTH; // Defined in video_export.hpp
+        result.height = THUMBNAIL_HEIGHT; // Defined in video_export.hpp
+        result.success = false;
 
-        AVFormatContext* fmt_ctx = nullptr;
-        AVCodecContext* codec_ctx = nullptr;
-        AVFrame* frame = nullptr;
-        AVFrame* rgb_frame = nullptr;
-        AVPacket* packet = nullptr;
-        SwsContext* sws_ctx = nullptr;
-        int video_stream_idx = -1;
-        uint8_t* buffer = nullptr;
+        // --- Handle Images using SDL_image (simpler) ---
+        if (is_image_file(request.clip_path)) {
+             SDL_Surface* surface = IMG_Load(request.clip_path.c_str());
+             if (!surface) {
+                 result.error_message = "IMG_Load failed: " + std::string(SDL_GetError());
+             } else {
+                 SDL_Surface* rgb_surface = SDL_ConvertSurface(surface, SDL_PIXELFORMAT_RGB24);
+                 if (!rgb_surface) {
+                     result.error_message = "SDL_ConvertSurfaceFormat failed: " + std::string(SDL_GetError());
+                 } else {
+                     // --- Resize using a simple method (or SwsScale if preferred) ---
+                     // Option 1: Simple manual resize (Nearest neighbor - fast but low quality)
+                     // Option 2: Use FFmpeg's SwsScale even for images
+                     // Let's use SwsScale for consistency
 
-        try { // Use try-catch for easier cleanup on error
-            // 1. Open Input
-            if (avformat_open_input(&fmt_ctx, request.clip_path.c_str(), nullptr, nullptr) != 0) {
-                throw std::runtime_error("Could not open video file: " + request.clip_path);
-            }
-            if (avformat_find_stream_info(fmt_ctx, nullptr) < 0) {
-                throw std::runtime_error("Could not find stream info for: " + request.clip_path);
-            }
+                     SwsContext* sws_ctx_img = sws_getContext(
+                         rgb_surface->w, rgb_surface->h, AV_PIX_FMT_RGB24, // Input
+                         result.width, result.height, AV_PIX_FMT_RGB24, // Output
+                         SWS_BILINEAR, nullptr, nullptr, nullptr);
 
-            // 2. Find Video Stream & Codec
-            video_stream_idx = av_find_best_stream(fmt_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
-            if (video_stream_idx < 0) {
-                throw std::runtime_error("No video stream found in: " + request.clip_path);
-            }
-            AVCodecParameters* codec_params = fmt_ctx->streams[video_stream_idx]->codecpar;
-            const AVCodec* codec = avcodec_find_decoder(codec_params->codec_id);
-            if (!codec) {
-                throw std::runtime_error("Unsupported codec in: " + request.clip_path);
-            }
-            codec_ctx = avcodec_alloc_context3(codec);
-            if (!codec_ctx || avcodec_parameters_to_context(codec_ctx, codec_params) < 0 || avcodec_open2(codec_ctx, codec, nullptr) < 0) {
-                throw std::runtime_error("Failed to setup codec context for: " + request.clip_path);
-            }
+                     if (!sws_ctx_img) {
+                         result.error_message = "Failed to create SwsContext for image resize.";
+                     } else {
+                         result.pixels.resize(result.width * result.height * 3);
+                         uint8_t* dst_data[1] = { result.pixels.data() };
+                         int dst_linesize[1] = { result.width * 3 };
+                         const uint8_t* src_data[1] = { (uint8_t*)rgb_surface->pixels };
+                         int src_linesize[1] = { rgb_surface->pitch };
 
-            AVRational time_base = fmt_ctx->streams[video_stream_idx]->time_base;
-
-            // 3. Seek
-            int64_t target_ts = av_rescale_q(static_cast<int64_t>(request.timestamp * AV_TIME_BASE), AV_TIME_BASE_Q, time_base);
-            // Seek slightly before the target to ensure we get the right frame or the one just before it
-            if (av_seek_frame(fmt_ctx, video_stream_idx, target_ts, AVSEEK_FLAG_BACKWARD) < 0) {
-                 // Don't throw, just log warning and try decoding from start if seek fails near beginning
-                 std::cerr << "Warning: Seek failed for " << request.clip_path << " at " << request.timestamp << "s. Trying from start." << std::endl;
-                 // Optionally seek to 0 if target_ts wasn't 0?
-                 // av_seek_frame(fmt_ctx, video_stream_idx, 0, AVSEEK_FLAG_BACKWARD);
-            }
-            avcodec_flush_buffers(codec_ctx); // Important after seek
-
-            // 4. Allocate Decoding Resources
-            frame = av_frame_alloc();
-            rgb_frame = av_frame_alloc(); // For the RGB conversion result
-            packet = av_packet_alloc();
-            if (!frame || !rgb_frame || !packet) {
-                throw std::runtime_error("Failed to allocate FFmpeg frame/packet.");
-            }
-
-            // Allocate buffer for RGB frame manually
-             int numBytes = av_image_get_buffer_size(AV_PIX_FMT_RGB24, THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT, 1); // Use alignment 1 for simplicity
-             buffer = (uint8_t*)av_malloc(numBytes * sizeof(uint8_t));
-             if (!buffer) {
-                 throw std::runtime_error("Failed to allocate RGB buffer.");
+                         sws_scale(sws_ctx_img, src_data, src_linesize, 0, rgb_surface->h, dst_data, dst_linesize);
+                         result.success = true;
+                         sws_freeContext(sws_ctx_img);
+                     }
+                     SDL_DestroySurface(rgb_surface);
+                 }
+                 SDL_DestroySurface(surface);
              }
-            av_image_fill_arrays(rgb_frame->data, rgb_frame->linesize, buffer, AV_PIX_FMT_RGB24, THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT, 1);
+        }
+        // --- Handle Videos using FFmpeg (existing logic) ---
+        else if (is_video_file(request.clip_path)) {
+            AVFormatContext* fmt_ctx = nullptr; /* ... */
+            AVCodecContext* codec_ctx = nullptr; /* ... */
+            AVFrame* frame = nullptr; /* ... */
+            AVFrame* rgb_frame = nullptr; /* ... */
+            AVPacket* packet = nullptr; /* ... */
+            SwsContext* sws_ctx = nullptr; /* ... */
+            int video_stream_idx = -1; /* ... */
+            uint8_t* buffer = nullptr; /* ... */
+
+            try {
+                // --- FFmpeg Setup (Open, Find Stream, Codec) ---
+                if (avformat_open_input(&fmt_ctx, request.clip_path.c_str(), nullptr, nullptr) != 0) throw std::runtime_error("avformat_open_input failed");
+                if (avformat_find_stream_info(fmt_ctx, nullptr) < 0) throw std::runtime_error("avformat_find_stream_info failed");
+                video_stream_idx = av_find_best_stream(fmt_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+                if (video_stream_idx < 0) throw std::runtime_error("No video stream found");
+                // ... (Codec setup as before) ...
+                 AVCodecParameters* codec_params = fmt_ctx->streams[video_stream_idx]->codecpar;
+                 const AVCodec* codec = avcodec_find_decoder(codec_params->codec_id);
+                 if (!codec) throw std::runtime_error("Unsupported codec");
+                 codec_ctx = avcodec_alloc_context3(codec);
+                 if (!codec_ctx || avcodec_parameters_to_context(codec_ctx, codec_params) < 0 || avcodec_open2(codec_ctx, codec, nullptr) < 0) throw std::runtime_error("Codec context setup failed");
 
 
-            // 5. Decode until the target frame is found or passed
-            int decode_ret = 0;
-            bool frame_decoded = false;
-            while (av_read_frame(fmt_ctx, packet) >= 0) {
-                if (packet->stream_index == video_stream_idx) {
-                    decode_ret = avcodec_send_packet(codec_ctx, packet);
-                    if (decode_ret < 0) {
-                        // Error sending packet, might be recoverable or EOF flush needed
-                        break;
-                    }
+                AVRational time_base = fmt_ctx->streams[video_stream_idx]->time_base;
+                 if (time_base.den == 0) time_base = {1, AV_TIME_BASE}; // Fallback timebase
 
-                    while (decode_ret >= 0) {
-                        decode_ret = avcodec_receive_frame(codec_ctx, frame);
-                        if (decode_ret == AVERROR(EAGAIN) || decode_ret == AVERROR_EOF) {
-                            break; // Need more packets or finished
-                        } else if (decode_ret < 0) {
-                            av_packet_unref(packet);
-                            throw std::runtime_error("Error receiving frame during decoding.");
-                        }
+                // --- Seek ---
+                int64_t target_ts = av_rescale_q(static_cast<int64_t>(request.timestamp * AV_TIME_BASE), AV_TIME_BASE_Q, time_base);
+                if (av_seek_frame(fmt_ctx, video_stream_idx, target_ts, AVSEEK_FLAG_BACKWARD) < 0) {
+                    std::cerr << "Warning: Seek failed for thumb " << request.clip_path << " at " << request.timestamp << "s. Trying from start." << std::endl;
+                }
+                avcodec_flush_buffers(codec_ctx);
 
-                        // Check if this frame is at or after our target timestamp
-                        double current_pts_sec = (frame->pts == AV_NOPTS_VALUE) ? -1.0 : static_cast<double>(frame->pts) * av_q2d(time_base);
-                        if (current_pts_sec < 0 && frame->pkt_dts != AV_NOPTS_VALUE) { // Fallback to DTS if PTS missing
-                             current_pts_sec = static_cast<double>(frame->pkt_dts) * av_q2d(time_base);
-                        }
+                // --- Allocate ---
+                frame = av_frame_alloc(); rgb_frame = av_frame_alloc(); packet = av_packet_alloc();
+                if (!frame || !rgb_frame || !packet) throw std::runtime_error("Alloc failed");
+                int numBytes = av_image_get_buffer_size(AV_PIX_FMT_RGB24, result.width, result.height, 1);
+                buffer = (uint8_t*)av_malloc(numBytes);
+                if (!buffer) throw std::runtime_error("Buffer alloc failed");
+                av_image_fill_arrays(rgb_frame->data, rgb_frame->linesize, buffer, AV_PIX_FMT_RGB24, result.width, result.height, 1);
 
 
-                        if (current_pts_sec >= request.timestamp || current_pts_sec < 0 ) { // Use frame if >= target or PTS is unknown after seek
-                             // Initialize SWS context *here* now that we have the source frame format
-                            sws_ctx = sws_getCachedContext(sws_ctx, // Reuse context
-                                                           codec_ctx->width, codec_ctx->height, codec_ctx->pix_fmt,
-                                                           THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT, AV_PIX_FMT_RGB24,
-                                                           SWS_BILINEAR, // Use bilinear for speed
-                                                           nullptr, nullptr, nullptr);
-                            if (!sws_ctx) {
-                                throw std::runtime_error("Failed to create SwsContext.");
+                // --- Decode Loop (find frame >= timestamp) ---
+                int decode_ret = 0; bool frame_decoded = false;
+                while (av_read_frame(fmt_ctx, packet) >= 0) {
+                    if (packet->stream_index == video_stream_idx) {
+                        decode_ret = avcodec_send_packet(codec_ctx, packet);
+                        if (decode_ret < 0) break; // Error or EOF flush needed potentially
+
+                        while (decode_ret >= 0) {
+                            decode_ret = avcodec_receive_frame(codec_ctx, frame);
+                            if (decode_ret == AVERROR(EAGAIN) || decode_ret == AVERROR_EOF) break;
+                            if (decode_ret < 0) { av_packet_unref(packet); throw std::runtime_error("Error receiving frame"); }
+
+                            // Check PTS
+                            double current_pts_sec = (frame->pts != AV_NOPTS_VALUE && time_base.den != 0) ? static_cast<double>(frame->pts) * av_q2d(time_base) : -1.0;
+                            if (current_pts_sec < 0 && frame->pkt_dts != AV_NOPTS_VALUE && time_base.den != 0) { // Fallback DTS
+                                current_pts_sec = static_cast<double>(frame->pkt_dts) * av_q2d(time_base);
                             }
 
-                            // Convert the frame directly to thumbnail size RGB
-                            sws_scale(sws_ctx, (const uint8_t* const*)frame->data, frame->linesize, 0, codec_ctx->height,
-                                      rgb_frame->data, rgb_frame->linesize);
+                            // Use frame if it's the first one after seek OR its PTS is >= target
+                            if (current_pts_sec >= request.timestamp || current_pts_sec < 0) {
+                                sws_ctx = sws_getCachedContext(sws_ctx, codec_ctx->width, codec_ctx->height, codec_ctx->pix_fmt,
+                                                               result.width, result.height, AV_PIX_FMT_RGB24, SWS_BILINEAR, nullptr, nullptr, nullptr);
+                                if (!sws_ctx) { av_frame_unref(frame); throw std::runtime_error("SwsContext failed"); }
 
-                            // Copy pixels to result vector
-                            result.pixels.resize(numBytes);
-                            memcpy(result.pixels.data(), buffer, numBytes);
-                            result.success = true;
-                            frame_decoded = true;
-                            av_frame_unref(frame); // Release the decoded frame
-                            break; // Found our frame
-                        }
-                        av_frame_unref(frame); // Release frame if it wasn't the target
-                    } // end receive loop
-                } // end if video stream
-                av_packet_unref(packet); // Release packet
-                if (frame_decoded) {
-                    break; // Exit read loop
-                }
-            } // end read loop
+                                sws_scale(sws_ctx, (const uint8_t* const*)frame->data, frame->linesize, 0, codec_ctx->height,
+                                          rgb_frame->data, rgb_frame->linesize);
 
-            // If loop finished without decoding, maybe try flushing? (Less critical for single frame)
-             if (!frame_decoded) {
-                // Optional: Add flush logic here if needed, similar to ensure_video_decoded_upto EOF handling
-                // but convert the *first* flushed frame if timestamp was near the end.
-                result.error_message = "Reached EOF or error before finding target frame.";
-             }
+                                result.pixels.resize(numBytes);
+                                memcpy(result.pixels.data(), buffer, numBytes);
+                                result.success = true;
+                                frame_decoded = true;
+                                av_frame_unref(frame);
+                                break; // Found suitable frame
+                            }
+                            av_frame_unref(frame); // Unref if not the target
+                        } // end receive loop
+                    } // end if video stream
+                    av_packet_unref(packet);
+                    if (frame_decoded) break; // Exit read loop
+                } // end read loop
 
+                 if (!frame_decoded) {
+                    result.error_message = "Reached EOF or error before finding target frame.";
+                 }
 
-        } catch (const std::runtime_error& e) {
-            result.success = false;
-            result.error_message = e.what();
-            std::cerr << "Thumbnail Error (" << request.clip_path << " @ " << request.timestamp << "s): " << e.what() << std::endl;
+            } catch (const std::runtime_error& e) {
+                result.success = false;
+                result.error_message = e.what();
+                 std::cerr << "Thumbnail Error (" << request.clip_path << " @ " << request.timestamp << "s): " << e.what() << std::endl;
+            }
+
+            // --- FFmpeg Cleanup ---
+            av_free(buffer);
+            sws_freeContext(sws_ctx);
+            av_frame_free(&frame); av_frame_free(&rgb_frame); av_packet_free(&packet);
+            if (codec_ctx) avcodec_free_context(&codec_ctx);
+            if (fmt_ctx) avformat_close_input(&fmt_ctx);
+        } else {
+             result.error_message = "Unsupported file type for thumbnails.";
         }
 
-        // --- Cleanup FFmpeg resources ---
-        av_free(buffer); // Free the manually allocated buffer
-        sws_freeContext(sws_ctx);
-        av_frame_free(&frame);
-        av_frame_free(&rgb_frame);
-        av_packet_free(&packet);
-        if (codec_ctx) avcodec_free_context(&codec_ctx);
-        if (fmt_ctx) avformat_close_input(&fmt_ctx);
 
         // --- Enqueue the result ---
         {
@@ -1463,7 +1682,6 @@ void thumbnail_worker_func() {
     std::cout << "Thumbnail worker thread finished." << std::endl;
 }
 
-// Add these functions, call from main() init and cleanup
 
 void start_thumbnail_worker() {
     stop_thumbnail_worker_flag = false;

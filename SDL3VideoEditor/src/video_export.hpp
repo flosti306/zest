@@ -152,13 +152,13 @@ bool setup_gl_resources(GLResources& res, int width, int height);
 void load_textures(GLResources& res, const std::vector<Clip>& clips); // Only loads images now
 
 bool is_video_file(const std::string& path);
+bool is_image_file(const std::string& path);
 
 // Renamed: initializes FFmpeg contexts, called by load_resources_for_clip
 bool initialize_video_resources(GLResources& res, const std::string& path);
 bool initialize_audio_resources(GLResources& res, const std::string& path); // For potential future audio streaming
 
-// New function to load all resources for a clip (video/audio contexts + image textures)
-void load_resources_for_clip(GLResources& res, const Clip& clip);
+bool load_resources_for_clip(GLResources& res, Clip& clip); // Should return bool
 
 // Decodes frames up to target_time, updates cache, returns true if target is reachable
 bool ensure_video_decoded_upto(VideoData& video, double target_time_seconds);
@@ -167,21 +167,19 @@ bool ensure_video_decoded_upto(VideoData& video, double target_time_seconds);
 bool update_texture_from_cache(VideoData& video, double target_time_seconds);
 
 // The main preview update function, orchestrates decoding requests and texture uploads
-void update_video_previews(GLResources& res, const std::vector<Clip>& active_clips, float current_time);
-
-// Renders the final composited frame using *existing* textures
-void render_frame(GLResources& res, float current_time, const std::vector<Clip>& sorted_clips, int width, int height);
+void update_video_previews(GLResources& res, const std::vector<std::shared_ptr<Node>>& root_nodes, float current_time); // Takes Nodes
+void render_frame(GLResources& res, float current_time, const std::vector<std::shared_ptr<Node>>& root_nodes, int width, int height); // Takes Nodes
 
 void cleanup_video_resources(GLResources& res); // Cleans FFmpeg video resources
 void cleanup_gl_resources(GLResources& res);    // Cleans OpenGL textures/FBO
 
 bool preload_audio_file(const std::string& path, PreloadedAudio& out, float media_start, float media_duration);
 
-bool start_video_export(const std::string& output_path,
-                       int width, int height, int fps,
-                       int duration_frames,
-                       const std::vector<Clip>& clips,
-                       SDL_Window* window); // Keep signature, implementation needs update
+bool start_video_export(const std::string& output_path, int width, int height, int fps,
+    float total_duration_sec, // <-- Use float duration
+    const std::vector<std::shared_ptr<Node>>& root_nodes, // <-- Use Nodes
+    const std::map<std::string, Clip>& media_library, // Pass media library
+    SDL_Window* window);
 
 std::vector<float> GenerateWaveformPreview(const std::vector<int16_t>& samples, int channels, int samples_per_pixel);
 

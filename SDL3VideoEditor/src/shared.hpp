@@ -1,9 +1,16 @@
 #pragma once
 #include <string>
+#include <vector>
+#include <map> // Added for media library potentially
+#include <memory> // Added for shared_ptr
+
+// Forward declaration
+struct Node;
 
 enum class ClipType {
     Video,
-    Audio
+    Audio,
+    Image // Added Image type
 };
 
 enum class BlendMode {
@@ -27,7 +34,7 @@ enum class InterpolationType {
 
 template<typename T>
 struct Keyframe {
-    float time;               // Time in seconds
+    float time;               // Time in seconds (relative to node start)
     T value;                  // The value at that time
     InterpolationType interp; // How to interpolate to next keyframe
 };
@@ -36,47 +43,32 @@ template<typename T>
 struct KeyframeTrack {
     std::vector<Keyframe<T>> keyframes;
 
-    // Evaluate value at a given time
+    // Evaluate value at a given time (relative to node start)
     T Evaluate(float time) const;
 };
 
+// Forward Lerp declaration
 float Lerp(float a, float b, float t);
 
-
+// Represents the source media information
 struct Clip {
-    std::string name;
-    
-    float start_time = 0.0f;      // timeline position in seconds
-    float duration = 0.0f;        // duration on timeline
-    int layer = 0;           // compositing layer (higher = in front)
-    
-    std::string path;
-
-    float media_start = 0.0f; // where in the source video to start
-
+    std::string name; // Base name derived from path
+    std::string path; // Unique identifier (usually)
     ClipType type = ClipType::Video;
 
-    // Transform attributes
-    float pos_x = 0.0f;      // normalized [-1, 1] or pixel values (we can decide)
-    float pos_y = 0.0f;
-    float scale = 1.0f;      // uniform scale for now
-    float opacity = 1.0f;    // 0.0 to 1.0
-    float rotation = 0.0f;
-    BlendMode blend_mode = BlendMode::Normal;
-
-    KeyframeTrack<float> pos_x_track;
-    KeyframeTrack<float> pos_y_track;
-    KeyframeTrack<float> scale_track;
-    KeyframeTrack<float> opacity_track;
-    KeyframeTrack<float> rotation_track;
-
-    bool selected = false;
-
-    bool has_audio = true;
+    float source_duration = 0.0f; // Duration of the original media file
+    bool has_audio = false;
     bool is_audio_only = false;
-    std::vector<float> waveform;     // normalized audio samples [-1.0, 1.0]
 
-    Clip* linked_clip = nullptr; // for audio/video pairs
+    // Metadata (could add width, height, fps etc. later)
+    int source_width = 0;
+    int source_height = 0;
+
+    // Optional: Preloaded audio data (could be moved elsewhere)
+    std::vector<float> waveform;     // normalized audio samples [-1.0, 1.0] for preview
+    // Potentially link source audio/video clips if they always come in pairs
+    // std::string linked_clip_path; // Use path to link? Or manage links via Nodes?
 };
 
+// --- Include Implementations ---
 #include "keyframetrack.inl"
