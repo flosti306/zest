@@ -2,7 +2,15 @@
 
 #include <vector>
 #include <string>
-#include "shared.hpp"  // or wherever `Clip` is defined
+#include "shared.hpp"  // or wherever `Node` is defined
+#include "node.hpp"    // For MediaNode and NodeType
 
-bool SaveProject(const std::string& filename, const std::vector<Clip>& clips, float playhead_time, float zoom_factor);
-bool LoadProject(const std::string& filename, std::vector<Clip>& clips, float& playhead_time, float& zoom_factor);
+bool SaveProject(const std::string& path, 
+    const std::vector<MediaNode>& nodes,
+    float project_duration,
+    float frame_rate);
+
+bool LoadProject(const std::string& path,
+    std::vector<MediaNode>& nodes,
+    float& project_duration,
+    float& frame_rate);

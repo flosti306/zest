@@ -27,9 +27,11 @@ extern "C" {
 #include <SDL_render.h>
 #include <string>
 #include "shared.hpp"
+#include "node.hpp"
 
 // Forward declare structs if needed by function signatures below
-struct Clip;
+struct Node;
+struct MediaNode;
 struct GLResources;
 struct ThumbnailRequest;
 struct ThumbnailResult;
@@ -126,20 +128,20 @@ struct GLResources {
     std::map<std::string, VideoData> video_cache; // Video state and textures
     std::map<std::string, AudioData> audio_cache; // Audio state
     std::map<std::string, PreloadedAudio> preloaded_audio; // Preloaded audio for waveforms/export
-    // Store the actual textures here, mapped by clip path
-    std::unordered_map<std::string, std::vector<GLuint>> clip_thumbnail_textures;
-    // Add a map to track which timestamps have generated textures for a clip
+    // Store the actual textures here, mapped by node path
+    std::unordered_map<std::string, std::vector<GLuint>> node_thumbnail_textures;
+    // Add a map to track which timestamps have generated textures for a node
     std::unordered_map<std::string, std::unordered_map<float, GLuint>> generated_thumbnails_map;
 };
 
 struct ThumbnailRequest {
-    std::string clip_path; // Use path to identify clip safely
+    std::string node_path; // Use path to identify node safely
     float timestamp = 0.0f;
     // Optional: add a unique ID if needed for complex scenarios
 };
 
 struct ThumbnailResult {
-    std::string clip_path;
+    std::string node_path;
     float timestamp = 0.0f;
     std::vector<uint8_t> pixels; // Decoded RGB pixels
     int width = 0;
@@ -149,16 +151,16 @@ struct ThumbnailResult {
 };
 
 bool setup_gl_resources(GLResources& res, int width, int height);
-void load_textures(GLResources& res, const std::vector<Clip>& clips); // Only loads images now
+void load_textures(GLResources& res, const std::vector<MediaNode>& nodes); // Only loads images now
 
 bool is_video_file(const std::string& path);
 
-// Renamed: initializes FFmpeg contexts, called by load_resources_for_clip
+// Renamed: initializes FFmpeg contexts, called by load_resources_for_node
 bool initialize_video_resources(GLResources& res, const std::string& path);
 bool initialize_audio_resources(GLResources& res, const std::string& path); // For potential future audio streaming
 
-// New function to load all resources for a clip (video/audio contexts + image textures)
-void load_resources_for_clip(GLResources& res, const Clip& clip);
+// New function to load all resources for a node (video/audio contexts + image textures)
+void load_resources_for_node(GLResources& res, const MediaNode& node);
 
 // Decodes frames up to target_time, updates cache, returns true if target is reachable
 bool ensure_video_decoded_upto(VideoData& video, double target_time_seconds);
@@ -167,10 +169,10 @@ bool ensure_video_decoded_upto(VideoData& video, double target_time_seconds);
 bool update_texture_from_cache(VideoData& video, double target_time_seconds);
 
 // The main preview update function, orchestrates decoding requests and texture uploads
-void update_video_previews(GLResources& res, const std::vector<Clip>& active_clips, float current_time);
+void update_video_previews(GLResources& res, const std::vector<MediaNode>& active_nodes, float current_time);
 
 // Renders the final composited frame using *existing* textures
-void render_frame(GLResources& res, float current_time, const std::vector<Clip>& sorted_clips, int width, int height);
+void render_frame(GLResources& res, float current_time, const std::vector<MediaNode>& sorted_nodes, int width, int height);
 
 void cleanup_video_resources(GLResources& res); // Cleans FFmpeg video resources
 void cleanup_gl_resources(GLResources& res);    // Cleans OpenGL textures/FBO
@@ -180,12 +182,12 @@ bool preload_audio_file(const std::string& path, PreloadedAudio& out, float medi
 bool start_video_export(const std::string& output_path,
                        int width, int height, int fps,
                        int duration_frames,
-                       const std::vector<Clip>& clips,
+                       const std::vector<MediaNode>& nodes,
                        SDL_Window* window); // Keep signature, implementation needs update
 
 std::vector<float> GenerateWaveformPreview(const std::vector<int16_t>& samples, int channels, int samples_per_pixel);
 
-void QueueClipThumbnails(GLResources& res, const Clip& clip);
+void QueueNodeThumbnails(GLResources& res, const MediaNode& node);
 void ProcessThumbnailTasks(GLResources& res, int max_per_frame);
 
 void start_thumbnail_worker();

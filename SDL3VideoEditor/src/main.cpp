@@ -45,6 +45,7 @@ extern "C" {
 #include "video_export.hpp" // Include AFTER system headers and glad/imgui
 #include "shared.hpp"
 #include "project_io.hpp"
+#include "node.hpp" // For Node and MediaNode classes
 
 // Global gradient data storage (used by ApplyWindowBackgroundGradients)
 struct GradientData {
@@ -64,7 +65,7 @@ int render_width = 1920;
 int render_height = 1080;
 int export_fps = 30;
 
-Clip* selected_clip = nullptr; // Keep track of selected clip
+MediaNode* selected_node = nullptr; // Keep track of selected node
 
 bool show_thumbs = false;
 
@@ -320,66 +321,66 @@ void RenderDockSpace() {
     ImGui::End();
 }
 
-// --- Clip Management ---
-void AddNewClip(std::vector<Clip>& clips, const std::string& input_path, float video_duration, int layer, GLResources& res) {
-    Clip temp_clip;
-    temp_clip.path = input_path;
-    temp_clip.type = ClipType::Video;
-    load_resources_for_clip(res, temp_clip);
+// --- Node Management ---
+void AddNewNode(std::vector<MediaNode>& nodes, const std::string& input_path, float video_duration, int layer, GLResources& res) {
+    MediaNode temp_node;
+    temp_node.src = input_path;
+    temp_node.type = NodeType::Video;
+    load_resources_for_node(res, temp_node);
 
-    clips.reserve(clips.size() + 2);
+    nodes.reserve(nodes.size() + 2);
     std::string base_name = std::filesystem::path(input_path).filename().string();
 
-    size_t video_index = clips.size();
-    clips.emplace_back();
-    Clip& video_clip = clips[video_index];
-    video_clip.name = base_name + " [Video]";
-    video_clip.path = input_path;
-    video_clip.type = ClipType::Video;
-    video_clip.start_time = playhead_time;
-    video_clip.duration = video_duration;
-    video_clip.layer = layer;
-    video_clip.media_start = 0.0f;
-    video_clip.is_audio_only = false;
-    video_clip.opacity = 1.0f;
-    video_clip.scale = 1.0f;
-    video_clip.pos_x = 0.0f;
-    video_clip.pos_y = 0.0f;
-    video_clip.selected = false;
+    size_t video_index = nodes.size();
+    nodes.emplace_back();
+    MediaNode& video_node = nodes[video_index];
+    video_node.name = base_name + " [Video]";
+    video_node.src = input_path;
+    video_node.type = NodeType::Video;
+    video_node.start_time = playhead_time;
+    video_node.duration = video_duration;
+    video_node.layer = layer;
+    video_node.media_start = 0.0f;
+    video_node.is_audio_only = false;
+    video_node.opacity = 1.0f;
+    video_node.scale = 1.0f;
+    video_node.pos_x = 0.0f;
+    video_node.pos_y = 0.0f;
+    video_node.selected = false;
 
-    if(show_thumbs) QueueClipThumbnails(res, video_clip);
+    if(show_thumbs) QueueNodeThumbnails(res, video_node);
 
     auto audio_it = res.preloaded_audio.find(input_path);
     if (audio_it != res.preloaded_audio.end() && !audio_it->second.samples.empty()) {
-        size_t audio_index = clips.size();
-        clips.emplace_back();
-        Clip& audio_clip = clips[audio_index];
-        audio_clip.name = base_name + " [Audio]";
-        audio_clip.path = input_path;
-        audio_clip.type = ClipType::Audio;
-        audio_clip.start_time = video_clip.start_time;
-        audio_clip.duration = audio_it->second.duration;
-        audio_clip.layer = layer;
-        audio_clip.media_start = 0.0f;
-        audio_clip.waveform = audio_it->second.waveform;
-        audio_clip.is_audio_only = false;
-        audio_clip.opacity = 1.0f;
-        audio_clip.scale = 1.0f;
-        audio_clip.pos_x = 0.0f;
-        audio_clip.pos_y = 0.0f;
-        audio_clip.selected = false;
+        size_t audio_index = nodes.size();
+        nodes.emplace_back();
+        MediaNode& audio_node = nodes[audio_index];
+        audio_node.name = base_name + " [Audio]";
+        audio_node.src = input_path;
+        audio_node.type = NodeType::Audio;
+        audio_node.start_time = video_node.start_time;
+        audio_node.duration = audio_it->second.duration;
+        audio_node.layer = layer;
+        audio_node.media_start = 0.0f;
+        audio_node.waveform = audio_it->second.waveform;
+        audio_node.is_audio_only = false;
+        audio_node.opacity = 1.0f;
+        audio_node.scale = 1.0f;
+        audio_node.pos_x = 0.0f;
+        audio_node.pos_y = 0.0f;
+        audio_node.selected = false;
 
-        audio_clip.linked_clip = &clips[video_index];
-        video_clip.linked_clip = &clips[audio_index];
-        video_clip.has_audio = true;
-        std::cout << "Added linked Video and Audio clips for: " << input_path << std::endl;
+        audio_node.linked_node = &nodes[video_index];
+        video_node.linked_node = &nodes[audio_index];
+        video_node.has_audio = true;
+        std::cout << "Added linked Video and Audio nodes for: " << input_path << std::endl;
     } else {
-        video_clip.has_audio = false;
-        video_clip.linked_clip = nullptr;
+        video_node.has_audio = false;
+        video_node.linked_node = nullptr;
         if (audio_it != res.preloaded_audio.end() && audio_it->second.samples.empty()) {
-            std::cout << "Added Video clip (Audio stream found but empty/failed preload) for: " << input_path << std::endl;
+            std::cout << "Added Video node (Audio stream found but empty/failed preload) for: " << input_path << std::endl;
         } else {
-             std::cout << "Added Video clip (No audio stream found/preloaded) for: " << input_path << std::endl;
+             std::cout << "Added Video node (No audio stream found/preloaded) for: " << input_path << std::endl;
         }
     }
 }
@@ -428,8 +429,8 @@ float get_video_duration(const std::string& input_path) {
 // --- Forward Declarations ---
 template<typename T>
 void DrawKeyframeTrackEditor(const std::string& label, KeyframeTrack<T>& track);
-void DrawTimelineEditor(std::vector<Clip>& clips, float& playhead_time, float& max_duration, float& zoom_factor, std::atomic<bool>& layers_changed, Clip*& selected_clip, GLResources& res);
-void UpdatePreview(GLResources& res, const std::vector<Clip>& sorted_clips, int width, int height, float playhead_time, bool force_update);
+void DrawTimelineEditor(std::vector<MediaNode>& nodes, float& playhead_time, float& max_duration, float& zoom_factor, std::atomic<bool>& layers_changed, MediaNode*& selected_node, GLResources& res);
+void UpdatePreview(GLResources& res, const std::vector<MediaNode>& sorted_nodes, int width, int height, float playhead_time, bool force_update);
 void RenderPreviewWindow(GLuint preview_tex, int preview_width, int preview_height);
 
 // --- Main Application ---
@@ -495,7 +496,7 @@ int main(int argc, char* argv[]) {
     std::atomic<bool> layers_changed = true;
     bool file_dropped_this_frame = false;
     std::string process_message = "Ready.";
-    std::vector<Clip> clips;
+    std::vector<MediaNode> nodes;
     float last_preview_update_time = -1.0f;
     const float PREVIEW_UPDATE_INTERVAL = 1.0f / 60.0f;
 
@@ -536,75 +537,75 @@ int main(int argc, char* argv[]) {
                 std::cout << "Playback " << (playing ? "started" : "paused") << "\n";
             }
             // Use event.key.key and SDLK_B (Fix 3 & 4)
-            else if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_B && (SDL_GetModState() & SDL_KMOD_CTRL) && selected_clip && event.key.down) {
+            else if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_B && (SDL_GetModState() & SDL_KMOD_CTRL) && selected_node && event.key.down) {
                 // --- Blade Tool Logic ---
                 float cut_time = playhead_time;
-                float clip_start_global = selected_clip->start_time;
-                float clip_end_global = selected_clip->start_time + selected_clip->duration;
-                if (cut_time > clip_start_global && cut_time < clip_end_global) {
-                    Clip* linked_clip_ptr = selected_clip->linked_clip;
-                    float relative_cut = cut_time - clip_start_global;
-                    float new_media_start = selected_clip->media_start + relative_cut;
-                    Clip new_clip = *selected_clip;
-                    new_clip.start_time = cut_time;
-                    new_clip.media_start = new_media_start;
-                    new_clip.duration = clip_end_global - cut_time;
-                    new_clip.name += " (Split)";
-                    new_clip.selected = false;
-                    new_clip.linked_clip = nullptr;
-                    selected_clip->duration = relative_cut;
-                    selected_clip->linked_clip = nullptr;
-                    Clip* new_linked_clip_ptr = nullptr;
-                    if (linked_clip_ptr) {
+                float node_start_global = selected_node->start_time;
+                float node_end_global = selected_node->start_time + selected_node->duration;
+                if (cut_time > node_start_global && cut_time < node_end_global) {
+                    MediaNode* linked_node_ptr = selected_node->linked_node;
+                    float relative_cut = cut_time - node_start_global;
+                    float new_media_start = selected_node->media_start + relative_cut;
+                    MediaNode new_node = *selected_node;
+                    new_node.start_time = cut_time;
+                    new_node.media_start = new_media_start;
+                    new_node.duration = node_end_global - cut_time;
+                    new_node.name += " (Split)";
+                    new_node.selected = false;
+                    new_node.linked_node = nullptr;
+                    selected_node->duration = relative_cut;
+                    selected_node->linked_node = nullptr;
+                    MediaNode* new_linked_node_ptr = nullptr;
+                    if (linked_node_ptr) {
                         bool linked_found = false;
-                        for (const auto& c : clips) { if (&c == linked_clip_ptr) { linked_found = true; break; } }
+                        for (const auto& c : nodes) { if (&c == linked_node_ptr) { linked_found = true; break; } }
                         if (linked_found) {
-                            Clip new_linked_clip = *linked_clip_ptr;
-                            new_linked_clip.start_time = cut_time;
-                            new_linked_clip.media_start = linked_clip_ptr->media_start + relative_cut;
-                            new_linked_clip.duration = new_clip.duration;
-                            new_linked_clip.name += " (Split)";
-                            new_linked_clip.selected = false;
-                            new_linked_clip.linked_clip = nullptr;
-                            linked_clip_ptr->duration = selected_clip->duration;
-                            linked_clip_ptr->linked_clip = nullptr;
-                            clips.push_back(new_linked_clip);
-                            new_linked_clip_ptr = &clips.back();
+                            MediaNode new_linked_node = *linked_node_ptr;
+                            new_linked_node.start_time = cut_time;
+                            new_linked_node.media_start = linked_node_ptr->media_start + relative_cut;
+                            new_linked_node.duration = new_node.duration;
+                            new_linked_node.name += " (Split)";
+                            new_linked_node.selected = false;
+                            new_linked_node.linked_node = nullptr;
+                            linked_node_ptr->duration = selected_node->duration;
+                            linked_node_ptr->linked_node = nullptr;
+                            nodes.push_back(new_linked_node);
+                            new_linked_node_ptr = &nodes.back();
                         } else {
-                            std::cerr << "Warning: Linked clip pointer was invalid during split." << std::endl;
-                            linked_clip_ptr = nullptr;
+                            std::cerr << "Warning: Linked node pointer was invalid during split." << std::endl;
+                            linked_node_ptr = nullptr;
                         }
                     }
-                    clips.push_back(new_clip);
-                    Clip* new_clip_ptr = &clips.back();
-                    if (linked_clip_ptr) {
-                        selected_clip->linked_clip = linked_clip_ptr;
-                        linked_clip_ptr->linked_clip = selected_clip;
-                        if (new_linked_clip_ptr) {
-                            new_clip_ptr->linked_clip = new_linked_clip_ptr;
-                            new_linked_clip_ptr->linked_clip = new_clip_ptr;
+                    nodes.push_back(new_node);
+                    MediaNode* new_node_ptr = &nodes.back();
+                    if (linked_node_ptr) {
+                        selected_node->linked_node = linked_node_ptr;
+                        linked_node_ptr->linked_node = selected_node;
+                        if (new_linked_node_ptr) {
+                            new_node_ptr->linked_node = new_linked_node_ptr;
+                            new_linked_node_ptr->linked_node = new_node_ptr;
                         }
                     }
                     layers_changed = true;
-                    selected_clip = new_clip_ptr;
-                    std::cout << "Split clip at " << cut_time << "s\n";
+                    selected_node = new_node_ptr;
+                    std::cout << "Split node at " << cut_time << "s\n";
                 } else {
-                    std::cout << "Split position (" << cut_time << ") is not within the selected clip bounds (" << clip_start_global << " - " << clip_end_global << ")\n";
+                    std::cout << "Split position (" << cut_time << ") is not within the selected node bounds (" << node_start_global << " - " << node_end_global << ")\n";
                 }
                 // --- End Blade Tool ---
             }
             // Use event.key.key and SDLK_DELETE (Fix 3 & 4)
-            else if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_DELETE && selected_clip && event.key.down) {
+            else if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_DELETE && selected_node && event.key.down) {
                 ptrdiff_t selected_index = -1;
-                for(size_t i = 0; i < clips.size(); ++i) { if (&clips[i] == selected_clip) { selected_index = i; break; } }
+                for(size_t i = 0; i < nodes.size(); ++i) { if (&nodes[i] == selected_node) { selected_index = i; break; } }
                 if (selected_index != -1) {
-                        Clip& clip_to_delete = clips[selected_index];
-                    if (clip_to_delete.linked_clip) clip_to_delete.linked_clip->linked_clip = nullptr;
-                        clips.erase(clips.begin() + selected_index);
-                        selected_clip = nullptr;
+                        MediaNode& node_to_delete = nodes[selected_index];
+                    if (node_to_delete.linked_node) node_to_delete.linked_node->linked_node = nullptr;
+                        nodes.erase(nodes.begin() + selected_index);
+                        selected_node = nullptr;
                         layers_changed = true;
-                        process_message = "Deleted clip.";
-                        std::cout << "Deleted selected clip." << std::endl;
+                        process_message = "Deleted node.";
+                        std::cout << "Deleted selected node." << std::endl;
                 }
             }
 
@@ -623,9 +624,9 @@ int main(int argc, char* argv[]) {
             if (std::filesystem::exists(dropped_path_str)) {
                 float duration = get_video_duration(dropped_path_str);
                 if (duration >= 0) {
-                    AddNewClip(clips, dropped_path_str, duration, 0, gl_resources);
+                    AddNewNode(nodes, dropped_path_str, duration, 0, gl_resources);
                     layers_changed = true;
-                    process_message = "Added clip: " + std::filesystem::path(dropped_path_str).filename().string();
+                    process_message = "Added node: " + std::filesystem::path(dropped_path_str).filename().string();
                 } else {
                     process_message = "Failed to get duration for: " + std::filesystem::path(dropped_path_str).filename().string();
                     std::cerr << process_message << std::endl;
@@ -643,18 +644,18 @@ int main(int argc, char* argv[]) {
             playhead_time = std::max(0.0f, playhead_time);
         }
 
-        std::vector<Clip> active_clips_for_preview;
+        std::vector<MediaNode> active_nodes_for_preview;
         float preview_time_window = 1.0f;
-        for (const auto& clip : clips) {
+        for (const auto& node : nodes) {
              // Need is_video_file (Fix 5 - requires declaration in hpp)
-            if (clip.type == ClipType::Video && is_video_file(clip.path)) {
-                 float clip_start = clip.start_time; float clip_end = clip.start_time + clip.duration;
-                if (std::max(clip_start, playhead_time - preview_time_window) < std::min(clip_end, playhead_time + preview_time_window)) {
-                    active_clips_for_preview.push_back(clip);
+            if (node.type == NodeType::Video && is_video_file(node.src)) {
+                 float node_start = node.start_time; float node_end = node.start_time + node.duration;
+                if (std::max(node_start, playhead_time - preview_time_window) < std::min(node_end, playhead_time + preview_time_window)) {
+                    active_nodes_for_preview.push_back(node);
                 }
             }
         }
-        update_video_previews(gl_resources, active_clips_for_preview, playhead_time);
+        update_video_previews(gl_resources, active_nodes_for_preview, playhead_time);
         if(show_thumbs) ProcessThumbnailResults(gl_resources, 2);
 
         ImGui_ImplOpenGL3_NewFrame(); ImGui_ImplSDL3_NewFrame(); ImGui::NewFrame();
@@ -683,7 +684,7 @@ int main(int argc, char* argv[]) {
                  if (export_duration_frames <= 0) { process_message = "Cannot export empty timeline!"; }
                  else {
                     process_message = "Exporting...";
-                    bool success = start_video_export(output_path, render_width, render_height, export_fps, export_duration_frames, clips, window);
+                    bool success = start_video_export(output_path, render_width, render_height, export_fps, export_duration_frames, nodes, window);
                     process_message = success ? "Export finished successfully!" : "Export failed!";
                 }
             }
@@ -693,7 +694,7 @@ int main(int argc, char* argv[]) {
             const char* filters[] = { "*.zest" };
             const char* save_path = tinyfd_saveFileDialog("Save Project", "project.zest", 1, filters, "Zest Project Files (*.zest)");
             if (save_path) {
-                 if (SaveProject(save_path, clips, playhead_time, zoom_factor)) {
+                 if (SaveProject(save_path, nodes, playhead_time, zoom_factor)) {
                     process_message = "Project saved to " + std::string(save_path); std::cout << process_message << std::endl;
                 } else { process_message = "Failed to save project!"; std::cerr << process_message << std::endl; }
             }
@@ -703,31 +704,31 @@ int main(int argc, char* argv[]) {
             const char* filters[] = { "*.zest" };
             const char* load_path = tinyfd_openFileDialog("Load Project", "", 1, filters, "Zest Project Files (*.zest)", 0);
             if (load_path) {
-                std::vector<Clip> loaded_clips; float loaded_playhead = 0; float loaded_zoom = 1.0f;
+                std::vector<MediaNode> loaded_nodes; float loaded_playhead = 0; float loaded_zoom = 1.0f;
                 // In the project loading block:
-                if (LoadProject(load_path, loaded_clips, loaded_playhead, loaded_zoom)) {
+                if (LoadProject(load_path, loaded_nodes, loaded_playhead, loaded_zoom)) {
                     playing = false;
-                    clips.clear();
-                    selected_clip = nullptr;
+                    nodes.clear();
+                    selected_node = nullptr;
                     cleanup_gl_resources(gl_resources);
                     cleanup_video_resources(gl_resources);
                     gl_resources.preloaded_audio.clear();
                     setup_gl_resources(gl_resources, preview_width, preview_height);
                     
-                    clips = std::move(loaded_clips);
+                    nodes = std::move(loaded_nodes);
                     playhead_time = loaded_playhead;
                     zoom_factor = loaded_zoom;
                     
-                    // Reload audio waveforms for all clips
-                    for (auto& clip : clips) {
-                        if (clip.type == ClipType::Audio) {
+                    // Reload audio waveforms for all nodes
+                    for (auto& node : nodes) {
+                        if (node.type == NodeType::Audio) {
                             // Force reload audio data
-                            load_resources_for_clip(gl_resources, clip);
-                            if(show_thumbs) QueueClipThumbnails(gl_resources, clip);
+                            load_resources_for_node(gl_resources, node);
+                            if(show_thumbs) QueueNodeThumbnails(gl_resources, node);
                             // Link waveform pointer after reload
-                            auto audio_it = gl_resources.preloaded_audio.find(clip.path);
+                            auto audio_it = gl_resources.preloaded_audio.find(node.src);
                             if (audio_it != gl_resources.preloaded_audio.end()) {
-                                clip.waveform = audio_it->second.waveform;
+                                node.waveform = audio_it->second.waveform;
                             }
                         }
                     }
@@ -739,80 +740,80 @@ int main(int argc, char* argv[]) {
         }
         ImGui::End(); // End Controls
 
-        DrawTimelineEditor(clips, playhead_time, max_duration, zoom_factor, layers_changed, selected_clip, gl_resources);
+        DrawTimelineEditor(nodes, playhead_time, max_duration, zoom_factor, layers_changed, selected_node, gl_resources);
 
         bool force_preview_update = layers_changed.load();
         if (force_preview_update || std::abs(playhead_time - last_preview_update_time) > PREVIEW_UPDATE_INTERVAL) {
-            std::vector<Clip> sorted_clips = clips;
-            std::sort(sorted_clips.begin(), sorted_clips.end(), [](const Clip& a, const Clip& b) { return a.layer < b.layer; });
-            UpdatePreview(gl_resources, sorted_clips, preview_width, preview_height, playhead_time, force_preview_update);
+            std::vector<MediaNode> sorted_nodes = nodes;
+            std::sort(sorted_nodes.begin(), sorted_nodes.end(), [](const MediaNode& a, const MediaNode& b) { return a.layer < b.layer; });
+            UpdatePreview(gl_resources, sorted_nodes, preview_width, preview_height, playhead_time, force_preview_update);
             last_preview_update_time = playhead_time;
             layers_changed = false;
         }
         RenderPreviewWindow(gl_resources.render_tex, preview_width, preview_height);
 
         ImGui::Begin("Inspector"); ApplyWindowBackgroundGradients();
-        if (selected_clip) {
-            ImGui::Text("Selected: %s", selected_clip->name.c_str()); ImGui::Text("Path: %s", selected_clip->path.c_str());
+        if (selected_node) {
+            ImGui::Text("Selected: %s", selected_node->name.c_str()); ImGui::Text("Path: %s", selected_node->src.c_str());
             bool changed = false;
             ImGui::SeparatorText("Transform");
-            changed |= ImGui::SliderFloat("Pos X", &selected_clip->pos_x, -1.0f, 1.0f, "%.3f");
-            changed |= ImGui::SliderFloat("Pos Y", &selected_clip->pos_y, -1.0f, 1.0f, "%.3f");
-            changed |= ImGui::SliderFloat("Scale", &selected_clip->scale, 0.0f, 10.0f, "%.3f");
-            changed |= ImGui::SliderFloat("Rotation", &selected_clip->rotation, 0.0f, 360.0f, "%.3f");
-            changed |= ImGui::SliderFloat("Opacity", &selected_clip->opacity, 0.0f, 1.0f, "%.3f");
+            changed |= ImGui::SliderFloat("Pos X", &selected_node->pos_x, -1.0f, 1.0f, "%.3f");
+            changed |= ImGui::SliderFloat("Pos Y", &selected_node->pos_y, -1.0f, 1.0f, "%.3f");
+            changed |= ImGui::SliderFloat("Scale", &selected_node->scale, 0.0f, 10.0f, "%.3f");
+            changed |= ImGui::SliderFloat("Rotation", &selected_node->rotation, 0.0f, 360.0f, "%.3f");
+            changed |= ImGui::SliderFloat("Opacity", &selected_node->opacity, 0.0f, 1.0f, "%.3f");
             ImGui::SeparatorText("Timing & Trimming");
-            changed |= ImGui::InputFloat("Start Time", &selected_clip->start_time, 0.1f, 1.0f, "%.2f"); selected_clip->start_time = std::max(0.0f, selected_clip->start_time);
-            changed |= ImGui::InputFloat("Media Start", &selected_clip->media_start, 0.1f, 1.0f, "%.2f"); selected_clip->media_start = std::max(0.0f, selected_clip->media_start);
-            changed |= ImGui::InputFloat("Duration", &selected_clip->duration, 0.1f, 1.0f, "%.2f"); selected_clip->duration = std::max(0.01f, selected_clip->duration);
+            changed |= ImGui::InputFloat("Start Time", &selected_node->start_time, 0.1f, 1.0f, "%.2f"); selected_node->start_time = std::max(0.0f, selected_node->start_time);
+            changed |= ImGui::InputFloat("Media Start", &selected_node->media_start, 0.1f, 1.0f, "%.2f"); selected_node->media_start = std::max(0.0f, selected_node->media_start);
+            changed |= ImGui::InputFloat("Duration", &selected_node->duration, 0.1f, 1.0f, "%.2f"); selected_node->duration = std::max(0.01f, selected_node->duration);
             ImGui::SeparatorText("Layering");
-            changed |= ImGui::InputInt("Layer", &selected_clip->layer); selected_clip->layer = std::max(0, selected_clip->layer);
+            changed |= ImGui::InputInt("Layer", &selected_node->layer); selected_node->layer = std::max(0, selected_node->layer);
             const char* blend_modes[] = { "Normal", "Additive", "Multiply", "Screen", "Darken", "Lighten", "Difference", "Subtract", "Divide", "Overlay"};
-            int current_mode = static_cast<int>(selected_clip->blend_mode);
+            int current_mode = static_cast<int>(selected_node->blend_mode);
 
             if (ImGui::Combo("Blend Mode", &current_mode, blend_modes, IM_ARRAYSIZE(blend_modes))) {
-                selected_clip->blend_mode = static_cast<BlendMode>(current_mode);
+                selected_node->blend_mode = static_cast<BlendMode>(current_mode);
                 changed = true;
             }
             ImGui::SeparatorText("Keying");
-            DrawKeyframeTrackEditor("Opacity Keyframes", selected_clip->opacity_track);
-            DrawKeyframeTrackEditor("Position X Keyframes", selected_clip->pos_x_track);
-            DrawKeyframeTrackEditor("Position Y Keyframes", selected_clip->pos_y_track);
-            DrawKeyframeTrackEditor("Rotation Keyframes", selected_clip->rotation_track);
-            DrawKeyframeTrackEditor("Scale Keyframes", selected_clip->scale_track);
+            DrawKeyframeTrackEditor("Opacity Keyframes", selected_node->opacity_track);
+            DrawKeyframeTrackEditor("Position X Keyframes", selected_node->pos_x_track);
+            DrawKeyframeTrackEditor("Position Y Keyframes", selected_node->pos_y_track);
+            DrawKeyframeTrackEditor("Rotation Keyframes", selected_node->rotation_track);
+            DrawKeyframeTrackEditor("Scale Keyframes", selected_node->scale_track);
             if (changed) {
                 layers_changed = true;
-                if (selected_clip->linked_clip) {
-                    if (selected_clip->type == ClipType::Video) {
-                        selected_clip->linked_clip->start_time = selected_clip->start_time;
-                        selected_clip->linked_clip->duration = selected_clip->duration;
+                if (selected_node->linked_node) {
+                    if (selected_node->type == NodeType::Video) {
+                        selected_node->linked_node->start_time = selected_node->start_time;
+                        selected_node->linked_node->duration = selected_node->duration;
                     }
                 }
             }
-        } else ImGui::Text("No clip selected.");
+        } else ImGui::Text("No node selected.");
         ImGui::End(); // End Inspector
 
-        ImGui::Begin("Active Clips"); ApplyWindowBackgroundGradients();
-        ImGui::Text("Clip List (%zu clips):", clips.size()); ImGui::Separator();
-        ImGuiListClipper clipper; clipper.Begin(clips.size());
+        ImGui::Begin("Active Nodes"); ApplyWindowBackgroundGradients();
+        ImGui::Text("Node List (%zu nodes):", nodes.size()); ImGui::Separator();
+        ImGuiListClipper clipper; clipper.Begin(nodes.size());
         while (clipper.Step()) {
             for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
-                 Clip& clip = clips[i]; bool is_selected = (&clip == selected_clip); ImGui::PushID(i);
+                 MediaNode& node = nodes[i]; bool is_selected = (&node == selected_node); ImGui::PushID(i);
                  if (is_selected) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.7f, 0.3f, 1.0f));
-                 if (ImGui::Selectable(clip.name.c_str(), is_selected, ImGuiSelectableFlags_AllowItemOverlap)) selected_clip = &clip;
+                 if (ImGui::Selectable(node.name.c_str(), is_selected, ImGuiSelectableFlags_AllowItemOverlap)) selected_node = &node;
                  if (is_selected) ImGui::PopStyleColor();
-                 ImGui::SameLine(300); ImGui::TextDisabled("T:%.2f D:%.2f L:%d MStart:%.2f %s", clip.start_time, clip.duration, clip.layer, clip.media_start, clip.linked_clip ? "[L]" : "");
+                 ImGui::SameLine(300); ImGui::TextDisabled("T:%.2f D:%.2f L:%d MStart:%.2f %s", node.start_time, node.duration, node.layer, node.media_start, node.linked_node ? "[L]" : "");
                  ImGui::SameLine(ImGui::GetWindowWidth() - 50);
                  if (ImGui::SmallButton("Del")) {
-                     if (clip.linked_clip) clip.linked_clip->linked_clip = nullptr;
-                     clips.erase(clips.begin() + i);
-                     if (&clip == selected_clip) selected_clip = nullptr;
+                     if (node.linked_node) node.linked_node->linked_node = nullptr;
+                     nodes.erase(nodes.begin() + i);
+                     if (&node == selected_node) selected_node = nullptr;
                      layers_changed = true; ImGui::PopID(); clipper.End(); goto end_debug_loop_main;
                  }
                  ImGui::PopID();
             }
         } end_debug_loop_main:;
-        ImGui::End(); // End Active Clips Debug
+        ImGui::End(); // End Active Nodes Debug
 
         ImGui::Render();
 
@@ -845,8 +846,8 @@ int main(int argc, char* argv[]) {
 
 
 // --- Updated UpdatePreview Function ---
-void UpdatePreview(GLResources& res, const std::vector<Clip>& sorted_clips, int width, int height, float playhead_time, bool force_update) {
-    render_frame(res, playhead_time, sorted_clips, width, height);
+void UpdatePreview(GLResources& res, const std::vector<MediaNode>& sorted_nodes, int width, int height, float playhead_time, bool force_update) {
+    render_frame(res, playhead_time, sorted_nodes, width, height);
 }
 
 // --- RenderPreviewWindow ---
@@ -876,12 +877,12 @@ void RenderPreviewWindow(GLuint preview_tex, int preview_width, int preview_heig
 
 // --- DrawTimelineEditor ---
 void DrawTimelineEditor(
-    std::vector<Clip>& clips,
+    std::vector<MediaNode>& nodes,
     float& playhead_time,
     float& max_duration,
     float& zoom_factor,
     std::atomic<bool>& layers_changed,
-    Clip*& selected_clip,
+    MediaNode*& selected_node,
     GLResources& res
 ) {
     ImGui::Begin("Timeline Editor");
@@ -920,11 +921,11 @@ void DrawTimelineEditor(
     int max_video_layer = 0;
     int max_audio_layer = 0;
 
-    for (const auto& clip : clips) {
-        if (clip.type == ClipType::Video)
-            max_video_layer = std::max(max_video_layer, clip.layer);
-        else if (clip.type == ClipType::Audio)
-            max_audio_layer = std::max(max_audio_layer, clip.layer);
+    for (const auto& node : nodes) {
+        if (node.type == NodeType::Video)
+            max_video_layer = std::max(max_video_layer, node.layer);
+        else if (node.type == NodeType::Audio)
+            max_audio_layer = std::max(max_audio_layer, node.layer);
     }
     max_video_layer += 1;
     max_audio_layer += 1;
@@ -933,10 +934,10 @@ void DrawTimelineEditor(
 
     // === Compute true visible project length
     float project_duration = 0.0f;
-    for (const auto& clip : clips) {
-        float clip_end = clip.start_time + clip.duration;
-        if (clip_end > project_duration)
-            project_duration = clip_end;
+    for (const auto& node : nodes) {
+        float node_end = node.start_time + node.duration;
+        if (node_end > project_duration)
+            project_duration = node_end;
     }
 
     max_duration = project_duration;
@@ -1128,30 +1129,30 @@ void DrawTimelineEditor(
         }
     }
 
-    static int dragging_clip_index = -1;
+    static int dragging_node_index = -1;
     static float drag_offset_time = 0.0f;
     static bool resizing_left = false;
     static bool resizing_right = false;
-    bool clicked_on_clip = false;
+    bool clicked_on_node = false;
 
-    for (size_t i = 0; i < clips.size(); ++i) {
-        auto& clip = clips[i];
+    for (size_t i = 0; i < nodes.size(); ++i) {
+        auto& node = nodes[i];
 
-        float clip_start_x = timeline_start.x + (clip.start_time * pixels_per_second);
-        float clip_end_x = clip_start_x + (clip.duration * pixels_per_second);
+        float node_start_x = timeline_start.x + (node.start_time * pixels_per_second);
+        float node_end_x = node_start_x + (node.duration * pixels_per_second);
 
-        int y_index = clip.type == ClipType::Video
-        ? max_video_layer - clip.layer - 1
-        : max_video_layer + clip.layer;
+        int y_index = node.type == NodeType::Video
+        ? max_video_layer - node.layer - 1
+        : max_video_layer + node.layer;
 
         float layer_y = timeline_start.y + y_index * (layer_height + layer_padding);
 
-        ImVec2 clip_rect_min = ImVec2(clip_start_x, layer_y + layer_padding);
-        ImVec2 clip_rect_max = ImVec2(clip_end_x, layer_y + layer_height);
+        ImVec2 node_rect_min = ImVec2(node_start_x, layer_y + layer_padding);
+        ImVec2 node_rect_max = ImVec2(node_end_x, layer_y + layer_height);
 
-        // Draw clip body with gradient and themed colors
+        // Draw node body with gradient and themed colors
         ImU32 fill_color_top, fill_color_bottom;
-        if (clip.type == ClipType::Audio) {
+        if (node.type == NodeType::Audio) {
             // Blue gradient for audio with orange tint
             fill_color_top = ImGui::ColorConvertFloat4ToU32(ImVec4(0.25f, 0.30f, 0.45f, 1.00f));
             fill_color_bottom = ImGui::ColorConvertFloat4ToU32(ImVec4(0.18f, 0.22f, 0.35f, 1.00f));
@@ -1161,21 +1162,21 @@ void DrawTimelineEditor(
             fill_color_bottom = ImGui::ColorConvertFloat4ToU32(ImVec4(0.45f, 0.22f, 0.15f, 1.00f));
         }
         
-        // Draw clip body with gradient
+        // Draw node body with gradient
         draw_list->AddRectFilledMultiColor(
-            clip_rect_min,
-            clip_rect_max,
+            node_rect_min,
+            node_rect_max,
             fill_color_top,
             fill_color_top,
             fill_color_bottom,
             fill_color_bottom
         );
         
-        // Draw clip border with slight rounding
+        // Draw node border with slight rounding
         ImU32 border_color = ImGui::ColorConvertFloat4ToU32(ImVec4(0.65f, 0.65f, 0.68f, 0.8f));
         draw_list->AddRect(
-            clip_rect_min,
-            clip_rect_max,
+            node_rect_min,
+            node_rect_max,
             border_color,
             4.0f, // Rounded corners
             0,
@@ -1183,33 +1184,33 @@ void DrawTimelineEditor(
         );
 
         // Draw thumbnails if video
-        if (clip.type == ClipType::Video && is_video_file(clip.path) && show_thumbs) {
-            // Find the thumbnails vector in GLResources using the clip path
-            auto thumb_it = res.clip_thumbnail_textures.find(clip.path); // Need access to GLResources 'res' here! Pass it in.
-           if (thumb_it != res.clip_thumbnail_textures.end()) {
+        if (node.type == NodeType::Video && is_video_file(node.src) && show_thumbs) {
+            // Find the thumbnails vector in GLResources using the node path
+            auto thumb_it = res.node_thumbnail_textures.find(node.src); // Need access to GLResources 'res' here! Pass it in.
+           if (thumb_it != res.node_thumbnail_textures.end()) {
                 const auto& thumbnails = thumb_it->second; // Get reference to vector<GLuint>
 
                if (!thumbnails.empty()) {
                     const float thumb_spacing = 2.0f;
-                    const float thumb_height = (clip_rect_max.y - clip_rect_min.y) - 8.0f;
+                    const float thumb_height = (node_rect_max.y - node_rect_min.y) - 8.0f;
                     const float thumb_width = thumb_height * (static_cast<float>(THUMBNAIL_WIDTH) / static_cast<float>(THUMBNAIL_HEIGHT)); // Use defined aspect ratio
-                    const float total_thumb_area_width = clip_rect_max.x - clip_rect_min.x;
+                    const float total_thumb_area_width = node_rect_max.x - node_rect_min.x;
                     const float available_width_per_thumb = total_thumb_area_width / static_cast<float>(thumbnails.size());
 
-                    float current_x = clip_rect_min.x + thumb_spacing;
-                    float thumb_y = clip_rect_min.y + 4.0f;
+                    float current_x = node_rect_min.x + thumb_spacing;
+                    float thumb_y = node_rect_min.y + 4.0f;
 
                     for (size_t t = 0; t < thumbnails.size(); ++t) {
                         // Calculate position based on index, distribute evenly
-                        float thumb_x = clip_rect_min.x + (t * available_width_per_thumb);
+                        float thumb_x = node_rect_min.x + (t * available_width_per_thumb);
                         // Clamp width to available space per thumb or actual thumb width
                         float display_thumb_width = std::min(thumb_width, available_width_per_thumb - thumb_spacing);
 
                         ImVec2 thumb_min(thumb_x + thumb_spacing / 2.0f, thumb_y);
                         ImVec2 thumb_max(thumb_x + thumb_spacing / 2.0f + display_thumb_width, thumb_y + thumb_height);
 
-                        // Ensure thumbnail doesn't exceed clip bounds
-                        thumb_max.x = std::min(thumb_max.x, clip_rect_max.x - thumb_spacing / 2.0f);
+                        // Ensure thumbnail doesn't exceed node bounds
+                        thumb_max.x = std::min(thumb_max.x, node_rect_max.x - thumb_spacing / 2.0f);
                         if (thumb_min.x >= thumb_max.x || thumb_min.y >= thumb_max.y) continue; // Skip if zero size
 
                         GLuint tex = thumbnails[t];
@@ -1229,47 +1230,47 @@ void DrawTimelineEditor(
                     }
                 } else {
                     // Draw a placeholder if the vector exists but is empty (loading)
-                    ImVec2 placeholder_min = ImVec2(clip_rect_min.x + 4, clip_rect_min.y + 4);
-                    ImVec2 placeholder_max = ImVec2(clip_rect_max.x - 4, clip_rect_max.y - 4);
+                    ImVec2 placeholder_min = ImVec2(node_rect_min.x + 4, node_rect_min.y + 4);
+                    ImVec2 placeholder_max = ImVec2(node_rect_max.x - 4, node_rect_max.y - 4);
                     draw_list->AddRectFilled(placeholder_min, placeholder_max, IM_COL32(50, 50, 55, 100), 4.0f);
                     draw_list->AddText(placeholder_min, IM_COL32_WHITE, "...");
                 }
            }
-           // else: Thumbnails haven't been queued yet or clip path not found (shouldn't happen if queued correctly)
+           // else: Thumbnails haven't been queued yet or node path not found (shouldn't happen if queued correctly)
        }
 
-        // Clip title with shadow effect for better readability
-        std::string clip_title = clip.name;
-        ImVec2 title_size = ImGui::CalcTextSize(clip_title.c_str());
-        ImVec2 title_pos = ImVec2(clip_rect_min.x + 6, clip_rect_min.y + 6);
+        // Node title with shadow effect for better readability
+        std::string node_title = node.name;
+        ImVec2 title_size = ImGui::CalcTextSize(node_title.c_str());
+        ImVec2 title_pos = ImVec2(node_rect_min.x + 6, node_rect_min.y + 6);
         
         // Text shadow
         draw_list->AddText(
             ImVec2(title_pos.x + 1, title_pos.y + 1),
             ImGui::ColorConvertFloat4ToU32(ImVec4(0.0f, 0.0f, 0.0f, 0.8f)),
-            clip_title.c_str()
+            node_title.c_str()
         );
         
         // Actual text
         draw_list->AddText(
             title_pos,
             ImGui::ColorConvertFloat4ToU32(ImVec4(0.95f, 0.95f, 0.95f, 0.95f)),
-            clip_title.c_str()
+            node_title.c_str()
         );
 
-        // If audio clip, draw stylized waveform
-        if (clip.type == ClipType::Audio && !clip.waveform.empty()) {
-            int waveform_samples = clip.waveform.size();
+        // If audio node, draw stylized waveform
+        if (node.type == NodeType::Audio && !node.waveform.empty()) {
+            int waveform_samples = node.waveform.size();
             ImU32 waveform_color = ImGui::ColorConvertFloat4ToU32(ImVec4(1.0f, 0.9f, 0.7f, 0.8f));
             ImU32 waveform_highlight = ImGui::ColorConvertFloat4ToU32(ImVec4(1.0f, 0.75f, 0.4f, 0.9f));
             
-            float center_y = (clip_rect_min.y + clip_rect_max.y) / 2.0f;
-            float max_height = (clip_rect_max.y - clip_rect_min.y) * 0.7f;
+            float center_y = (node_rect_min.y + node_rect_max.y) / 2.0f;
+            float max_height = (node_rect_max.y - node_rect_min.y) * 0.7f;
             
             for (int s = 0; s < waveform_samples; ++s) {
-                float amp = clip.waveform[s];
+                float amp = node.waveform[s];
                 float norm = float(s) / waveform_samples;
-                float x = clip_rect_min.x + norm * (clip_rect_max.x - clip_rect_min.x);
+                float x = node_rect_min.x + norm * (node_rect_max.x - node_rect_min.x);
                 float height = max_height * amp;
                 
                 // Gradient color based on amplitude
@@ -1298,72 +1299,72 @@ void DrawTimelineEditor(
 
 
         // Selection highlight with accent color
-        if (&clip == selected_clip) {
+        if (&node == selected_node) {
             // Highlight with orange accent color from theme
             draw_list->AddRect(
-                clip_rect_min, 
-                clip_rect_max, 
+                node_rect_min, 
+                node_rect_max, 
                 col_accent,
                 4.0f, // Rounded corners
                 0,
                 2.0f  // Thicker line for selection
             );
-            clip.selected = true;
+            node.selected = true;
         } else {
-            clip.selected = false;
+            node.selected = false;
         }
 
         // Selection
-        if (!resizing_left && !resizing_right && dragging_clip_index == -1 &&
-            ImGui::IsMouseHoveringRect(clip_rect_min, clip_rect_max) && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-            selected_clip = &clip;
-            clicked_on_clip = true;
+        if (!resizing_left && !resizing_right && dragging_node_index == -1 &&
+            ImGui::IsMouseHoveringRect(node_rect_min, node_rect_max) && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            selected_node = &node;
+            clicked_on_node = true;
         }
 
-        // Deselect if clicked outside any clips
-        if (!clicked_on_clip && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && ImGui::IsWindowHovered()) {
-            selected_clip = nullptr;
+        // Deselect if clicked outside any nodes
+        if (!clicked_on_node && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && ImGui::IsWindowHovered()) {
+            selected_node = nullptr;
         }
 
-        // Clip dragging
-        ImVec2 drag_area_start = ImVec2(clip_start_x + 10.0f, clip_rect_min.y);
-        ImVec2 drag_area_end = ImVec2(clip_end_x - 10.0f, clip_rect_max.y);
+        // Node dragging
+        ImVec2 drag_area_start = ImVec2(node_start_x + 10.0f, node_rect_min.y);
+        ImVec2 drag_area_end = ImVec2(node_end_x - 10.0f, node_rect_max.y);
         ImGui::SetCursorScreenPos(drag_area_start);
-        ImGui::InvisibleButton(("clip_drag" + std::to_string(i)).c_str(), ImVec2(drag_area_end.x - drag_area_start.x, drag_area_end.y - drag_area_start.y));
+        ImGui::InvisibleButton(("node_drag" + std::to_string(i)).c_str(), ImVec2(drag_area_end.x - drag_area_start.x, drag_area_end.y - drag_area_start.y));
 
         if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
 
         if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
-            if (dragging_clip_index == -1) {
-                dragging_clip_index = i;
+            if (dragging_node_index == -1) {
+                dragging_node_index = i;
                 float mouse_x = ImGui::GetMousePos().x;
-                drag_offset_time = (mouse_x - clip_start_x) / pixels_per_second;
+                drag_offset_time = (mouse_x - node_start_x) / pixels_per_second;
             }
 
-            if (dragging_clip_index == i) {
+            if (dragging_node_index == i) {
                 float mouse_x = ImGui::GetMousePos().x;
                 float new_start = (mouse_x - timeline_start.x) / pixels_per_second - drag_offset_time;
                 new_start = std::max(0.0f, new_start);
-                float old_start = clip.start_time;
-                clip.start_time = new_start;
+                float old_start = node.start_time;
+                node.start_time = new_start;
 
-                // Sync linked clip's start_time if it's not actively being dragged or resized
-                if (clip.linked_clip && clip.linked_clip != selected_clip) {
+                // Sync linked node's start_time if it's not actively being dragged or resized
+                if (node.linked_node && node.linked_node != selected_node) {
                     float delta = new_start - old_start;
-                    clip.linked_clip->start_time += delta;
+                    node.linked_node->start_time += delta;
                 }
             }
-        } else if (dragging_clip_index == i) {
-            dragging_clip_index = -1;
+        } else if (dragging_node_index == i) {
+            dragging_node_index = -1;
         }
 
         // Left resizing
         float handle_w = 6.0f;
-        ImVec2 left_min = ImVec2(clip_start_x - handle_w / 2, clip_rect_min.y);
-        ImVec2 left_max = ImVec2(clip_start_x + handle_w / 2, clip_rect_max.y);
+        ImVec2 left_min = ImVec2(node_start_x - handle_w / 2, node_rect_min.y);
+        ImVec2 left_max = ImVec2(node_start_x + handle_w / 2, node_rect_max.y);
 
         ImGui::SetCursorScreenPos(left_min);
-        ImGui::InvisibleButton(("clip_resize_L" + std::to_string(i)).c_str(), ImVec2(handle_w, clip_rect_max.y - clip_rect_min.y));
+        ImGui::InvisibleButton(("node_resize_L" + std::to_string(i)).c_str(), ImVec2(handle_w, node_rect_max.y - node_rect_min.y));
         if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
 
         if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
@@ -1371,25 +1372,25 @@ void DrawTimelineEditor(
                 resizing_left = true;
                 float mouse_x = ImGui::GetMousePos().x;
                 float new_start = (mouse_x - timeline_start.x) / pixels_per_second;
-                float new_duration = clip.start_time + clip.duration - new_start;
-                float delta = new_start - clip.start_time;
-                if (delta > 0.0f) clip.media_start += delta;
-                clip.start_time = std::max(0.0f, new_start);
-                clip.duration = std::max(0.1f, new_duration);
+                float new_duration = node.start_time + node.duration - new_start;
+                float delta = new_start - node.start_time;
+                if (delta > 0.0f) node.media_start += delta;
+                node.start_time = std::max(0.0f, new_start);
+                node.duration = std::max(0.1f, new_duration);
 
-                if (clip.linked_clip && clip.linked_clip != selected_clip) {
-                    clip.linked_clip->start_time += delta;
-                    clip.linked_clip->duration = clip.duration;
+                if (node.linked_node && node.linked_node != selected_node) {
+                    node.linked_node->start_time += delta;
+                    node.linked_node->duration = node.duration;
                 }
             }
         } else if (resizing_left) resizing_left = false;
 
         // Right resizing
-        ImVec2 right_min = ImVec2(clip_end_x - handle_w / 2, clip_rect_min.y);
-        ImVec2 right_max = ImVec2(clip_end_x + handle_w / 2, clip_rect_max.y);
+        ImVec2 right_min = ImVec2(node_end_x - handle_w / 2, node_rect_min.y);
+        ImVec2 right_max = ImVec2(node_end_x + handle_w / 2, node_rect_max.y);
 
         ImGui::SetCursorScreenPos(right_min);
-        ImGui::InvisibleButton(("clip_resize_R" + std::to_string(i)).c_str(), ImVec2(handle_w, clip_rect_max.y - clip_rect_min.y));
+        ImGui::InvisibleButton(("node_resize_R" + std::to_string(i)).c_str(), ImVec2(handle_w, node_rect_max.y - node_rect_min.y));
         if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
 
         if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
@@ -1397,31 +1398,31 @@ void DrawTimelineEditor(
                 resizing_right = true;
                 float mouse_x = ImGui::GetMousePos().x;
                 float new_end = (mouse_x - timeline_start.x) / pixels_per_second;
-                float old_duration = clip.duration;
-                clip.duration = std::max(0.1f, new_end - clip.start_time);
+                float old_duration = node.duration;
+                node.duration = std::max(0.1f, new_end - node.start_time);
 
-                float delta = clip.duration - old_duration;
-                if (clip.linked_clip && clip.linked_clip != selected_clip) {
-                    clip.linked_clip->duration += delta;
+                float delta = node.duration - old_duration;
+                if (node.linked_node && node.linked_node != selected_node) {
+                    node.linked_node->duration += delta;
                 }
             }
         } else if (resizing_right) resizing_right = false;
 
         // Create unique ID and hit area for context menu
-        ImGui::SetCursorScreenPos(clip_rect_min);
-        ImGui::InvisibleButton(("clip_context" + std::to_string(i)).c_str(), 
-                            ImVec2(clip_rect_max.x - clip_rect_min.x, clip_rect_max.y - clip_rect_min.y));
+        ImGui::SetCursorScreenPos(node_rect_min);
+        ImGui::InvisibleButton(("node_context" + std::to_string(i)).c_str(), 
+                            ImVec2(node_rect_max.x - node_rect_min.x, node_rect_max.y - node_rect_min.y));
 
         // Context menu for linking with themed style
-        if (ImGui::BeginPopupContextItem(("clip_context" + std::to_string(i)).c_str())) {
+        if (ImGui::BeginPopupContextItem(("node_context" + std::to_string(i)).c_str())) {
             ImGui::PushStyleColor(ImGuiCol_Text, text);
             ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(accent.x, accent.y, accent.z, 0.55f));
             ImGui::PushStyleColor(ImGuiCol_HeaderHovered, accent_hover);
             ImGui::PushStyleColor(ImGuiCol_HeaderActive, accent_active);
             
-            if (clip.linked_clip && ImGui::MenuItem("Unlink Audio/Video")) {
-                clip.linked_clip->linked_clip = nullptr;
-                clip.linked_clip = nullptr;
+            if (node.linked_node && ImGui::MenuItem("Unlink Audio/Video")) {
+                node.linked_node->linked_node = nullptr;
+                node.linked_node = nullptr;
             }
             
             ImGui::PopStyleColor(4);
@@ -1511,7 +1512,7 @@ void DrawTimelineEditor(
     }
 
     // Clicking anywhere to move playhead (only within timeline area)
-    if (!clicked_on_clip && ImGui::IsWindowHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+    if (!clicked_on_node && ImGui::IsWindowHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
         ImVec2 mouse = ImGui::GetMousePos();
         if (mouse.y > timeline_start.y && mouse.y < timeline_end.y && 
             mouse.x > timeline_start.x && mouse.x < timeline_end.x) {
