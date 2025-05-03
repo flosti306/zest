@@ -506,3 +506,153 @@ void LUTColorGradingNode::Process(const EffectContext& ctx) {
     glUseProgram(0);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }
+
+bool MaskEffectNode::loadMaskTexture(const std::string& path) {
+    if (mask_texture != 0) {
+        glDeleteTextures(1, &mask_texture);
+        mask_texture = 0;
+    }
+    mask_texture_path = ""; // Clear path initially
+
+    SDL_Surface* surface = IMG_Load(path.c_str()); // Use IMG_Load for flexibility
+    if (!surface) {
+        std::cerr << "Failed to load mask texture image: " << path << " - " << SDL_GetError() << std::endl;
+        return false;
+    }
+
+    // Prefer grayscale or single channel if possible, otherwise RGBA/RGB
+    SDL_Surface* converted_surface = nullptr;
+    GLenum gl_format = GL_RGB; // Default
+    GLint gl_internal_format = GL_RGB8; // Request 8-bit internal format
+
+    // Check if already grayscale (approximation)
+    if (surface->format == SDL_PIXELFORMAT_INDEX8 || surface->format == SDL_PIXELFORMAT_RGB332) {
+         // Try converting to a single channel format like GL_R8 if supported, or stick to RGB/RGBA
+         // For simplicity, let's convert to RGBA and use the Red channel in the shader
+        converted_surface = SDL_ConvertSurface(surface, SDL_PIXELFORMAT_RGBA32);
+        gl_format = GL_RGBA;
+        gl_internal_format = GL_RGBA8;
+    } else if (SDL_ISPIXELFORMAT_ALPHA(surface->format)) {
+        converted_surface = SDL_ConvertSurface(surface, SDL_PIXELFORMAT_RGBA32);
+        gl_format = GL_RGBA;
+        gl_internal_format = GL_RGBA8;
+    } else {
+        converted_surface = SDL_ConvertSurface(surface, SDL_PIXELFORMAT_RGB24);
+        gl_format = GL_RGB;
+        gl_internal_format = GL_RGB8;
+    }
+
+    SDL_DestroySurface(surface); // Free original
+
+    if (!converted_surface) {
+        std::cerr << "Failed to convert mask texture image to required format: " << path << " - " << SDL_GetError() << std::endl;
+        return false;
+    }
+
+    glGenTextures(1, &mask_texture);
+    glBindTexture(GL_TEXTURE_2D, mask_texture);
+    glTexImage2D(GL_TEXTURE_2D, 0, gl_internal_format, converted_surface->w, converted_surface->h, 0, gl_format, GL_UNSIGNED_BYTE, converted_surface->pixels);
+
+    GLenum err = glGetError();
+    if (err != GL_NO_ERROR) {
+         std::cerr << "OpenGL Error (" << err << ") loading mask texture: " << path << std::endl;
+         glDeleteTextures(1, &mask_texture);
+         mask_texture = 0;
+         SDL_DestroySurface(converted_surface);
+         return false;
+    }
+
+    // Generate mipmaps for potential smoother feathering via sampling if needed
+    glGenerateMipmap(GL_TEXTURE_2D);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    glBindTexture(GL_TEXTURE_2D, 0);
+    SDL_DestroySurface(converted_surface);
+
+    mask_texture_path = path; // Store path on success
+    std::cout << "Loaded mask texture: " << path << " (ID: " << mask_texture << ")" << std::endl;
+    return true;
+}
+
+
+// NEW: Implementation for MaskEffectNode::Process
+void MaskEffectNode::Process(const EffectContext& ctx) {
+    if (!enabled || ctx.input_texture == 0 || mask_type == MaskType::None)
+        return; // Don't process if disabled, no input, or mask type is None
+
+    // Load shader program (consider caching)
+    // We'll need a dedicated mask shader
+    GLuint mask_program = LoadShaderProgram("shaders/mask.vert", "shaders/mask.frag");
+    if (mask_program == 0)
+        return;
+
+    // Setup render state
+    glBindFramebuffer(GL_FRAMEBUFFER, ctx.output_fbo);
+    glViewport(0, 0, (int)ctx.resolution.x, (int)ctx.resolution.y);
+    // Don't clear here, assume previous effect or clip rendered content
+
+    glUseProgram(mask_program);
+
+    // Set common uniforms
+    glUniform1i(glGetUniformLocation(mask_program, "u_MaskType"), static_cast<int>(mask_type));
+    glUniform1i(glGetUniformLocation(mask_program, "u_Invert"), invert);
+    glUniform1f(glGetUniformLocation(mask_program, "u_Feather"), feather);
+    glUniform2f(glGetUniformLocation(mask_program, "u_Resolution"), ctx.resolution.x, ctx.resolution.y);
+
+    // Set type-specific uniforms
+    switch (mask_type) {
+        case MaskType::Rectangle:
+            glUniform2f(glGetUniformLocation(mask_program, "u_RectCenter"), rect_center.x, rect_center.y);
+            glUniform2f(glGetUniformLocation(mask_program, "u_RectSize"), rect_size.x, rect_size.y);
+            glUniform1f(glGetUniformLocation(mask_program, "u_RectRotation"), glm::radians(rect_rotation)); // Pass radians
+            break;
+        case MaskType::Circle:
+            glUniform2f(glGetUniformLocation(mask_program, "u_CircleCenter"), circle_center.x, circle_center.y);
+            glUniform1f(glGetUniformLocation(mask_program, "u_CircleRadius"), circle_radius);
+            break;
+        case MaskType::Texture:
+            if (mask_texture == 0) { // No texture loaded/created
+                glUseProgram(0);
+                glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                std::cerr << "Mask effect enabled with Texture type, but no mask texture is loaded." << std::endl;
+                // Maybe default to passthrough or full mask? For now, just skip processing.
+                 // To render passthrough: Copy input to output (or just return if this is the last effect)
+                 // For now, just return, leaving the previous buffer content unchanged
+                 // This might be wrong if it's an intermediate step.
+                 // A safer bet is to copy input to output here if mask_texture is 0.
+                return;
+            }
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D, mask_texture);
+            glUniform1i(glGetUniformLocation(mask_program, "u_MaskTexture"), 1);
+            break;
+        case MaskType::None: // Should have been caught earlier, but handle defensively
+             glUseProgram(0);
+             glBindFramebuffer(GL_FRAMEBUFFER, 0);
+             return; // No masking needed
+        // case MaskType::Smart: // Placeholder
+        //     // Uniforms for smart mask data (if implemented)
+        //     break;
+    }
+
+    // Bind input texture (the image/video to be masked)
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, ctx.input_texture);
+    glUniform1i(glGetUniformLocation(mask_program, "u_Texture"), 0);
+
+    // Draw fullscreen quad
+    RenderFullscreenQuad(); // Uses the modern VAO approach
+
+    // Cleanup
+    glUseProgram(0);
+    // Unbind mask texture if it was bound
+    if (mask_type == MaskType::Texture) {
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glActiveTexture(GL_TEXTURE0); // Reset active texture unit
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}

@@ -40,6 +40,8 @@ extern "C" {
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_video.h>
 #include <SDL3/SDL_image.h> // Use SDL_image for SDL3
+#include <glm/glm.hpp> // For vec2, vec3 etc.
+#include <glm/gtc/matrix_transform.hpp> // For ortho
 
 // Project headers
 #include "video_export.hpp" // Include AFTER system headers and glad/imgui
@@ -68,6 +70,18 @@ int export_fps = 30;
 Clip* selected_clip = nullptr; // Keep track of selected clip
 
 bool show_thumbs = false;
+
+// --- Mask Drawing Editor State ---
+static bool mask_editor_open = false;
+static MaskEffectNode* current_editing_mask_node = nullptr;
+static GLuint mask_draw_fbo = 0;
+static GLuint mask_draw_texture = 0;
+static int mask_draw_width = 0;  // Will be set based on preview size
+static int mask_draw_height = 0;
+static float mask_brush_size = 20.0f; // In pixels
+static glm::vec3 mask_brush_color = glm::vec3(1.0f, 1.0f, 1.0f); // White = paint mask
+static bool mask_needs_apply = false; // Flag if drawing occurred
+static GLuint background_clip_texture_id = 0; // Texture of the clip being masked
 
 // Error checking macros
 #define CHECK_AV_ERROR(ret, message) \
@@ -426,13 +440,384 @@ float get_video_duration(const std::string& input_path) {
     return duration;
 }
 
+// Helper to create/resize the drawing FBO/Texture
+bool setup_mask_draw_buffer(int width, int height) {
+    if (width <= 0 || height <= 0) return false;
+
+    // Cleanup existing if dimensions change
+    if (mask_draw_fbo != 0 && (width != mask_draw_width || height != mask_draw_height)) {
+        glDeleteFramebuffers(1, &mask_draw_fbo);
+        glDeleteTextures(1, &mask_draw_texture);
+        mask_draw_fbo = 0;
+        mask_draw_texture = 0;
+        std::cout << "Recreating mask draw buffer due to size change." << std::endl;
+    }
+
+    mask_draw_width = width;
+    mask_draw_height = height;
+
+    if (mask_draw_fbo == 0) {
+        glGenFramebuffers(1, &mask_draw_fbo);
+        glGenTextures(1, &mask_draw_texture);
+
+        glBindTexture(GL_TEXTURE_2D, mask_draw_texture);
+        // Use RGB8 for simple white/black/gray drawing
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+        glBindFramebuffer(GL_FRAMEBUFFER, mask_draw_fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, mask_draw_texture, 0);
+
+        GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+        if (status != GL_FRAMEBUFFER_COMPLETE) {
+            std::cerr << "Mask Draw Framebuffer incomplete! Status: " << status << std::endl;
+            glDeleteFramebuffers(1, &mask_draw_fbo);
+            glDeleteTextures(1, &mask_draw_texture);
+            mask_draw_fbo = 0;
+            mask_draw_texture = 0;
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            return false;
+        }
+         glBindFramebuffer(GL_FRAMEBUFFER, 0);
+         std::cout << "Mask draw buffer created (" << width << "x" << height << ")" << std::endl;
+
+         // --- Initial Clear ---
+         // Clear the texture to a neutral state (e.g., black = transparent mask)
+         // Or potentially initialize from the node's existing texture if it exists?
+         // For simplicity, clear to black.
+         GLint last_fbo; glGetIntegerv(GL_FRAMEBUFFER_BINDING, &last_fbo);
+         glBindFramebuffer(GL_FRAMEBUFFER, mask_draw_fbo);
+         glViewport(0,0, width, height);
+         glClearColor(0.0f, 0.0f, 0.0f, 1.0f); // Clear to black
+         glClear(GL_COLOR_BUFFER_BIT);
+         glBindFramebuffer(GL_FRAMEBUFFER, last_fbo); // Restore previous FBO
+         // Restore viewport? Assumes caller will set it later.
+    }
+    return true;
+}
+
+// Helper to clean up resources when editor closes
+void cleanup_mask_draw_buffer() {
+    if (mask_draw_fbo != 0) {
+        glDeleteFramebuffers(1, &mask_draw_fbo);
+        mask_draw_fbo = 0;
+    }
+    if (mask_draw_texture != 0) {
+        glDeleteTextures(1, &mask_draw_texture);
+        mask_draw_texture = 0;
+    }
+    mask_draw_width = 0;
+    mask_draw_height = 0;
+    current_editing_mask_node = nullptr;
+    background_clip_texture_id = 0;
+    std::cout << "Mask draw buffer cleaned up." << std::endl;
+}
+
+// Function to open the editor
+void OpenMaskEditor(MaskEffectNode* node, GLuint clip_texture_for_background) {
+     if (!node) return;
+     // Setup buffer with current preview dimensions
+     if (!setup_mask_draw_buffer(preview_width, preview_height)) {
+         tinyfd_messageBox("Error", "Could not create mask drawing buffer.", "ok", "error", 1);
+         return;
+     }
+     current_editing_mask_node = node;
+     background_clip_texture_id = clip_texture_for_background; // Store the background
+     mask_editor_open = true;
+     mask_needs_apply = false; // Reset apply flag
+
+     // Optional: Initialize the drawing buffer with the node's current mask texture if it exists
+     if (node->mask_texture != 0) {
+         // This requires ensuring the node's texture is the same size as the draw buffer
+         // Or resampling. For simplicity, we start fresh by clearing.
+         // If you want to load previous drawing:
+         // 1. Check if node->mask_texture exists and has size mask_draw_width/height
+         // 2. If so, copy node->mask_texture to mask_draw_texture using FBO blit or glCopyTexSubImage2D
+         // Otherwise, clear as done in setup_mask_draw_buffer.
+     }
+}
+
+// Function to draw a brush stroke (using immediate mode OpenGL for simplicity)
+void DrawBrushStroke(glm::vec2 uv, float brush_size_pixels, glm::vec3 color) {
+    if (!mask_draw_fbo || mask_draw_width <= 0 || mask_draw_height <= 0) return;
+
+    // Backup GL state
+    GLint last_viewport[4]; glGetIntegerv(GL_VIEWPORT, last_viewport);
+    GLint last_fbo; glGetIntegerv(GL_FRAMEBUFFER_BINDING, &last_fbo);
+    // GLboolean last_blend = glIsEnabled(GL_BLEND);
+    // GLboolean last_texture = glIsEnabled(GL_TEXTURE_2D);
+    // GLboolean last_depth = glIsEnabled(GL_DEPTH_TEST);
+
+    // Setup for drawing into FBO
+    glBindFramebuffer(GL_FRAMEBUFFER, mask_draw_fbo);
+    glViewport(0, 0, mask_draw_width, mask_draw_height);
+
+    // Simple Ortho projection matching buffer dimensions
+    glMatrixMode(GL_PROJECTION);
+    glPushMatrix();
+    glLoadIdentity();
+    glOrtho(0.0, mask_draw_width, mask_draw_height, 0.0, -1.0, 1.0); // Top-left origin
+
+    glMatrixMode(GL_MODELVIEW);
+    glPushMatrix();
+    glLoadIdentity();
+
+    // Disable things we don't need
+    glDisable(GL_TEXTURE_2D);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_BLEND); // Overwrite with solid color
+
+    // Convert UV to pixel coordinates
+    float px = uv.x * mask_draw_width;
+    float py = uv.y * mask_draw_height;
+    float radius = brush_size_pixels * 0.5f;
+
+    // Draw a simple circle using a triangle fan
+    int num_segments = 20;
+    glColor3f(color.r, color.g, color.b);
+    glBegin(GL_TRIANGLE_FAN);
+    glVertex2f(px, py); // Center
+    for (int i = 0; i <= num_segments; i++) {
+        float angle = i * (2.0f * M_PI / num_segments);
+        glVertex2f(px + cos(angle) * radius, py + sin(angle) * radius);
+    }
+    glEnd();
+
+    // Restore GL State
+    glMatrixMode(GL_PROJECTION);
+    glPopMatrix();
+    glMatrixMode(GL_MODELVIEW);
+    glPopMatrix();
+
+    glBindFramebuffer(GL_FRAMEBUFFER, last_fbo);
+    glViewport(last_viewport[0], last_viewport[1], last_viewport[2], last_viewport[3]);
+    // if (last_blend) glEnable(GL_BLEND);
+    // if (last_texture) glEnable(GL_TEXTURE_2D);
+    // if (last_depth) glEnable(GL_DEPTH_TEST);
+    // glColor4f(1,1,1,1); // Reset color
+
+    mask_needs_apply = true; // Mark that we've drawn something
+}
+
+// Function to apply the drawn mask to the node's texture
+bool ApplyDrawnMask() {
+    if (!current_editing_mask_node || !mask_draw_fbo || !mask_draw_texture || mask_draw_width <= 0 || mask_draw_height <= 0) {
+        std::cerr << "ApplyDrawnMask: Invalid state." << std::endl;
+        return false;
+    }
+
+    // --- Ensure the target node's texture exists and matches size ---
+    bool texture_created_or_resized = false;
+    // Check if texture exists
+    if (current_editing_mask_node->mask_texture == 0) {
+        glGenTextures(1, &current_editing_mask_node->mask_texture);
+        texture_created_or_resized = true;
+        std::cout << "Generated mask texture ID " << current_editing_mask_node->mask_texture << " for node." << std::endl;
+    } else {
+        // Optional: Check if size matches, recreate if not (more robust)
+        GLint existing_width = 0, existing_height = 0;
+        glBindTexture(GL_TEXTURE_2D, current_editing_mask_node->mask_texture);
+        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &existing_width);
+        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &existing_height);
+        glBindTexture(GL_TEXTURE_2D, 0); // Unbind after checking
+        if (existing_width != mask_draw_width || existing_height != mask_draw_height) {
+            std::cout << "Resizing node mask texture from " << existing_width << "x" << existing_height
+                      << " to " << mask_draw_width << "x" << mask_draw_height << std::endl;
+            texture_created_or_resized = true; // Need to re-init texture image
+        }
+    }
+
+    // Initialize or re-initialize texture image if needed
+    if (texture_created_or_resized) {
+        glBindTexture(GL_TEXTURE_2D, current_editing_mask_node->mask_texture);
+        // Use RGB8 format matching the drawing buffer
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, mask_draw_width, mask_draw_height, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glBindTexture(GL_TEXTURE_2D, 0);
+    }
+
+    // --- Create a temporary FBO for the destination texture ---
+    GLuint dest_fbo = 0;
+    glGenFramebuffers(1, &dest_fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, dest_fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, current_editing_mask_node->mask_texture, 0);
+
+    GLenum dest_status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (dest_status != GL_FRAMEBUFFER_COMPLETE) {
+        std::cerr << "ApplyDrawnMask: Destination FBO incomplete! Status: " << dest_status << std::endl;
+        glBindFramebuffer(GL_FRAMEBUFFER, 0); // Unbind potentially incomplete FBO
+        glDeleteFramebuffers(1, &dest_fbo);
+        return false;
+    }
+    // Destination FBO is ready and bound to GL_FRAMEBUFFER
+
+    // --- Perform the Blit with Vertical Flip ---
+    GLint last_read_fbo, last_draw_fbo;
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &last_read_fbo);
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &last_draw_fbo);
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, mask_draw_fbo); // Source: our drawing buffer
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dest_fbo);      // Destination: the temp FBO for the node's texture
+
+    // Blit operation with flip:
+    // Source rectangle: (0, 0) bottom-left to (w, h) top-right
+    // Dest rectangle:   (0, h) top-left   to (w, 0) bottom-right
+    // This vertical flip aligns the top-left drawing origin with OpenGL's bottom-left texture origin.
+    glBlitFramebuffer(
+        0, 0, mask_draw_width, mask_draw_height, // Source Rect (x0, y0, x1, y1)
+        0, mask_draw_height, mask_draw_width, 0, // Dest Rect -> FLIPS Y-AXIS!
+        GL_COLOR_BUFFER_BIT,                     // Mask (copy color)
+        GL_NEAREST                               // Filter (Nearest is fine for exact copy)
+    );
+
+    GLenum err = glGetError();
+    if (err != GL_NO_ERROR) {
+        std::cerr << "OpenGL Error (" << err << ") during glBlitFramebuffer!" << std::endl;
+         // Restore bindings before returning
+         glBindFramebuffer(GL_READ_FRAMEBUFFER, last_read_fbo);
+         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, last_draw_fbo);
+         glDeleteFramebuffers(1, &dest_fbo); // Clean up temp dest FBO
+        return false;
+    }
+
+    // --- Restore state and Cleanup ---
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, last_read_fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, last_draw_fbo);
+    glDeleteFramebuffers(1, &dest_fbo); // Clean up temp dest FBO
+
+    current_editing_mask_node->mask_texture_path = ""; // Mark as drawn, not file-based
+    current_editing_mask_node->mask_type = MaskEffectNode::MaskType::Texture; // Ensure type is set
+    mask_needs_apply = false;
+    std::cout << "Applied drawn mask (flipped) to node texture ID: " << current_editing_mask_node->mask_texture << std::endl;
+    return true;
+}
+
+// --- The Editor Window Drawing Function ---
+// Call this function from your main loop if mask_editor_open is true
+void DrawMaskEditorWindow(GLResources& res) { // Pass GLResources if needed later
+    if (!mask_editor_open || !current_editing_mask_node) {
+        cleanup_mask_draw_buffer(); // Clean up if node became null somehow
+        mask_editor_open = false;
+        return;
+    }
+
+    ImGui::SetNextWindowSize(ImVec2(600, 700), ImGuiCond_FirstUseEver); // Decent default size
+    if (ImGui::Begin("Mask Drawing Editor", &mask_editor_open)) {
+
+         // --- Draw Controls ---
+         ImGui::Text("Editing Mask for Effect: %s", current_editing_mask_node->name.c_str());
+         ImGui::Separator();
+
+         ImGui::SliderFloat("Brush Size", &mask_brush_size, 1.0f, 100.0f, "%.0f pixels");
+
+         if (ImGui::RadioButton("Paint (White)", mask_brush_color.r > 0.5f)) {
+             mask_brush_color = glm::vec3(1.0f, 1.0f, 1.0f);
+         }
+         ImGui::SameLine();
+         if (ImGui::RadioButton("Erase (Black)", mask_brush_color.r < 0.5f)) {
+             mask_brush_color = glm::vec3(0.0f, 0.0f, 0.0f);
+         }
+         ImGui::SameLine();
+         // Optional: Clear button
+         if (ImGui::Button("Clear")) {
+             GLint last_fbo; glGetIntegerv(GL_FRAMEBUFFER_BINDING, &last_fbo);
+             glBindFramebuffer(GL_FRAMEBUFFER, mask_draw_fbo);
+             glViewport(0,0, mask_draw_width, mask_draw_height);
+             glClearColor(0.0f, 0.0f, 0.0f, 1.0f); // Clear to black
+             glClear(GL_COLOR_BUFFER_BIT);
+             glBindFramebuffer(GL_FRAMEBUFFER, last_fbo);
+             mask_needs_apply = true; // Need to apply the clear
+         }
+
+         ImGui::Separator();
+
+         // --- Drawing Canvas ---
+         ImGui::Text("Canvas:");
+         ImVec2 canvas_pos = ImGui::GetCursorScreenPos();
+         ImVec2 canvas_size = ImGui::GetContentRegionAvail();
+         // Try to maintain aspect ratio of the drawing buffer
+         float aspect = (float)mask_draw_width / (float)mask_draw_height;
+         if (canvas_size.x / aspect <= canvas_size.y) {
+             canvas_size.y = canvas_size.x / aspect;
+         } else {
+             canvas_size.x = canvas_size.y * aspect;
+         }
+         canvas_size.x = std::max(canvas_size.x, 50.0f); // Min size
+         canvas_size.y = std::max(canvas_size.y, 50.0f);
+
+         // Display the current state of the mask texture
+         ImGui::Image((ImTextureID)(intptr_t)mask_draw_texture, canvas_size, ImVec2(0, 1), ImVec2(1, 0)); // Flip UVs for display
+
+         // Use InvisibleButton to capture input over the image area
+         ImGui::SetCursorScreenPos(canvas_pos); // Reset cursor pos to overlay button correctly
+         ImGui::InvisibleButton("##mask_canvas", canvas_size);
+
+         ImVec2 canvas_min = ImGui::GetItemRectMin(); // Top-left of the canvas area in screen coords
+         ImVec2 canvas_max = ImGui::GetItemRectMax(); // Bottom-right
+
+         // Handle drawing input if hovering over the canvas
+         if (ImGui::IsItemHovered()) {
+             ImGui::SetMouseCursor(ImGuiMouseCursor_Hand); // Indicate drawable area
+             if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                 ImVec2 mouse_pos_abs = ImGui::GetMousePos();
+                 ImVec2 mouse_pos_rel = ImVec2(mouse_pos_abs.x - canvas_min.x, mouse_pos_abs.y - canvas_min.y);
+
+                 // Convert relative pixel position to UV coordinates [0, 1]
+                 glm::vec2 uv = glm::vec2(mouse_pos_rel.x / canvas_size.x, mouse_pos_rel.y / canvas_size.y);
+
+                 // Clamp UVs (optional, prevents drawing outside if mouse slips)
+                 uv.x = std::max(0.0f, std::min(1.0f, uv.x));
+                 uv.y = std::max(0.0f, std::min(1.0f, uv.y));
+
+                 // Draw the stroke
+                 DrawBrushStroke(uv, mask_brush_size, mask_brush_color);
+             }
+         }
+
+         // --- Apply Button ---
+         ImGui::Separator();
+         bool applied_this_frame = false;
+        if (ImGui::Button("Apply Mask")) {
+                applied_this_frame = ApplyDrawnMask(); // ApplyDrawnMask now returns bool
+                if (applied_this_frame) {
+                    tinyfd_messageBox("Success", "Mask applied.", "ok", "info", 1);
+                } else {
+                    tinyfd_messageBox("Error", "Failed to apply mask.", "ok", "error", 1);
+                }
+        }
+         ImGui::SameLine();
+         if (ImGui::Button("Close")) {
+             mask_editor_open = false;
+             // Optional: Ask if user wants to apply changes if mask_needs_apply is true
+         }
+         if (mask_needs_apply) {
+             ImGui::SameLine();
+             ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "Changes not applied!");
+         }
+
+    }
+    ImGui::End();
+
+    // If window was closed by user, cleanup
+    if (!mask_editor_open) {
+        // Optional: Prompt to save/apply if mask_needs_apply is true
+        cleanup_mask_draw_buffer();
+    }
+}
+
 // --- Forward Declarations ---
 template<typename T>
 void DrawKeyframeTrackEditor(const std::string& label, KeyframeTrack<T>& track);
 void DrawTimelineEditor(std::vector<Clip>& clips, float& playhead_time, float& max_duration, float& zoom_factor, std::atomic<bool>& layers_changed, Clip*& selected_clip, GLResources& res);
 void UpdatePreview(GLResources& res, const std::vector<Clip>& sorted_clips, int width, int height, float playhead_time, bool force_update);
 void RenderPreviewWindow(GLuint preview_tex, int preview_width, int preview_height);
-void DrawEffectUIForClip(Clip& clip);
+void DrawEffectUIForClip(Clip& clip, GLResources& gl_resources);
 
 // --- Main Application ---
 int main(int argc, char* argv[]) {
@@ -743,6 +1128,10 @@ int main(int argc, char* argv[]) {
 
         DrawTimelineEditor(clips, playhead_time, max_duration, zoom_factor, layers_changed, selected_clip, gl_resources);
 
+        if (mask_editor_open) {
+            DrawMaskEditorWindow(gl_resources); // Pass gl_resources if needed inside editor
+        }
+
         bool force_preview_update = layers_changed.load();
         if (force_preview_update || std::abs(playhead_time - last_preview_update_time) > PREVIEW_UPDATE_INTERVAL) {
             std::vector<Clip> sorted_clips = clips;
@@ -783,7 +1172,7 @@ int main(int argc, char* argv[]) {
             DrawKeyframeTrackEditor("Rotation Keyframes", selected_clip->rotation_track);
             DrawKeyframeTrackEditor("Scale Keyframes", selected_clip->scale_track);
             ImGui::SeparatorText("Effects");
-            DrawEffectUIForClip(*selected_clip);
+            DrawEffectUIForClip(*selected_clip, gl_resources);
             if (changed) {
                 layers_changed = true;
                 if (selected_clip->linked_clip) {
@@ -1584,7 +1973,7 @@ void DrawKeyframeTrackEditor(const std::string& label, KeyframeTrack<T>& track) 
     }
 }
 
-void DrawEffectUIForClip(Clip& clip) {
+void DrawEffectUIForClip(Clip& clip, GLResources& gl_resources) {
     if (!clip.effect_graph)
         clip.effect_graph = std::make_shared<EffectGraph>();
 
@@ -1612,8 +2001,14 @@ void DrawEffectUIForClip(Clip& clip) {
             lut->strength = 1.0f;
             clip.effect_graph->nodes.push_back(lut);
         }
+        if (ImGui::Button("Add Mask")) {
+            auto mask = std::make_shared<MaskEffectNode>();
+            // Default settings are set in constructor
+            clip.effect_graph->nodes.push_back(mask);
+        }
 
         for (size_t i = 0; i < clip.effect_graph->nodes.size(); ++i) {
+            bool effect_changed = false;
             auto& node = clip.effect_graph->nodes[i];
             ImGui::PushID(int(i));
             if (ImGui::TreeNode(node->name.c_str())) {
@@ -1632,6 +2027,87 @@ void DrawEffectUIForClip(Clip& clip) {
                     if (ImGui::Button("Load LUT")) {
                         const char* load_path = tinyfd_openFileDialog("Load Project", "", 1, NULL, "", 0);
                         if (load_path) lut->lut_path = load_path;
+                    }
+                } else if (auto mask = std::dynamic_pointer_cast<MaskEffectNode>(node)) {
+                    const char* mask_types[] = { "None", "Rectangle", "Circle", "Texture"/*, "Smart"*/ };
+                    int current_type = static_cast<int>(mask->mask_type);
+                    if (ImGui::Combo("Mask Type", &current_type, mask_types, IM_ARRAYSIZE(mask_types))) {
+                        mask->mask_type = static_cast<MaskEffectNode::MaskType>(current_type);
+                        effect_changed = true;
+                    }
+
+                    effect_changed |= ImGui::Checkbox("Invert Mask", &mask->invert);
+                    effect_changed |= ImGui::SliderFloat("Feather", &mask->feather, 0.0f, 0.5f, "%.3f"); // Adjust range as needed
+
+                    ImGui::Separator();
+
+                    switch (mask->mask_type) {
+                        case MaskEffectNode::MaskType::Rectangle:
+                            ImGui::Text("Rectangle Properties (Normalized)");
+                            effect_changed |= ImGui::SliderFloat2("Center##Rect", &mask->rect_center.x, 0.0f, 1.0f);
+                            effect_changed |= ImGui::SliderFloat2("Size##Rect", &mask->rect_size.x, 0.0f, 1.0f);
+                            effect_changed |= ImGui::SliderFloat("Rotation##Rect", &mask->rect_rotation, -180.0f, 180.0f);
+                            break;
+                        case MaskEffectNode::MaskType::Circle:
+                            ImGui::Text("Circle Properties (Normalized)");
+                            effect_changed |= ImGui::SliderFloat2("Center##Circle", &mask->circle_center.x, 0.0f, 1.0f);
+                            effect_changed |= ImGui::SliderFloat("Radius##Circle", &mask->circle_radius, 0.0f, 1.0f); // Radius relative to smaller dimension? Or just normalized? Let's stick to normalized for now.
+                            break;
+                        case MaskEffectNode::MaskType::Texture:
+                            ImGui::Text("Texture Mask Properties");
+                            if (ImGui::Button("Load Mask Texture")) {
+                                const char* filterPatterns[3] = { "*.png", "*.bmp", "*.jpg" }; // Allow common image formats
+                                const char* path = tinyfd_openFileDialog("Load Mask Texture", "", 3, filterPatterns, "Image Files", 0);
+                                if (path) {
+                                     if (mask->loadMaskTexture(path)) {
+                                         effect_changed = true;
+                                         if (current_editing_mask_node == mask.get()) cleanup_mask_draw_buffer();
+                                     } else {
+                                        tinyfd_messageBox("Error", "Failed to load mask texture.", "ok", "error", 1);
+                                     }
+                                }
+                            }
+                            ImGui::Text("Path: %s", mask->mask_texture_path.empty() ? "None" : mask->mask_texture_path.c_str());
+                             if (mask->mask_texture != 0) {
+                                 ImGui::Image((ImTextureID)(intptr_t)mask->mask_texture, ImVec2(64, 64), ImVec2(0, 0), ImVec2(1, 1), ImVec4(1,1,1,1), ImVec4(1,1,1,0.5)); // Show preview
+                             } else {
+                                 ImGui::TextColored(ImVec4(1,0,0,1), "No mask texture loaded!");
+                             }
+                            // TODO: Button "Create/Edit Drawn Mask" - opens a dedicated editor window
+                            if (ImGui::Button("Create/Edit Drawn Mask")) {
+                                // Need the clip's current texture for background guide
+                                GLuint bg_tex_id = 0;
+                                if (is_video_file(clip.path)) { // Assuming 'clip' is available here
+                                    auto vid_it = gl_resources.video_cache.find(clip.path); // Assuming gl_resources is available
+                                    if (vid_it != gl_resources.video_cache.end() && vid_it->second.is_initialized) {
+                                        bg_tex_id = vid_it->second.texture_id;
+                                    }
+                                } else {
+                                    auto img_it = gl_resources.texture_cache.find(clip.path);
+                                    if (img_it != gl_resources.texture_cache.end()) {
+                                        bg_tex_id = img_it->second;
+                                    }
+                                }
+                                if (bg_tex_id != 0) {
+                                   OpenMaskEditor(mask.get(), bg_tex_id);
+                                } else {
+                                    tinyfd_messageBox("Error", "Cannot open mask editor: Clip texture not available.", "ok", "warning", 1);
+                                }
+                           }
+
+                           ImGui::Text("Path: %s", mask->mask_texture_path.empty() ? "(Using Drawn Mask)" : mask->mask_texture_path.c_str());
+                            if (mask->mask_texture != 0) {
+                                ImGui::Image((ImTextureID)(intptr_t)mask->mask_texture, ImVec2(128, 128), ImVec2(0, 0), ImVec2(1, 1), ImVec4(1, 1, 1, 1), ImVec4(0, 0, 0, 0.5));
+                            } else {
+                                ImGui::TextColored(ImVec4(1,0,0,1), "No mask texture loaded!");
+                            }
+                           break; // End MaskType::Texture case
+                        // case MaskEffectNode::MaskType::Smart:
+                        //     ImGui::Text("Smart Mask (Not Implemented)");
+                        //     // UI for triggering smart mask generation/selection
+                        //     break;
+                        case MaskEffectNode::MaskType::None:
+                            break; // No specific controls needed
                     }
                 }
 

@@ -92,3 +92,47 @@ struct LUTColorGradingNode : public EffectNode {
     
     void Process(const EffectContext& ctx) override;
 };
+
+struct MaskEffectNode : public EffectNode {
+    enum class MaskType {
+        None,
+        Rectangle,
+        Circle,
+        Texture // For loaded images or drawn masks
+        // Smart (Future - placeholder)
+    };
+
+    MaskType mask_type = MaskType::Rectangle;
+    bool invert = false;
+    float feather = 0.05f; // Range [0.0, 1.0] - softness of the edge
+
+    // Rectangle parameters (normalized coordinates [0, 1])
+    glm::vec2 rect_center = glm::vec2(0.5f, 0.5f);
+    glm::vec2 rect_size = glm::vec2(0.5f, 0.5f);
+    float rect_rotation = 0.0f; // Degrees
+
+    // Circle parameters (normalized coordinates [0, 1])
+    glm::vec2 circle_center = glm::vec2(0.5f, 0.5f);
+    float circle_radius = 0.25f;
+
+    // Texture mask parameters
+    GLuint mask_texture = 0;
+    std::string mask_texture_path = ""; // For loading/saving
+
+    // TODO: Add parameters for drawing or smart mask if/when implemented
+
+    MaskEffectNode() {
+        name = "Mask";
+    }
+
+    ~MaskEffectNode() override {
+        if (mask_texture != 0) {
+            glDeleteTextures(1, &mask_texture);
+        }
+    }
+
+    // Function to load a texture mask
+    bool loadMaskTexture(const std::string& path);
+
+    void Process(const EffectContext& ctx) override;
+};
