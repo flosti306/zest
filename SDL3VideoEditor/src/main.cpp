@@ -45,6 +45,7 @@ extern "C" {
 #include "video_export.hpp" // Include AFTER system headers and glad/imgui
 #include "shared.hpp"
 #include "project_io.hpp"
+#include "effects.hpp"
 
 // Global gradient data storage (used by ApplyWindowBackgroundGradients)
 struct GradientData {
@@ -431,6 +432,7 @@ void DrawKeyframeTrackEditor(const std::string& label, KeyframeTrack<T>& track);
 void DrawTimelineEditor(std::vector<Clip>& clips, float& playhead_time, float& max_duration, float& zoom_factor, std::atomic<bool>& layers_changed, Clip*& selected_clip, GLResources& res);
 void UpdatePreview(GLResources& res, const std::vector<Clip>& sorted_clips, int width, int height, float playhead_time, bool force_update);
 void RenderPreviewWindow(GLuint preview_tex, int preview_width, int preview_height);
+void DrawEffectUIForClip(Clip& clip);
 
 // --- Main Application ---
 int main(int argc, char* argv[]) {
@@ -780,6 +782,8 @@ int main(int argc, char* argv[]) {
             DrawKeyframeTrackEditor("Position Y Keyframes", selected_clip->pos_y_track);
             DrawKeyframeTrackEditor("Rotation Keyframes", selected_clip->rotation_track);
             DrawKeyframeTrackEditor("Scale Keyframes", selected_clip->scale_track);
+            ImGui::SeparatorText("Effects");
+            DrawEffectUIForClip(*selected_clip);
             if (changed) {
                 layers_changed = true;
                 if (selected_clip->linked_clip) {
@@ -1577,5 +1581,72 @@ void DrawKeyframeTrackEditor(const std::string& label, KeyframeTrack<T>& track) 
         }
 
         ImGui::TreePop();
+    }
+}
+
+void DrawEffectUIForClip(Clip& clip) {
+    if (!clip.effect_graph)
+        clip.effect_graph = std::make_shared<EffectGraph>();
+
+    if (ImGui::CollapsingHeader("Effects")) {
+        if (ImGui::Button("Add Gaussian Blur")) {
+            auto blur = std::make_shared<GaussianBlurNode>();
+            blur->name = "Blur";
+            blur->blur_amount = 5.0f;
+            clip.effect_graph->nodes.push_back(blur);
+        }
+        if (ImGui::Button("Add Color Grading")) {
+            auto color_grade = std::make_shared<ColorGradingNode>();
+            color_grade->name = "Color Grading";
+            color_grade->brightness = 0.0f;
+            color_grade->contrast = 1.0f;
+            color_grade->saturation = 1.0f;
+            color_grade->temperature = 0.0f;
+            color_grade->tint = 0.0f;
+            color_grade->gamma = 1.0f;
+            clip.effect_graph->nodes.push_back(color_grade);
+        }
+        if (ImGui::Button("Add LUT")) {
+            auto lut = std::make_shared<LUTColorGradingNode>();
+            lut->name = "LUT Color Grading";
+            lut->strength = 1.0f;
+            clip.effect_graph->nodes.push_back(lut);
+        }
+
+        for (size_t i = 0; i < clip.effect_graph->nodes.size(); ++i) {
+            auto& node = clip.effect_graph->nodes[i];
+            ImGui::PushID(int(i));
+            if (ImGui::TreeNode(node->name.c_str())) {
+                // Render type-specific UI
+                if (auto blur = std::dynamic_pointer_cast<GaussianBlurNode>(node)) {
+                    ImGui::SliderFloat("Blur Amount", &blur->blur_amount, 0.0f, 50.0f);
+                } else if (auto clr_grade = std::dynamic_pointer_cast<ColorGradingNode>(node)) {
+                    ImGui::SliderFloat("Brightness", &clr_grade->brightness, -1.0f, 1.0f);
+                    ImGui::SliderFloat("Contrast", &clr_grade->contrast, 0.0f, 2.0f);
+                    ImGui::SliderFloat("Saturation", &clr_grade->saturation, 0.0f, 2.0f);
+                    ImGui::SliderFloat("Temperature", &clr_grade->temperature, -1.0f, 1.0f);
+                    ImGui::SliderFloat("Tint", &clr_grade->tint, -1.0f, 1.0f);
+                    ImGui::SliderFloat("Gamma", &clr_grade->gamma, 0.1f, 3.0f);
+                } else if (auto lut = std::dynamic_pointer_cast<LUTColorGradingNode>(node)) {
+                    ImGui::SliderFloat("Strength", &lut->strength, 0.0f, 1.0f);
+                    if (ImGui::Button("Load LUT")) {
+                        const char* load_path = tinyfd_openFileDialog("Load Project", "", 1, NULL, "", 0);
+                        if (load_path) lut->lut_path = load_path;
+                    }
+                }
+
+                // Render common UI elements
+                ImGui::Checkbox("Enabled", &node->enabled);
+                if (ImGui::Button("Remove")) {
+                    clip.effect_graph->nodes.erase(clip.effect_graph->nodes.begin() + i);
+                    ImGui::TreePop();
+                    ImGui::PopID();
+                    break;
+                }
+
+                ImGui::TreePop();
+            }
+            ImGui::PopID();
+        }
     }
 }

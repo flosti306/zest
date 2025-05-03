@@ -687,23 +687,64 @@ void render_frame(GLResources& res, float current_time,
         }
 
         if (tex_id != 0) {
-            glBindTexture(GL_TEXTURE_2D, tex_id);
-            glPushMatrix();
-
-            // --- Apply evaluated transforms ---
-            glTranslatef(evaluated_pos_x * width, evaluated_pos_y * height, 0.0f);
-            glRotatef(evaluated_rotation, 0.0f, 0.0f, 1.0f);
-            glScalef(evaluated_scale, evaluated_scale, 1.0f); // Adjust scaling for new aspect ratio
-            glColor4f(1.0f, 1.0f, 1.0f, evaluated_opacity);
-
-            glBegin(GL_QUADS);
-                glTexCoord2f(0.0f, 0.0f); glVertex2f(-1.0f * width, -1.0f * height);
-                glTexCoord2f(1.0f, 0.0f); glVertex2f( 1.0f * width, -1.0f * height);
-                glTexCoord2f(1.0f, 1.0f); glVertex2f( 1.0f * width,  1.0f * height);
-                glTexCoord2f(0.0f, 1.0f); glVertex2f(-1.0f * width,  1.0f * height);
-            glEnd();
-
-            glPopMatrix();
+            // If the clip has effects, we need to handle them differently
+            if (clip.has_effects()) {
+                // Create a temporary FBO to capture the clip with transforms applied
+                GLuint transformed_tex;
+                GLuint transformed_fbo = create_temp_fbo(glm::vec2(width, height), transformed_tex);
+                
+                // Render the clip with transforms to the temporary FBO
+                glBindFramebuffer(GL_FRAMEBUFFER, transformed_fbo);
+                glViewport(0, 0, width, height);
+                
+                // Bind the clip's texture
+                glBindTexture(GL_TEXTURE_2D, tex_id);
+                
+                glPushMatrix();
+                // Apply transforms
+                glTranslatef(evaluated_pos_x * width, evaluated_pos_y * height, 0.0f);
+                glRotatef(evaluated_rotation, 0.0f, 0.0f, 1.0f);
+                glScalef(evaluated_scale, evaluated_scale, 1.0f);
+                glColor4f(1.0f, 1.0f, 1.0f, evaluated_opacity);
+                
+                // Draw the texture with transforms applied
+                glBegin(GL_QUADS);
+                    glTexCoord2f(0.0f, 0.0f); glVertex2f(-1.0f * width, -1.0f * height);
+                    glTexCoord2f(1.0f, 0.0f); glVertex2f(1.0f * width, -1.0f * height);
+                    glTexCoord2f(1.0f, 1.0f); glVertex2f(1.0f * width, 1.0f * height);
+                    glTexCoord2f(0.0f, 1.0f); glVertex2f(-1.0f * width, 1.0f * height);
+                glEnd();
+                
+                glPopMatrix();
+                
+                // Process the effects using the transformed texture
+                glBindFramebuffer(GL_FRAMEBUFFER, res.fbo); // Back to main FBO
+                clip.effect_graph->Process(transformed_tex, res.fbo, current_time, glm::vec2(width, height));
+                
+                // Clean up
+                destroy_temp_fbo(transformed_fbo, transformed_tex);
+            } else {
+                // Normal rendering (no effects)
+                glBindTexture(GL_TEXTURE_2D, tex_id);
+                glPushMatrix();
+                
+                // Apply transforms
+                glTranslatef(evaluated_pos_x * width, evaluated_pos_y * height, 0.0f);
+                glRotatef(evaluated_rotation, 0.0f, 0.0f, 1.0f);
+                glScalef(evaluated_scale, evaluated_scale, 1.0f);
+                glColor4f(1.0f, 1.0f, 1.0f, evaluated_opacity);
+                
+                // Draw the quad
+                glBegin(GL_QUADS);
+                    glTexCoord2f(0.0f, 0.0f); glVertex2f(-1.0f * width, -1.0f * height);
+                    glTexCoord2f(1.0f, 0.0f); glVertex2f(1.0f * width, -1.0f * height);
+                    glTexCoord2f(1.0f, 1.0f); glVertex2f(1.0f * width, 1.0f * height);
+                    glTexCoord2f(0.0f, 1.0f); glVertex2f(-1.0f * width, 1.0f * height);
+                glEnd();
+                
+                glPopMatrix();
+            }
+            
             rendered_any = true;
         } else {
             // Optionally render a placeholder if texture is missing/not ready

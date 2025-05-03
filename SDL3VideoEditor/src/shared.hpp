@@ -1,5 +1,6 @@
 #pragma once
 #include <string>
+#include "effects.hpp"
 
 enum class ClipType {
     Video,
@@ -77,6 +78,10 @@ struct Clip {
     std::vector<float> waveform;     // normalized audio samples [-1.0, 1.0]
 
     Clip* linked_clip = nullptr; // for audio/video pairs
+
+    std::shared_ptr<EffectGraph> effect_graph = nullptr; // optional
+
+    bool has_effects() const { return effect_graph && !effect_graph->nodes.empty(); }
 };
 
 #include "keyframetrack.inl"
