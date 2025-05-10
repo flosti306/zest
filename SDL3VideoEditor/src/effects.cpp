@@ -584,7 +584,6 @@ void MaskEffectNode::Process(const EffectContext& ctx) {
         return; // Don't process if disabled, no input, or mask type is None
 
     // Load shader program (consider caching)
-    // We'll need a dedicated mask shader
     GLuint mask_program = LoadShaderProgram("shaders/mask.vert", "shaders/mask.frag");
     if (mask_program == 0)
         return;
@@ -596,63 +595,90 @@ void MaskEffectNode::Process(const EffectContext& ctx) {
 
     glUseProgram(mask_program);
 
+    // --- Evaluate Keyframes ---
+    float eval_feather = feather; // Default to base value
+    if (!feather_track.keyframes.empty()) eval_feather = feather_track.Evaluate(ctx.time);
+
+    glm::vec2 eval_rect_center = rect_center;
+    if (!rect_center_x_track.keyframes.empty()) eval_rect_center.x = rect_center_x_track.Evaluate(ctx.time);
+    if (!rect_center_y_track.keyframes.empty()) eval_rect_center.y = rect_center_y_track.Evaluate(ctx.time);
+
+    glm::vec2 eval_rect_size = rect_size;
+    if (!rect_size_x_track.keyframes.empty()) eval_rect_size.x = rect_size_x_track.Evaluate(ctx.time);
+    if (!rect_size_y_track.keyframes.empty()) eval_rect_size.y = rect_size_y_track.Evaluate(ctx.time);
+
+    float eval_rect_rotation = rect_rotation;
+    if (!rect_rotation_track.keyframes.empty()) eval_rect_rotation = rect_rotation_track.Evaluate(ctx.time);
+
+    float eval_rect_corner_radius = rect_corner_radius;
+    if(!rect_corner_radius_track.keyframes.empty()) eval_rect_corner_radius = rect_corner_radius_track.Evaluate(ctx.time);
+
+    glm::vec2 eval_circle_center = circle_center;
+    if (!circle_center_x_track.keyframes.empty()) eval_circle_center.x = circle_center_x_track.Evaluate(ctx.time);
+    if (!circle_center_y_track.keyframes.empty()) eval_circle_center.y = circle_center_y_track.Evaluate(ctx.time);
+
+    float eval_circle_radius = circle_radius;
+    if (!circle_radius_track.keyframes.empty()) eval_circle_radius = circle_radius_track.Evaluate(ctx.time);
+
+    float eval_circle_aspect_ratio = circle_aspect_ratio;
+    if (!circle_aspect_ratio_track.keyframes.empty()) eval_circle_aspect_ratio = circle_aspect_ratio_track.Evaluate(ctx.time);
+
     // Set common uniforms
     glUniform1i(glGetUniformLocation(mask_program, "u_MaskType"), static_cast<int>(mask_type));
     glUniform1i(glGetUniformLocation(mask_program, "u_Invert"), invert);
-    glUniform1f(glGetUniformLocation(mask_program, "u_Feather"), feather);
+    // ***** USE EVALUATED VALUE *****
+    glUniform1f(glGetUniformLocation(mask_program, "u_Feather"), eval_feather);
     glUniform2f(glGetUniformLocation(mask_program, "u_Resolution"), ctx.resolution.x, ctx.resolution.y);
 
     // Set type-specific uniforms
     switch (mask_type) {
         case MaskType::Rectangle:
-            glUniform2f(glGetUniformLocation(mask_program, "u_RectCenter"), rect_center.x, rect_center.y);
-            glUniform2f(glGetUniformLocation(mask_program, "u_RectSize"), rect_size.x, rect_size.y);
-            glUniform1f(glGetUniformLocation(mask_program, "u_RectRotation"), glm::radians(rect_rotation)); // Pass radians
+            // ***** USE EVALUATED VALUES *****
+            glUniform2f(glGetUniformLocation(mask_program, "u_RectCenter"), eval_rect_center.x, eval_rect_center.y);
+            glUniform2f(glGetUniformLocation(mask_program, "u_RectSize"), eval_rect_size.x, eval_rect_size.y);
+            glUniform1f(glGetUniformLocation(mask_program, "u_RectRotation"), glm::radians(eval_rect_rotation)); // Pass radians
+            glUniform1f(glGetUniformLocation(mask_program, "u_RectCornerRadius"), eval_rect_corner_radius);
             break;
         case MaskType::Circle:
-            glUniform2f(glGetUniformLocation(mask_program, "u_CircleCenter"), circle_center.x, circle_center.y);
-            glUniform1f(glGetUniformLocation(mask_program, "u_CircleRadius"), circle_radius);
+            // ***** USE EVALUATED VALUES *****
+            glUniform2f(glGetUniformLocation(mask_program, "u_CircleCenter"), eval_circle_center.x, eval_circle_center.y);
+            glUniform1f(glGetUniformLocation(mask_program, "u_CircleRadius"), eval_circle_radius);
+            glUniform1f(glGetUniformLocation(mask_program, "u_CircleAspectRatio"), eval_circle_aspect_ratio);
             break;
         case MaskType::Texture:
-            if (mask_texture == 0) { // No texture loaded/created
+            if (mask_texture == 0) { 
                 glUseProgram(0);
                 glBindFramebuffer(GL_FRAMEBUFFER, 0);
-                std::cerr << "Mask effect enabled with Texture type, but no mask texture is loaded." << std::endl;
-                // Maybe default to passthrough or full mask? For now, just skip processing.
-                 // To render passthrough: Copy input to output (or just return if this is the last effect)
-                 // For now, just return, leaving the previous buffer content unchanged
-                 // This might be wrong if it's an intermediate step.
-                 // A safer bet is to copy input to output here if mask_texture is 0.
+                // To prevent breaking the effect chain if a mask texture is expected but missing,
+                // we should ideally render a passthrough or a fully opaque/transparent mask.
+                // For now, let's just copy input to output FBO if mask_texture is 0.
+                // This requires a simple copy shader. For simplicity of this fix, we'll return.
+                // If this is an intermediate effect, returning means the FBO has old data.
+                // A robust solution would be to draw input_texture to output_fbo.
+                // For now, this matches previous behavior of effectively disabling the effect.
                 return;
             }
             glActiveTexture(GL_TEXTURE1);
             glBindTexture(GL_TEXTURE_2D, mask_texture);
             glUniform1i(glGetUniformLocation(mask_program, "u_MaskTexture"), 1);
             break;
-        case MaskType::None: // Should have been caught earlier, but handle defensively
+        case MaskType::None: 
              glUseProgram(0);
              glBindFramebuffer(GL_FRAMEBUFFER, 0);
-             return; // No masking needed
-        // case MaskType::Smart: // Placeholder
-        //     // Uniforms for smart mask data (if implemented)
-        //     break;
+             return; 
     }
 
-    // Bind input texture (the image/video to be masked)
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, ctx.input_texture);
     glUniform1i(glGetUniformLocation(mask_program, "u_Texture"), 0);
 
-    // Draw fullscreen quad
-    RenderFullscreenQuad(); // Uses the modern VAO approach
+    RenderFullscreenQuad(); 
 
-    // Cleanup
     glUseProgram(0);
-    // Unbind mask texture if it was bound
     if (mask_type == MaskType::Texture) {
         glActiveTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, 0);
-        glActiveTexture(GL_TEXTURE0); // Reset active texture unit
+        glActiveTexture(GL_TEXTURE0); 
     }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }

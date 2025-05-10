@@ -1,6 +1,9 @@
 #pragma once
 #include <string>
-#include "effects.hpp"
+#include <vector>
+#include <memory>
+
+struct EffectGraph; // Forward declaration
 
 enum class ClipType {
     Video,
@@ -81,7 +84,7 @@ struct Clip {
 
     std::shared_ptr<EffectGraph> effect_graph = nullptr; // optional
 
-    bool has_effects() const { return effect_graph && !effect_graph->nodes.empty(); }
+    bool has_effects = false;
 };
 
 #include "keyframetrack.inl"

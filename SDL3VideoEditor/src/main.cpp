@@ -82,6 +82,9 @@ static float mask_brush_size = 20.0f; // In pixels
 static glm::vec3 mask_brush_color = glm::vec3(1.0f, 1.0f, 1.0f); // White = paint mask
 static bool mask_needs_apply = false; // Flag if drawing occurred
 static GLuint background_clip_texture_id = 0; // Texture of the clip being masked
+static bool mask_editor_show_background = true; // NEW: Toggle state
+static GLuint mask_editor_preview_program = 0; // Shader for combined preview
+static GLuint mask_editor_dummy_vao = 0;       // VAO for fullscreen quad drawing
 
 // Error checking macros
 #define CHECK_AV_ERROR(ret, message) \
@@ -698,6 +701,19 @@ bool ApplyDrawnMask() {
     return true;
 }
 
+void SetupMaskEditorPreviewResources() {
+    // Use the same vertex shader as your effects if it's a simple passthrough
+    // Or create a specific "shaders/mask_editor_preview.vert"
+    mask_editor_preview_program = LoadShaderProgram("shaders/mask_editor_preview.vert", "shaders/mask_editor_preview.frag");
+    if (mask_editor_preview_program == 0) {
+        std::cerr << "FATAL: Failed to load mask editor preview shader!" << std::endl;
+        // Handle error
+    }
+    // mask_editor_dummy_vao is NO LONGER NEEDED if using RenderFullscreenQuad
+    mask_editor_dummy_vao = 0; // Or delete it if it was created
+    std::cout << "Loaded mask editor preview shaders. VAO will be from RenderFullscreenQuad." << std::endl;
+}
+
 // --- The Editor Window Drawing Function ---
 // Call this function from your main loop if mask_editor_open is true
 void DrawMaskEditorWindow(GLResources& res) { // Pass GLResources if needed later
@@ -706,6 +722,11 @@ void DrawMaskEditorWindow(GLResources& res) { // Pass GLResources if needed late
         mask_editor_open = false;
         return;
     }
+
+    static GLuint mask_preview_fbo = 0;
+    static GLuint mask_preview_texture = 0;
+    static int mask_preview_width = 0;
+    static int mask_preview_height = 0;
 
     ImGui::SetNextWindowSize(ImVec2(600, 700), ImGuiCond_FirstUseEver); // Decent default size
     if (ImGui::Begin("Mask Drawing Editor", &mask_editor_open)) {
@@ -737,6 +758,9 @@ void DrawMaskEditorWindow(GLResources& res) { // Pass GLResources if needed late
 
          ImGui::Separator();
 
+         ImGui::Checkbox("Show Background Preview", &mask_editor_show_background);
+        ImGui::Separator();
+
          // --- Drawing Canvas ---
          ImGui::Text("Canvas:");
          ImVec2 canvas_pos = ImGui::GetCursorScreenPos();
@@ -751,8 +775,119 @@ void DrawMaskEditorWindow(GLResources& res) { // Pass GLResources if needed late
          canvas_size.x = std::max(canvas_size.x, 50.0f); // Min size
          canvas_size.y = std::max(canvas_size.y, 50.0f);
 
+         // --- Render the Preview ---
+        ImVec2 uv0 = ImVec2(0, 0); // Top-left for ImGui display
+        ImVec2 uv1 = ImVec2(1, 1); // Bottom-right for ImGui display
+
+        if (mask_editor_show_background && background_clip_texture_id != 0 && mask_draw_texture != 0 && mask_editor_preview_program != 0) {
+            // --- Ensure preview FBO/texture are set up for current canvas size ---
+            // We'll use the mask_draw_width/height as the rendering resolution for the preview FBO
+            // This keeps the preview 1:1 with the drawing buffer.
+            if (mask_preview_fbo == 0 || mask_preview_width != mask_draw_width || mask_preview_height != mask_draw_height) {
+                if (mask_preview_fbo != 0) {
+                    glDeleteFramebuffers(1, &mask_preview_fbo);
+                    glDeleteTextures(1, &mask_preview_texture);
+                }
+                mask_preview_width = mask_draw_width;
+                mask_preview_height = mask_draw_height;
+        
+                glGenFramebuffers(1, &mask_preview_fbo);
+                glGenTextures(1, &mask_preview_texture);
+        
+                glBindTexture(GL_TEXTURE_2D, mask_preview_texture);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, mask_preview_width, mask_preview_height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                glBindTexture(GL_TEXTURE_2D, 0);
+        
+                glBindFramebuffer(GL_FRAMEBUFFER, mask_preview_fbo);
+                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, mask_preview_texture, 0);
+        
+                if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+                    std::cerr << "ERROR: Mask Preview FBO incomplete!" << std::endl;
+                    // Cleanup and disable combined preview
+                    glDeleteFramebuffers(1, &mask_preview_fbo); mask_preview_fbo = 0;
+                    glDeleteTextures(1, &mask_preview_texture); mask_preview_texture = 0;
+                }
+                glBindFramebuffer(GL_FRAMEBUFFER, 0); // Unbind
+                std::cout << "Mask Preview FBO created/resized: " << mask_preview_width << "x" << mask_preview_height << std::endl;
+            }
+        
+            if (mask_preview_fbo != 0) {
+                // --- Render to the mask_preview_fbo ---
+                GLint last_fbo; glGetIntegerv(GL_FRAMEBUFFER_BINDING, &last_fbo);
+                GLint last_vp[4]; glGetIntegerv(GL_VIEWPORT, last_vp);
+                // GLboolean last_blend = glIsEnabled(GL_BLEND); // Backup other states if necessary
+        
+                glBindFramebuffer(GL_FRAMEBUFFER, mask_preview_fbo);
+                glViewport(0, 0, mask_preview_width, mask_preview_height);
+                // glClearColor(0.0f, 0.0f, 0.0f, 0.0f); // Optional: Clear if needed
+                // glClear(GL_COLOR_BUFFER_BIT);
+        
+                glUseProgram(mask_editor_preview_program);
+        
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, background_clip_texture_id);
+                glUniform1i(glGetUniformLocation(mask_editor_preview_program, "u_BackgroundTexture"), 0);
+        
+                glActiveTexture(GL_TEXTURE1);
+                glBindTexture(GL_TEXTURE_2D, mask_draw_texture); // This is the one drawn by DrawBrushStroke
+                glUniform1i(glGetUniformLocation(mask_editor_preview_program, "u_DrawnMaskTexture"), 1);
+                
+                // Set procedural mask uniforms (get values from current_editing_mask_node)
+                // This allows visualizing the rect/circle from the node's properties as a guide
+                // while you are *drawing* a texture mask.
+                glUniform2f(glGetUniformLocation(mask_editor_preview_program, "u_Resolution"), (float)mask_preview_width, (float)mask_preview_height);
+                if (current_editing_mask_node->mask_type == MaskEffectNode::MaskType::Rectangle) {
+                    glUniform1i(glGetUniformLocation(mask_editor_preview_program, "u_ProceduralMaskType"), 1);
+                    glUniform1f(glGetUniformLocation(mask_editor_preview_program, "u_ProceduralFeather"), current_editing_mask_node->feather_track.Evaluate(playhead_time)); // Or current_editing_mask_node->feather
+                    glUniform1i(glGetUniformLocation(mask_editor_preview_program, "u_InvertProcedural"), current_editing_mask_node->invert);
+                    glUniform2f(glGetUniformLocation(mask_editor_preview_program, "u_RectCenter"), current_editing_mask_node->rect_center_x_track.Evaluate(playhead_time), current_editing_mask_node->rect_center_y_track.Evaluate(playhead_time));
+                    glUniform2f(glGetUniformLocation(mask_editor_preview_program, "u_RectSize"), current_editing_mask_node->rect_size_x_track.Evaluate(playhead_time), current_editing_mask_node->rect_size_y_track.Evaluate(playhead_time));
+                    glUniform1f(glGetUniformLocation(mask_editor_preview_program, "u_RectRotation"), glm::radians(current_editing_mask_node->rect_rotation_track.Evaluate(playhead_time)));
+                    glUniform1f(glGetUniformLocation(mask_editor_preview_program, "u_RectCornerRadius"), current_editing_mask_node->rect_corner_radius_track.Evaluate(playhead_time));
+                } else if (current_editing_mask_node->mask_type == MaskEffectNode::MaskType::Circle) {
+                    glUniform1i(glGetUniformLocation(mask_editor_preview_program, "u_ProceduralMaskType"), 2);
+                    glUniform1f(glGetUniformLocation(mask_editor_preview_program, "u_ProceduralFeather"), current_editing_mask_node->feather_track.Evaluate(playhead_time));
+                    glUniform1i(glGetUniformLocation(mask_editor_preview_program, "u_InvertProcedural"), current_editing_mask_node->invert);
+                    glUniform2f(glGetUniformLocation(mask_editor_preview_program, "u_CircleCenter"), current_editing_mask_node->circle_center_x_track.Evaluate(playhead_time), current_editing_mask_node->circle_center_y_track.Evaluate(playhead_time));
+                    glUniform1f(glGetUniformLocation(mask_editor_preview_program, "u_CircleRadius"), current_editing_mask_node->circle_radius_track.Evaluate(playhead_time));
+                    glUniform1f(glGetUniformLocation(mask_editor_preview_program, "u_CircleAspectRatio"), current_editing_mask_node->circle_aspect_ratio_track.Evaluate(playhead_time));
+                } else {
+                    glUniform1i(glGetUniformLocation(mask_editor_preview_program, "u_ProceduralMaskType"), 0); // None
+                }
+        
+        
+                RenderFullscreenQuad(mask_preview_width, mask_draw_height); // Use your existing utility!
+        
+                // Restore GL state
+                glBindFramebuffer(GL_FRAMEBUFFER, last_fbo);
+                glViewport(last_vp[0], last_vp[1], last_vp[2], last_vp[3]);
+                glUseProgram(0); // Or last program
+                glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, 0);
+                glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, 0);
+                // Restore other states like blend if changed
+            }
+        
+            // --- Display the rendered mask_preview_texture using ImGui::Image ---
+            if (mask_preview_texture != 0) {
+                // `mask_preview_texture` was rendered with bottom-left origin.
+                // ImGui::Image default UVs (0,0) to (1,1) expect bottom-left.
+                // However, if your RenderFullscreenQuad internally flips UVs for some reason, adjust here.
+                // Assuming standard behavior:
+                ImGui::Image((ImTextureID)(intptr_t)mask_preview_texture, canvas_size, ImVec2(0, 1), ImVec2(1, 0)); // Flip Y for display
+            } else {
+                ImGui::Text("Preview FBO Error"); // Fallback
+                ImGui::Image((ImTextureID)(intptr_t)mask_draw_texture, canvas_size, ImVec2(0, 1), ImVec2(1, 0)); // Show B&W
+            }
+        
+        } else {
+            // Show only the drawn mask (B&W) - this part was working
+            ImGui::Image((ImTextureID)(intptr_t)mask_draw_texture, canvas_size, ImVec2(0, 1), ImVec2(1, 0));
+        }
+
          // Display the current state of the mask texture
-         ImGui::Image((ImTextureID)(intptr_t)mask_draw_texture, canvas_size, ImVec2(0, 1), ImVec2(1, 0)); // Flip UVs for display
+         // ImGui::Image((ImTextureID)(intptr_t)mask_draw_texture, canvas_size, ImVec2(0, 1), ImVec2(1, 0)); // Flip UVs for display
 
          // Use InvisibleButton to capture input over the image area
          ImGui::SetCursorScreenPos(canvas_pos); // Reset cursor pos to overlay button correctly
@@ -895,6 +1030,8 @@ int main(int argc, char* argv[]) {
         SDL_DestroyWindow(window); SDL_Quit();
         return 1;
     }
+
+    SetupMaskEditorPreviewResources();
 
     if(show_thumbs) start_thumbnail_worker();
 
@@ -1240,6 +1377,27 @@ int main(int argc, char* argv[]) {
 // --- Updated UpdatePreview Function ---
 void UpdatePreview(GLResources& res, const std::vector<Clip>& sorted_clips, int width, int height, float playhead_time, bool force_update) {
     render_frame(res, playhead_time, sorted_clips, width, height);
+}
+
+// --- RenderFullscreenQuad Function ---
+void RenderFullscreenQuad(float width, float height) {
+    // Backup GL state
+    GLint last_viewport[4];
+    glGetIntegerv(GL_VIEWPORT, last_viewport);
+
+    // Set viewport to match the quad size
+    glViewport(0, 0, static_cast<GLsizei>(width), static_cast<GLsizei>(height));
+
+    // Render a simple fullscreen quad
+    glBegin(GL_QUADS);
+    glTexCoord2f(0.0f, 0.0f); glVertex2f(-1.0f, -1.0f);
+    glTexCoord2f(1.0f, 0.0f); glVertex2f(1.0f, -1.0f);
+    glTexCoord2f(1.0f, 1.0f); glVertex2f(1.0f, 1.0f);
+    glTexCoord2f(0.0f, 1.0f); glVertex2f(-1.0f, 1.0f);
+    glEnd();
+
+    // Restore GL state
+    glViewport(last_viewport[0], last_viewport[1], last_viewport[2], last_viewport[3]);
 }
 
 // --- RenderPreviewWindow ---
@@ -2038,6 +2196,7 @@ void DrawEffectUIForClip(Clip& clip, GLResources& gl_resources) {
 
                     effect_changed |= ImGui::Checkbox("Invert Mask", &mask->invert);
                     effect_changed |= ImGui::SliderFloat("Feather", &mask->feather, 0.0f, 0.5f, "%.3f"); // Adjust range as needed
+                    DrawKeyframeTrackEditor("Feather Keyframes", mask->feather_track);
 
                     ImGui::Separator();
 
@@ -2045,13 +2204,25 @@ void DrawEffectUIForClip(Clip& clip, GLResources& gl_resources) {
                         case MaskEffectNode::MaskType::Rectangle:
                             ImGui::Text("Rectangle Properties (Normalized)");
                             effect_changed |= ImGui::SliderFloat2("Center##Rect", &mask->rect_center.x, 0.0f, 1.0f);
+                            DrawKeyframeTrackEditor("Center X Keyframes##Rect", mask->rect_center_x_track);
+                            DrawKeyframeTrackEditor("Center Y Keyframes##Rect", mask->rect_center_y_track);
                             effect_changed |= ImGui::SliderFloat2("Size##Rect", &mask->rect_size.x, 0.0f, 1.0f);
+                            DrawKeyframeTrackEditor("Size X Keyframes##Rect", mask->rect_size_x_track);
+                            DrawKeyframeTrackEditor("Size Y Keyframes##Rect", mask->rect_size_y_track);
                             effect_changed |= ImGui::SliderFloat("Rotation##Rect", &mask->rect_rotation, -180.0f, 180.0f);
+                            DrawKeyframeTrackEditor("Rotation Keyframes##Rect", mask->rect_rotation_track);
+                            effect_changed |= ImGui::SliderFloat("Corner Radius##Rect", &mask->rect_corner_radius, 0.0f, 0.5f, "%.3f");
+                            DrawKeyframeTrackEditor("Corner Radius Keyframes##Rect", mask->rect_corner_radius_track);
                             break;
                         case MaskEffectNode::MaskType::Circle:
                             ImGui::Text("Circle Properties (Normalized)");
                             effect_changed |= ImGui::SliderFloat2("Center##Circle", &mask->circle_center.x, 0.0f, 1.0f);
+                            DrawKeyframeTrackEditor("Center X Keyframes##Circle", mask->circle_center_x_track);
+                            DrawKeyframeTrackEditor("Center Y Keyframes##Circle", mask->circle_center_y_track);
                             effect_changed |= ImGui::SliderFloat("Radius##Circle", &mask->circle_radius, 0.0f, 1.0f); // Radius relative to smaller dimension? Or just normalized? Let's stick to normalized for now.
+                            DrawKeyframeTrackEditor("Radius Keyframes##Circle", mask->circle_radius_track);
+                            effect_changed |= ImGui::SliderFloat("Aspect Ratio##Circle", &mask->circle_aspect_ratio, 0.1f, 10.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+                            DrawKeyframeTrackEditor("Aspect Ratio Keyframes##Circle", mask->circle_aspect_ratio_track);
                             break;
                         case MaskEffectNode::MaskType::Texture:
                             ImGui::Text("Texture Mask Properties");
@@ -2125,4 +2296,6 @@ void DrawEffectUIForClip(Clip& clip, GLResources& gl_resources) {
             ImGui::PopID();
         }
     }
+
+    clip.has_effects = clip.effect_graph && !clip.effect_graph->nodes.empty();
 }

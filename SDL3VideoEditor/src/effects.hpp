@@ -10,7 +10,7 @@
 #include <glad/glad.h> // Include glad for OpenGL function loading
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_image.h>
-
+#include "shared.hpp"
 
 GLuint create_temp_fbo(glm::vec2 resolution, GLuint& texture_out);
 
@@ -48,6 +48,7 @@ struct EffectGraph {
     std::vector<std::shared_ptr<EffectNode>> nodes;
 
     void Process(GLuint input_tex, GLuint output_fbo, float time, glm::vec2 resolution);
+
 };
 
 struct ColorGradingNode : public EffectNode {
@@ -110,14 +111,28 @@ struct MaskEffectNode : public EffectNode {
     glm::vec2 rect_center = glm::vec2(0.5f, 0.5f);
     glm::vec2 rect_size = glm::vec2(0.5f, 0.5f);
     float rect_rotation = 0.0f; // Degrees
+    float rect_corner_radius = 0.0f; // Range [0.0, 0.5] - Normalized relative to smaller dimension? Let's start with relative to half-size.
 
     // Circle parameters (normalized coordinates [0, 1])
     glm::vec2 circle_center = glm::vec2(0.5f, 0.5f);
     float circle_radius = 0.25f;
+    float circle_aspect_ratio = 1.0f;
 
     // Texture mask parameters
     GLuint mask_texture = 0;
     std::string mask_texture_path = ""; // For loading/saving
+
+    KeyframeTrack<float> feather_track;
+    KeyframeTrack<float> rect_center_x_track;
+    KeyframeTrack<float> rect_center_y_track;
+    KeyframeTrack<float> rect_size_x_track;
+    KeyframeTrack<float> rect_size_y_track;
+    KeyframeTrack<float> rect_rotation_track;
+    KeyframeTrack<float> rect_corner_radius_track;
+    KeyframeTrack<float> circle_center_x_track;
+    KeyframeTrack<float> circle_center_y_track;
+    KeyframeTrack<float> circle_radius_track;
+    KeyframeTrack<float> circle_aspect_ratio_track;
 
     // TODO: Add parameters for drawing or smart mask if/when implemented
 

@@ -16,8 +16,10 @@
 #include <thread>
 #include <limits>
 #include <cmath>
+#include "glm/glm.hpp"
 #include "shared.hpp"
 #include "video_export.hpp"
+#include "effects.hpp"
 
 extern "C" {
     #include <libavcodec/avcodec.h>
@@ -688,7 +690,7 @@ void render_frame(GLResources& res, float current_time,
 
         if (tex_id != 0) {
             // If the clip has effects, we need to handle them differently
-            if (clip.has_effects()) {
+            if (clip.has_effects) {
                 // Create a temporary FBO to capture the clip with transforms applied
                 GLuint transformed_tex;
                 GLuint transformed_fbo = create_temp_fbo(glm::vec2(width, height), transformed_tex);

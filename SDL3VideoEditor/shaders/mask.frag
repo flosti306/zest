@@ -14,10 +14,12 @@ uniform float u_Feather; // Feather amount [0, 1]
 uniform vec2 u_RectCenter; // Normalized [0, 1]
 uniform vec2 u_RectSize;   // Normalized [0, 1]
 uniform float u_RectRotation; // Radians
+uniform float u_RectCornerRadius;
 
 // Circle uniforms
 uniform vec2 u_CircleCenter; // Normalized [0, 1]
 uniform float u_CircleRadius; // Normalized [0, 1]
+uniform float u_CircleAspectRatio;
 
 // Optional: For aspect ratio correction if needed
 uniform vec2 u_Resolution;
@@ -40,6 +42,14 @@ float sdBox(vec2 p, vec2 b) {
   return length(max(d, 0.0)) + min(max(d.x, d.y), 0.0);
 }
 
+float sdRoundedBox( in vec2 p, in vec2 b, in vec4 r )
+{
+    r.xy = (p.x>0.0)?r.xy : r.zw;
+    r.x  = (p.y>0.0)?r.x  : r.y;
+    vec2 q = abs(p)-b+r.x;
+    return min(max(q.x,q.y),0.0) + length(max(q,0.0)) - r.x;
+}
+
 
 float getMaskAlpha() {
     float mask = 1.0; // Default opaque
@@ -54,13 +64,15 @@ float getMaskAlpha() {
     if (u_MaskType == 1) { // Rectangle
         vec2 rotatedUV = rotateUV(v_TexCoord, u_RectCenter, -u_RectRotation); // Rotate UV coords
         vec2 halfSize = u_RectSize * 0.5;
-        float dist = sdBox(rotatedUV - u_RectCenter, halfSize);
+        float dist = (u_RectCornerRadius > 0) ? sdRoundedBox(rotatedUV - u_RectCenter, halfSize, vec4(u_RectCornerRadius, u_RectCornerRadius, u_RectCornerRadius, u_RectCornerRadius)) : sdBox(rotatedUV - u_RectCenter, halfSize);
 
         // Use smoothstep for feathering based on distance field
         mask = smoothstep(safe_feather * 0.5, -safe_feather * 0.5, dist);
 
     } else if (u_MaskType == 2) { // Circle
-        float dist = distance(v_TexCoord, u_CircleCenter);
+        vec2 aspectCorrectedCenter = vec2(u_CircleCenter.x, u_CircleCenter.y / u_CircleAspectRatio);
+        vec2 aspectCorrectedUV = vec2(v_TexCoord.x, v_TexCoord.y / u_CircleAspectRatio);
+        float dist = distance(aspectCorrectedUV, aspectCorrectedCenter);
         mask = smoothstep(u_CircleRadius + safe_feather * 0.5, u_CircleRadius - safe_feather * 0.5, dist);
 
     } else if (u_MaskType == 3) { // Texture
