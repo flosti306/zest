@@ -86,6 +86,15 @@ static bool mask_editor_show_background = true; // NEW: Toggle state
 static GLuint mask_editor_preview_program = 0; // Shader for combined preview
 static GLuint mask_editor_dummy_vao = 0;       // VAO for fullscreen quad drawing
 
+static bool smart_mask_editor_open = false;
+static MaskEffectNode* current_editing_smart_mask_node = nullptr;
+static GLuint smart_mask_editor_bg_clip_tex = 0; // Texture of the clip frame to show
+static GLuint smart_mask_editor_overlay_tex = 0; // Texture of the generated GrabCut mask
+static ImVec2 smart_mask_roi_start_pos; // For drawing the ROI rectangle
+static ImVec2 smart_mask_roi_end_pos;
+static bool smart_mask_drawing_roi = false;
+static DecodedFrame smart_mask_current_decoded_frame; // To hold pixels for OpenCV
+
 // Error checking macros
 #define CHECK_AV_ERROR(ret, message) \
     if (ret < 0) { \
@@ -953,6 +962,8 @@ void DrawTimelineEditor(std::vector<Clip>& clips, float& playhead_time, float& m
 void UpdatePreview(GLResources& res, const std::vector<Clip>& sorted_clips, int width, int height, float playhead_time, bool force_update);
 void RenderPreviewWindow(GLuint preview_tex, int preview_width, int preview_height);
 void DrawEffectUIForClip(Clip& clip, GLResources& gl_resources);
+void OpenSmartMaskEditor(MaskEffectNode* node, GLuint clip_texture_for_background, const DecodedFrame& decoded_frame_for_cv);
+void DrawSmartMaskEditorWindow();
 
 // --- Main Application ---
 int main(int argc, char* argv[]) {
@@ -1267,6 +1278,10 @@ int main(int argc, char* argv[]) {
 
         if (mask_editor_open) {
             DrawMaskEditorWindow(gl_resources); // Pass gl_resources if needed inside editor
+        }
+
+        if (smart_mask_editor_open) {
+            DrawSmartMaskEditorWindow(); // Call this similar to DrawMaskEditorWindow
         }
 
         bool force_preview_update = layers_changed.load();
@@ -2187,7 +2202,7 @@ void DrawEffectUIForClip(Clip& clip, GLResources& gl_resources) {
                         if (load_path) lut->lut_path = load_path;
                     }
                 } else if (auto mask = std::dynamic_pointer_cast<MaskEffectNode>(node)) {
-                    const char* mask_types[] = { "None", "Rectangle", "Circle", "Texture"/*, "Smart"*/ };
+                    const char* mask_types[] = { "None", "Rectangle", "Circle", "Texture", "Smart"};
                     int current_type = static_cast<int>(mask->mask_type);
                     if (ImGui::Combo("Mask Type", &current_type, mask_types, IM_ARRAYSIZE(mask_types))) {
                         mask->mask_type = static_cast<MaskEffectNode::MaskType>(current_type);
@@ -2273,10 +2288,66 @@ void DrawEffectUIForClip(Clip& clip, GLResources& gl_resources) {
                                 ImGui::TextColored(ImVec4(1,0,0,1), "No mask texture loaded!");
                             }
                            break; // End MaskType::Texture case
-                        // case MaskEffectNode::MaskType::Smart:
-                        //     ImGui::Text("Smart Mask (Not Implemented)");
-                        //     // UI for triggering smart mask generation/selection
-                        //     break;
+                        case MaskEffectNode::MaskType::Smart_Interactive:
+                            ImGui::Text("Smart Mask");
+                            if (ImGui::Button("Edit Interactive Smart Mask...")) {
+                                DecodedFrame frame_for_smart_mask;
+                                GLuint bg_tex_id_for_smart_mask = 0;
+
+                                // selected_clip should be the same as 'clip' passed to this function
+                                // Ensure 'clip' (the function parameter) is the correct one.
+                                // If selected_clip is a global, it might be different.
+                                // Assuming 'clip' is the relevant one for this effect:
+                                if (is_video_file(clip.path)) { // Check if it's a video
+                                    auto it = gl_resources.video_cache.find(clip.path);
+                                    if (it != gl_resources.video_cache.end() && it->second.is_initialized) {
+                                        VideoData& vid_data = it->second;
+                                        // Use playhead_time (global or passed in) to determine the current frame
+                                        // Make sure playhead_time is accessible here.
+                                        float clip_media_time = playhead_time - clip.start_time + clip.media_start;
+                                        
+                                        ensure_video_decoded_upto(vid_data, clip_media_time);
+                                        
+                                        const DecodedFrame* found_frame = nullptr;
+                                        double min_diff = std::numeric_limits<double>::max();
+                                        for (const auto& cached_f : vid_data.frame_cache) {
+                                            double diff = std::abs(cached_f.pts - clip_media_time);
+                                            if (diff < min_diff) {
+                                                min_diff = diff;
+                                                found_frame = &cached_f;
+                                            }
+                                        }
+                                        if (found_frame) {
+                                            frame_for_smart_mask = *found_frame; 
+                                            bg_tex_id_for_smart_mask = vid_data.texture_id;
+                                        }
+                                    }
+                                } else { // It's an image clip
+                                    auto img_it = gl_resources.texture_cache.find(clip.path);
+                                    if (img_it != gl_resources.texture_cache.end()) {
+                                        bg_tex_id_for_smart_mask = img_it->second;
+                                        // For images, DecodedFrame needs to be constructed from the image pixels.
+                                        // This part is missing if you want to apply GrabCut to images.
+                                        // You'd need a function to load image into a DecodedFrame structure
+                                        // or adapt RunGrabCut to take a GLuint texture ID and read its pixels.
+                                        // For now, let's assume Smart Mask is primarily for video frames.
+                                        // If you want it for images, this path needs more work.
+                                        std::cerr << "Warning: Smart Mask for still images requires loading image pixels into DecodedFrame." << std::endl;
+                                    }
+                                }
+
+
+                                if (!frame_for_smart_mask.pixels.empty() && bg_tex_id_for_smart_mask != 0) {
+                                    // --- THIS IS THE FIX ---
+                                    OpenSmartMaskEditor(mask.get(), bg_tex_id_for_smart_mask, frame_for_smart_mask);
+                                    // --- END FIX ---
+                                } else {
+                                    tinyfd_messageBox("Error", "Could not get current video frame (or its texture) for smart mask.", "ok", "error", 1);
+                                    if (frame_for_smart_mask.pixels.empty()) std::cerr << "Frame for smart mask pixels is empty." << std::endl;
+                                    if (bg_tex_id_for_smart_mask == 0) std::cerr << "Background tex ID for smart mask is 0." << std::endl;
+                                }
+                            }
+                            break;
                         case MaskEffectNode::MaskType::None:
                             break; // No specific controls needed
                     }
@@ -2298,4 +2369,203 @@ void DrawEffectUIForClip(Clip& clip, GLResources& gl_resources) {
     }
 
     clip.has_effects = clip.effect_graph && !clip.effect_graph->nodes.empty();
+}
+
+// Function to open the editor
+void OpenSmartMaskEditor(MaskEffectNode* node, GLuint clip_texture_for_background, const DecodedFrame& decoded_frame_for_cv) {
+    if (!node) return;
+    current_editing_smart_mask_node = node;
+    smart_mask_editor_bg_clip_tex = clip_texture_for_background;
+    smart_mask_current_decoded_frame = decoded_frame_for_cv; // Make a copy for OpenCV processing
+
+    // Reset ROI and existing overlay
+    smart_mask_roi_start_pos = ImVec2(-1, -1);
+    smart_mask_roi_end_pos = ImVec2(-1, -1);
+    smart_mask_drawing_roi = false;
+    if (smart_mask_editor_overlay_tex != 0) {
+        glDeleteTextures(1, &smart_mask_editor_overlay_tex);
+        smart_mask_editor_overlay_tex = 0;
+    }
+    // Optionally, if the node already has a current_smart_mask_texture,
+    // you could load it into smart_mask_editor_overlay_tex here as a starting point.
+
+    smart_mask_editor_open = true;
+}
+
+void DrawSmartMaskEditorWindow() {
+    if (!smart_mask_editor_open || !current_editing_smart_mask_node) {
+        smart_mask_editor_open = false; // Ensure it closes if node is bad
+        if (smart_mask_editor_overlay_tex != 0) { // Cleanup
+             glDeleteTextures(1, &smart_mask_editor_overlay_tex);
+             smart_mask_editor_overlay_tex = 0;
+        }
+        return;
+    }
+
+    ImGui::SetNextWindowSize(ImVec2(700, 800), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Smart Mask Editor (Interactive)", &smart_mask_editor_open)) {
+        ImGui::Text("Editing Smart Mask for: %s", current_editing_smart_mask_node->name.c_str());
+        ImGui::Text("Draw a rectangle around the subject, then click 'Analyze Frame'.");
+        ImGui::Separator();
+
+        // --- Display Area for Clip Frame and ROI drawing ---
+        ImVec2 canvas_avail_size = ImGui::GetContentRegionAvail();
+        canvas_avail_size.y -= (ImGui::GetTextLineHeightWithSpacing() * 3); // Space for buttons
+
+        float frame_aspect = (smart_mask_current_decoded_frame.width > 0 && smart_mask_current_decoded_frame.height > 0)
+                             ? (float)smart_mask_current_decoded_frame.width / smart_mask_current_decoded_frame.height
+                             : 16.0f / 9.0f;
+
+        ImVec2 display_size = canvas_avail_size;
+        if (canvas_avail_size.x / frame_aspect <= canvas_avail_size.y) {
+            display_size.y = canvas_avail_size.x / frame_aspect;
+        } else {
+            display_size.x = canvas_avail_size.y * frame_aspect;
+        }
+        display_size.x = std::max(50.0f, display_size.x);
+        display_size.y = std::max(50.0f, display_size.y);
+        
+        ImVec2 canvas_p0 = ImGui::GetCursorScreenPos(); // Top-left of the drawing area
+        ImVec2 canvas_p1 = ImVec2(canvas_p0.x + display_size.x, canvas_p0.y + display_size.y);
+        ImDrawList* draw_list = ImGui::GetWindowDrawList();
+
+        // Display background clip frame
+        if (smart_mask_editor_bg_clip_tex != 0) {
+            // UVs (0,0) to (1,1) for ImGui::Image usually assumes texture is top-left origin.
+            // If your video textures are standard GL (bottom-left), flip Y.
+            draw_list->AddImage((ImTextureID)(intptr_t)smart_mask_editor_bg_clip_tex, canvas_p0, canvas_p1, ImVec2(0,1), ImVec2(1,0));
+        } else {
+            draw_list->AddRectFilled(canvas_p0, canvas_p1, IM_COL32(30,30,30,255));
+            ImGui::SetCursorScreenPos(ImVec2(canvas_p0.x + 5, canvas_p0.y + 5));
+            ImGui::Text("Background frame unavailable");
+        }
+        
+        // Display GrabCut result overlay (semi-transparent)
+        if (smart_mask_editor_overlay_tex != 0) {
+            // This texture was created from OpenCV mask (likely top-left data).
+            // If GrabCutMaskToRGBTexture doesn't flip, and ImGui::Image needs top-left, UVs (0,0)-(1,1)
+            // If GrabCutMaskToRGBTexture *does* flip, and ImGui needs top-left, UVs (0,1)-(1,0)
+            // Assuming GrabCutMaskToRGBTexture outputs standard GL (bottom-left after potential flip):
+            draw_list->AddImage((ImTextureID)(intptr_t)smart_mask_editor_overlay_tex,
+                                 canvas_p0, canvas_p1,
+                                 ImVec2(0,1), ImVec2(1,0), // Flip Y for display
+                                 IM_COL32(255, 255, 255, 128)); // Semi-transparent white
+        }
+
+
+        // ROI Drawing Logic
+        ImGui::InvisibleButton("##smart_mask_canvas", display_size);
+        bool is_hovered = ImGui::IsItemHovered();
+        bool is_active = ImGui::IsItemActive();
+
+        if (is_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            smart_mask_drawing_roi = true;
+            smart_mask_roi_start_pos = ImGui::GetMousePos(); // Screen coordinates
+            smart_mask_roi_end_pos = smart_mask_roi_start_pos;
+        }
+        if (smart_mask_drawing_roi) {
+            smart_mask_roi_end_pos = ImGui::GetMousePos();
+            if (ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+                smart_mask_drawing_roi = false;
+                // Optional: Clamp ROI_end_pos to canvas boundaries
+                smart_mask_roi_end_pos.x = std::max(canvas_p0.x, std::min(smart_mask_roi_end_pos.x, canvas_p1.x));
+                smart_mask_roi_end_pos.y = std::max(canvas_p0.y, std::min(smart_mask_roi_end_pos.y, canvas_p1.y));
+            }
+            // Draw the ROI rectangle being dragged
+            draw_list->AddRect(smart_mask_roi_start_pos, smart_mask_roi_end_pos, IM_COL32(255, 255, 0, 255), 0.0f, 0, 2.0f);
+        } else if (smart_mask_roi_start_pos.x >= 0) { // ROI has been defined
+            // Draw the finalized ROI
+             draw_list->AddRect(smart_mask_roi_start_pos, smart_mask_roi_end_pos, IM_COL32(0, 255, 0, 255), 0.0f, 0, 2.0f);
+        }
+
+
+        ImGui::SetCursorPosY(canvas_p0.y + display_size.y + 10); // Move cursor below canvas
+
+        // --- Buttons ---
+        if (ImGui::Button("Analyze Frame") && smart_mask_roi_start_pos.x >= 0 && !smart_mask_current_decoded_frame.pixels.empty()) {
+            // Convert screen-space ROI to normalized canvas UVs [0,1] (top-left origin)
+            ImVec2 roi_norm_tl, roi_norm_br;
+            roi_norm_tl.x = (smart_mask_roi_start_pos.x - canvas_p0.x) / display_size.x;
+            roi_norm_tl.y = (smart_mask_roi_start_pos.y - canvas_p0.y) / display_size.y;
+            roi_norm_br.x = (smart_mask_roi_end_pos.x - canvas_p0.x) / display_size.x;
+            roi_norm_br.y = (smart_mask_roi_end_pos.y - canvas_p0.y) / display_size.y;
+
+            // Ensure tl is actually top-left and br is bottom-right for RunGrabCut
+            ImVec2 final_tl(std::min(roi_norm_tl.x, roi_norm_br.x), std::min(roi_norm_tl.y, roi_norm_br.y));
+            ImVec2 final_br(std::max(roi_norm_tl.x, roi_norm_br.x), std::max(roi_norm_tl.y, roi_norm_br.y));
+            
+            // Delete old overlay texture before generating a new one
+            if (smart_mask_editor_overlay_tex != 0) {
+                glDeleteTextures(1, &smart_mask_editor_overlay_tex);
+                smart_mask_editor_overlay_tex = 0;
+            }
+
+            bool success = current_editing_smart_mask_node->RunGrabCut(smart_mask_current_decoded_frame, final_tl, final_br);
+            if (success && current_editing_smart_mask_node->current_smart_mask_texture != 0) {
+                // The RunGrabCut method now directly updates node's current_smart_mask_texture.
+                // We need a *copy* of this for the editor's overlay, or just use the node's directly if it's safe.
+                // For simplicity, let's assume RunGrabCut stores it in the node, and we use that for overlay.
+                // To avoid re-upload, we can make GrabCutMaskToRGBTexture return the data, and upload here.
+                // For now, let's assign the node's texture to our editor's overlay for display.
+                // IMPORTANT: This means if the user closes without "Apply", the node still holds this temp texture.
+                smart_mask_editor_overlay_tex = current_editing_smart_mask_node->current_smart_mask_texture;
+                // To be safer, you might want GrabCut to return pixel data, and the editor manages its own overlay_tex
+                // then "Apply" copies it to the node.
+                std::cout << "Smart Mask Analyzed. Overlay tex ID: " << smart_mask_editor_overlay_tex << std::endl;
+
+            } else {
+                tinyfd_messageBox("Error", "GrabCut analysis failed.", "ok", "error", 1);
+            }
+        }
+
+        ImGui::SameLine();
+        if (ImGui::Button("Apply Smart Mask")) {
+            if (current_editing_smart_mask_node->grabcut_ran_for_current_texture &&
+                current_editing_smart_mask_node->current_smart_mask_texture != 0)
+            {
+                // The node's current_smart_mask_texture is already set by RunGrabCut.
+                // We just need to set the mask type.
+                current_editing_smart_mask_node->mask_type = MaskEffectNode::MaskType::Smart_Interactive;
+                // The actual effect processing will use current_editing_smart_mask_node->current_smart_mask_texture
+                
+                // Mark that the main preview needs an update
+                // layers_changed = true; // Assuming layers_changed is accessible or pass by ref
+                
+                tinyfd_messageBox("Success", "Smart mask applied to effect.", "ok", "info", 1);
+                smart_mask_editor_open = false; // Close editor on apply
+            } else {
+                tinyfd_messageBox("Warning", "No smart mask generated yet. Analyze frame first.", "ok", "warning", 1);
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Clear ROI")) {
+            smart_mask_roi_start_pos = ImVec2(-1,-1);
+            smart_mask_drawing_roi = false;
+            if (smart_mask_editor_overlay_tex != 0) { // Also clear overlay if ROI is cleared
+                glDeleteTextures(1, &smart_mask_editor_overlay_tex);
+                smart_mask_editor_overlay_tex = 0;
+                // Also clear it from the node if it was set by a previous analyze
+                if (current_editing_smart_mask_node && current_editing_smart_mask_node->current_smart_mask_texture != 0 && current_editing_smart_mask_node->grabcut_ran_for_current_texture) {
+                     // Decide if clearing ROI should also nuke the node's temp mask. For now, let's say yes.
+                     // glDeleteTextures(1, ¤t_editing_smart_mask_node->current_smart_mask_texture);
+                     // current_editing_smart_mask_node->current_smart_mask_texture = 0;
+                     // current_editing_smart_mask_node->grabcut_ran_for_current_texture = false;
+                }
+            }
+        }
+
+    }
+    ImGui::End();
+
+    if (!smart_mask_editor_open) { // Cleanup if window was closed
+        if (smart_mask_editor_overlay_tex != 0) {
+             glDeleteTextures(1, &smart_mask_editor_overlay_tex);
+             smart_mask_editor_overlay_tex = 0;
+        }
+        // If RunGrabCut directly modified node->current_smart_mask_texture,
+        // and the user closes without "Apply", that texture might still be on the node.
+        // Decide on desired behavior: either "Apply" is the only way to commit,
+        // or "Analyze" directly modifies the node for immediate preview in the main timeline.
+        // Current implementation of RunGrabCut directly modifies the node's texture.
+    }
 }

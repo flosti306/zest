@@ -5,6 +5,7 @@
 #include <glm/glm.hpp>
 #include <glad/glad.h> // Include glad for OpenGL function loading
 #include "effects.hpp"
+#include "cv_utils.hpp"
 
 
 GLuint LoadShaderProgram(const std::string& vertex_path, const std::string& fragment_path) {
@@ -595,6 +596,9 @@ void MaskEffectNode::Process(const EffectContext& ctx) {
 
     glUseProgram(mask_program);
 
+    GLuint active_mask_texture_for_shader = 0;
+    GLint mask_sampler_loc = glGetUniformLocation(mask_program, "u_MaskTexture");
+
     // --- Evaluate Keyframes ---
     float eval_feather = feather; // Default to base value
     if (!feather_track.keyframes.empty()) eval_feather = feather_track.Evaluate(ctx.time);
@@ -633,6 +637,7 @@ void MaskEffectNode::Process(const EffectContext& ctx) {
     // Set type-specific uniforms
     switch (mask_type) {
         case MaskType::Rectangle:
+            active_mask_texture_for_shader = mask_texture;
             // ***** USE EVALUATED VALUES *****
             glUniform2f(glGetUniformLocation(mask_program, "u_RectCenter"), eval_rect_center.x, eval_rect_center.y);
             glUniform2f(glGetUniformLocation(mask_program, "u_RectSize"), eval_rect_size.x, eval_rect_size.y);
@@ -640,6 +645,7 @@ void MaskEffectNode::Process(const EffectContext& ctx) {
             glUniform1f(glGetUniformLocation(mask_program, "u_RectCornerRadius"), eval_rect_corner_radius);
             break;
         case MaskType::Circle:
+            active_mask_texture_for_shader = mask_texture;
             // ***** USE EVALUATED VALUES *****
             glUniform2f(glGetUniformLocation(mask_program, "u_CircleCenter"), eval_circle_center.x, eval_circle_center.y);
             glUniform1f(glGetUniformLocation(mask_program, "u_CircleRadius"), eval_circle_radius);
@@ -662,10 +668,33 @@ void MaskEffectNode::Process(const EffectContext& ctx) {
             glBindTexture(GL_TEXTURE_2D, mask_texture);
             glUniform1i(glGetUniformLocation(mask_program, "u_MaskTexture"), 1);
             break;
+        case MaskType::Smart_Interactive:
+            active_mask_texture_for_shader = current_smart_mask_texture;
+            // The shader's u_MaskType for 'Texture' (3) can be used
+            // as we're providing a texture containing the mask.
+            glUniform1i(glGetUniformLocation(mask_program, "u_MaskType"), 3); 
+            break;
         case MaskType::None: 
              glUseProgram(0);
              glBindFramebuffer(GL_FRAMEBUFFER, 0);
              return; 
+    }
+
+    if (active_mask_texture_for_shader != 0) {
+        glActiveTexture(GL_TEXTURE1); // Or your chosen texture unit for masks
+        glBindTexture(GL_TEXTURE_2D, active_mask_texture_for_shader);
+        if (mask_sampler_loc != -1) {
+            glUniform1i(mask_sampler_loc, 1); // Texture unit 1
+        } else {
+            // std::cerr << "Warning: u_MaskTexture uniform not found in mask shader." << std::endl;
+        }
+    } else if (mask_type == MaskType::Rectangle || mask_type == MaskType::Circle) {
+        // Procedural, no texture needed for the mask itself, uniforms already set
+    } else {
+        // No mask texture active (e.g. MaskType::None or texture is 0)
+        // Ensure a texture isn't accidentally bound to GL_TEXTURE1 from a previous operation.
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, 0);
     }
 
     glActiveTexture(GL_TEXTURE0);
@@ -681,4 +710,85 @@ void MaskEffectNode::Process(const EffectContext& ctx) {
         glActiveTexture(GL_TEXTURE0); 
     }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+bool MaskEffectNode::RunGrabCut(const DecodedFrame& current_clip_frame, const ImVec2& roi_norm_tl, const ImVec2& roi_norm_br) {
+    if (current_clip_frame.pixels.empty()) {
+        std::cerr << "RunGrabCut: Current clip frame is empty." << std::endl;
+        return false;
+    }
+
+    cv::Mat image_bgr = DecodedFrameToCvMat(current_clip_frame);
+    if (image_bgr.empty()) {
+        std::cerr << "RunGrabCut: Failed to convert frame to cv::Mat." << std::endl;
+        return false;
+    }
+
+    int img_w = image_bgr.cols;
+    int img_h = image_bgr.rows;
+
+    // Convert normalized ROI from ImGui canvas to pixel coordinates for OpenCV
+    // Ensure roi_norm_tl is actually top-left and roi_norm_br is bottom-right
+    int x = static_cast<int>(std::min(roi_norm_tl.x, roi_norm_br.x) * img_w);
+    int y = static_cast<int>(std::min(roi_norm_tl.y, roi_norm_br.y) * img_h);
+    int width = static_cast<int>(std::abs(roi_norm_br.x - roi_norm_tl.x) * img_w);
+    int height = static_cast<int>(std::abs(roi_norm_br.y - roi_norm_tl.y) * img_h);
+
+    if (width <= 0 || height <= 0) {
+        std::cerr << "RunGrabCut: Invalid ROI dimensions." << std::endl;
+        return false;
+    }
+    // Clamp ROI to image boundaries
+    x = std::max(0, std::min(x, img_w - 1));
+    y = std::max(0, std::min(y, img_h - 1));
+    width = std::min(width, img_w - x);
+    height = std::min(height, img_h - y);
+     if (width <= 0 || height <= 0) { // Check again after clamping
+        std::cerr << "RunGrabCut: ROI dimensions became invalid after clamping." << std::endl;
+        return false;
+    }
+
+
+    grabcut_roi_rect = cv::Rect(x, y, width, height); // Store for potential re-use/display
+
+    cv::Mat result_mask; // Segmentation result (CV_8UC1)
+    cv::Mat bgdModel, fgdModel; // Arrays used by GrabCut internally
+
+    std::cout << "Running GrabCut on ROI: x=" << grabcut_roi_rect.x << " y=" << grabcut_roi_rect.y
+              << " w=" << grabcut_roi_rect.width << " h=" << grabcut_roi_rect.height << std::endl;
+    
+    try {
+        // cv::GC_INIT_WITH_RECT: The rect contains the foreground object.
+        // Everything outside is initially background.
+        cv::grabCut(image_bgr, result_mask, grabcut_roi_rect, bgdModel, fgdModel, 5, cv::GC_INIT_WITH_RECT);
+    } catch (const cv::Exception& e) {
+        std::cerr << "OpenCV Exception in grabCut: " << e.what() << std::endl;
+        return false;
+    }
+
+    // The result_mask now contains:
+    //  cv::GC_BGD (0) - Definite background
+    //  cv::GC_FGD (1) - Definite foreground
+    //  cv::GC_PR_BGD (2) - Probable background
+    //  cv::GC_PR_FGD (3) - Probable foreground
+
+    // Convert this mask to a displayable texture
+    if (current_smart_mask_texture != 0) {
+        glDeleteTextures(1, &current_smart_mask_texture);
+        current_smart_mask_texture = 0;
+    }
+
+    int tex_w, tex_h;
+    // Create a B&W mask (FG=white, BG=black) for consistency with drawn masks
+    current_smart_mask_texture = GrabCutMaskToRGBTexture(result_mask, tex_w, tex_h, true); 
+
+    if (current_smart_mask_texture == 0) {
+        std::cerr << "RunGrabCut: Failed to convert GrabCut mask to texture." << std::endl;
+        grabcut_ran_for_current_texture = false;
+        return false;
+    }
+    
+    grabcut_ran_for_current_texture = true;
+    std::cout << "GrabCut successful. Generated mask texture ID: " << current_smart_mask_texture << std::endl;
+    return true;
 }

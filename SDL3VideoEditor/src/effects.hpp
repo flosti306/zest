@@ -10,6 +10,10 @@
 #include <glad/glad.h> // Include glad for OpenGL function loading
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_image.h>
+#include <opencv2/opencv.hpp>
+#include <opencv2/core/types.hpp> // For cv::Rect specifically
+#include <imgui.h>
+#include "video_export.hpp" // For DecodedFrame (or shared.hpp if it's there)
 #include "shared.hpp"
 
 GLuint create_temp_fbo(glm::vec2 resolution, GLuint& texture_out);
@@ -99,8 +103,8 @@ struct MaskEffectNode : public EffectNode {
         None,
         Rectangle,
         Circle,
-        Texture // For loaded images or drawn masks
-        // Smart (Future - placeholder)
+        Texture, // For loaded images or drawn masks
+        Smart_Interactive
     };
 
     MaskType mask_type = MaskType::Rectangle;
@@ -122,6 +126,15 @@ struct MaskEffectNode : public EffectNode {
     GLuint mask_texture = 0;
     std::string mask_texture_path = ""; // For loading/saving
 
+    // Smart mask parameters
+    GLuint current_smart_mask_texture = 0; // Texture ID for the GrabCut result
+    cv::Rect grabcut_roi_rect; // OpenCV Rect (x, y, width, height) in *image pixel* coordinates
+    bool grabcut_ran_for_current_texture = false;
+    
+    std::map<float, GLuint> smart_mask_sequence;
+    float smart_mask_start_time = 0.0f;
+    float smart_mask_fps = 0.0f;
+
     KeyframeTrack<float> feather_track;
     KeyframeTrack<float> rect_center_x_track;
     KeyframeTrack<float> rect_center_y_track;
@@ -142,12 +155,31 @@ struct MaskEffectNode : public EffectNode {
 
     ~MaskEffectNode() override {
         if (mask_texture != 0) {
-            glDeleteTextures(1, &mask_texture);
+            glDeleteTextures(1, &mask_texture); // Correct: pass address
         }
+        if (current_smart_mask_texture != 0) {
+            glDeleteTextures(1, &current_smart_mask_texture); // Correct: pass address
+        }
+
+        // Correctly iterate and delete textures from smart_mask_sequence
+        for (auto const& pair : this->smart_mask_sequence) { // Use this-> or ensure it's in scope
+            if (pair.second != 0) { // pair.second is the GLuint tex_id
+                GLuint id_to_delete = pair.second; // Make a non-const copy
+                glDeleteTextures(1, &id_to_delete);
+            }
+        }
+        this->smart_mask_sequence.clear(); // Use this-> or ensure it's in scope
     }
 
     // Function to load a texture mask
     bool loadMaskTexture(const std::string& path);
 
     void Process(const EffectContext& ctx) override;
+
+
+    // Method to run GrabCut (will be called from UI)
+    // frame_pixels: Raw pixel data of the current clip frame (e.g., from DecodedFrame)
+    // frame_w, frame_h: Dimensions of that frame
+    // roi_normalized: The user-drawn rectangle in NORMALIZED ImGui canvas coordinates [0,1]
+    bool RunGrabCut(const DecodedFrame& current_clip_frame, const ImVec2& roi_norm_tl, const ImVec2& roi_norm_br);
 };
