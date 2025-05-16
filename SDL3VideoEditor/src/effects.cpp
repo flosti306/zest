@@ -669,7 +669,7 @@ void MaskEffectNode::Process(const EffectContext& ctx) {
             glUniform1i(glGetUniformLocation(mask_program, "u_MaskTexture"), 1);
             break;
         case MaskType::Smart_Interactive:
-            active_mask_texture_for_shader = current_smart_mask_texture;
+            active_mask_texture_for_shader = smart_interactive_mask_texture;
             // The shader's u_MaskType for 'Texture' (3) can be used
             // as we're providing a texture containing the mask.
             glUniform1i(glGetUniformLocation(mask_program, "u_MaskType"), 3); 
@@ -712,7 +712,10 @@ void MaskEffectNode::Process(const EffectContext& ctx) {
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }
 
-bool MaskEffectNode::RunGrabCut(const DecodedFrame& current_clip_frame, const ImVec2& roi_norm_tl, const ImVec2& roi_norm_br) {
+GLuint MaskEffectNode::RunGrabCut(const DecodedFrame& current_clip_frame,
+                                GrabCutInitMode mode,
+                                const cv::Rect& roi_for_rect_mode_px, // Already in pixel coords
+                                const cv::Mat& scribble_mask_for_mask_mode_cv) { // CV_8UC1
     if (current_clip_frame.pixels.empty()) {
         std::cerr << "RunGrabCut: Current clip frame is empty." << std::endl;
         return false;
@@ -727,68 +730,51 @@ bool MaskEffectNode::RunGrabCut(const DecodedFrame& current_clip_frame, const Im
     int img_w = image_bgr.cols;
     int img_h = image_bgr.rows;
 
-    // Convert normalized ROI from ImGui canvas to pixel coordinates for OpenCV
-    // Ensure roi_norm_tl is actually top-left and roi_norm_br is bottom-right
-    int x = static_cast<int>(std::min(roi_norm_tl.x, roi_norm_br.x) * img_w);
-    int y = static_cast<int>(std::min(roi_norm_tl.y, roi_norm_br.y) * img_h);
-    int width = static_cast<int>(std::abs(roi_norm_br.x - roi_norm_tl.x) * img_w);
-    int height = static_cast<int>(std::abs(roi_norm_br.y - roi_norm_tl.y) * img_h);
+    cv::Mat result_mask_cv;
+    cv::Mat bgdModel, fgdModel;
+    cv::Rect actual_roi_for_grabcut = roi_for_rect_mode_px; // Default
 
-    if (width <= 0 || height <= 0) {
-        std::cerr << "RunGrabCut: Invalid ROI dimensions." << std::endl;
-        return false;
-    }
-    // Clamp ROI to image boundaries
-    x = std::max(0, std::min(x, img_w - 1));
-    y = std::max(0, std::min(y, img_h - 1));
-    width = std::min(width, img_w - x);
-    height = std::min(height, img_h - y);
-     if (width <= 0 || height <= 0) { // Check again after clamping
-        std::cerr << "RunGrabCut: ROI dimensions became invalid after clamping." << std::endl;
-        return false;
-    }
-
-
-    grabcut_roi_rect = cv::Rect(x, y, width, height); // Store for potential re-use/display
-
-    cv::Mat result_mask; // Segmentation result (CV_8UC1)
-    cv::Mat bgdModel, fgdModel; // Arrays used by GrabCut internally
-
-    std::cout << "Running GrabCut on ROI: x=" << grabcut_roi_rect.x << " y=" << grabcut_roi_rect.y
-              << " w=" << grabcut_roi_rect.width << " h=" << grabcut_roi_rect.height << std::endl;
-    
     try {
-        // cv::GC_INIT_WITH_RECT: The rect contains the foreground object.
-        // Everything outside is initially background.
-        cv::grabCut(image_bgr, result_mask, grabcut_roi_rect, bgdModel, fgdModel, 5, cv::GC_INIT_WITH_RECT);
-    } catch (const cv::Exception& e) {
-        std::cerr << "OpenCV Exception in grabCut: " << e.what() << std::endl;
-        return false;
-    }
+        if (mode == GrabCutInitMode::RECT) {
+            if (actual_roi_for_grabcut.width <= 0 || actual_roi_for_grabcut.height <= 0) {
+                 std::cerr << "RunGrabCut (RECT): Invalid ROI." << std::endl; return 0;
+            }
+            cv::grabCut(image_bgr, result_mask_cv, actual_roi_for_grabcut, bgdModel, fgdModel, 5, cv::GC_INIT_WITH_RECT);
+        } else { // GrabCutInitMode::MASK
+            if (scribble_mask_for_mask_mode_cv.empty() || 
+                scribble_mask_for_mask_mode_cv.size() != image_bgr.size() ||
+                scribble_mask_for_mask_mode_cv.type() != CV_8UC1) {
+                std::cerr << "RunGrabCut (MASK): Invalid scribble mask." << std::endl; return 0;
+            }
+            // When using GC_INIT_WITH_MASK, result_mask_cv is also the input hint mask.
+            scribble_mask_for_mask_mode_cv.copyTo(result_mask_cv); 
+            // The ROI can still be passed to potentially speed up, but GrabCut mainly uses the mask.
+            // If no meaningful ROI, you can pass a rect covering the whole image.
+            // For simplicity, if scribbles are used, let's assume the scribble mask dictates areas.
+            // The rect parameter is still required by the API signature even with GC_INIT_WITH_MASK.
+            // It often defines the area where "probable" values in the mask will be considered.
+            // If your scribble_mask_cv *only* contains GC_FGD and GC_BGD, then the rect might be less critical.
+            // If it contains GC_PR_FGD/BGD, the rect helps define the "unknown" region.
+            // For now, let's use the full image if mode is MASK and no specific ROI is also provided for it.
+            cv::Rect processing_rect(0, 0, image_bgr.cols, image_bgr.rows); 
+            if(roi_for_rect_mode_px.width > 0 && roi_for_rect_mode_px.height > 0 && mode == GrabCutInitMode::MASK) {
+                // Optionally, if an ROI is ALSO provided with scribble mode, use it.
+                // This is advanced: the mask has scribbles, and rect defines "unknowns".
+                // For now, if scribbles, let's assume they are comprehensive enough or rect is full image.
+            }
 
-    // The result_mask now contains:
-    //  cv::GC_BGD (0) - Definite background
-    //  cv::GC_FGD (1) - Definite foreground
-    //  cv::GC_PR_BGD (2) - Probable background
-    //  cv::GC_PR_FGD (3) - Probable foreground
-
-    // Convert this mask to a displayable texture
-    if (current_smart_mask_texture != 0) {
-        glDeleteTextures(1, &current_smart_mask_texture);
-        current_smart_mask_texture = 0;
-    }
+            cv::grabCut(image_bgr, result_mask_cv, processing_rect, bgdModel, fgdModel, 5, cv::GC_INIT_WITH_MASK);
+        }
+    } catch (const cv::Exception& e) { /* ... */ return 0; }
 
     int tex_w, tex_h;
-    // Create a B&W mask (FG=white, BG=black) for consistency with drawn masks
-    current_smart_mask_texture = GrabCutMaskToRGBTexture(result_mask, tex_w, tex_h, true); 
+    GLuint generated_texture_id = GrabCutMaskToRGBTexture(result_mask_cv, tex_w, tex_h, true);
 
-    if (current_smart_mask_texture == 0) {
+    if (generated_texture_id == 0) {
         std::cerr << "RunGrabCut: Failed to convert GrabCut mask to texture." << std::endl;
-        grabcut_ran_for_current_texture = false;
-        return false;
+        return 0;
     }
-    
-    grabcut_ran_for_current_texture = true;
-    std::cout << "GrabCut successful. Generated mask texture ID: " << current_smart_mask_texture << std::endl;
-    return true;
+
+    std::cout << "GrabCut successful. Generated temporary mask texture ID: " << generated_texture_id << std::endl;
+    return generated_texture_id; // Return the new texture ID
 }

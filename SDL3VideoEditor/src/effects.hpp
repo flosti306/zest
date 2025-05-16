@@ -127,9 +127,8 @@ struct MaskEffectNode : public EffectNode {
     std::string mask_texture_path = ""; // For loading/saving
 
     // Smart mask parameters
-    GLuint current_smart_mask_texture = 0; // Texture ID for the GrabCut result
+    GLuint smart_interactive_mask_texture = 0;
     cv::Rect grabcut_roi_rect; // OpenCV Rect (x, y, width, height) in *image pixel* coordinates
-    bool grabcut_ran_for_current_texture = false;
     
     std::map<float, GLuint> smart_mask_sequence;
     float smart_mask_start_time = 0.0f;
@@ -157,8 +156,8 @@ struct MaskEffectNode : public EffectNode {
         if (mask_texture != 0) {
             glDeleteTextures(1, &mask_texture); // Correct: pass address
         }
-        if (current_smart_mask_texture != 0) {
-            glDeleteTextures(1, &current_smart_mask_texture); // Correct: pass address
+        if (smart_interactive_mask_texture != 0) { // Updated member name
+            glDeleteTextures(1, &smart_interactive_mask_texture);
         }
 
         // Correctly iterate and delete textures from smart_mask_sequence
@@ -177,9 +176,9 @@ struct MaskEffectNode : public EffectNode {
     void Process(const EffectContext& ctx) override;
 
 
-    // Method to run GrabCut (will be called from UI)
-    // frame_pixels: Raw pixel data of the current clip frame (e.g., from DecodedFrame)
-    // frame_w, frame_h: Dimensions of that frame
-    // roi_normalized: The user-drawn rectangle in NORMALIZED ImGui canvas coordinates [0,1]
-    bool RunGrabCut(const DecodedFrame& current_clip_frame, const ImVec2& roi_norm_tl, const ImVec2& roi_norm_br);
+    enum class GrabCutInitMode { RECT, MASK };
+    GLuint RunGrabCut(const DecodedFrame& frame, 
+                    GrabCutInitMode mode, 
+                    const cv::Rect& roi_for_rect_mode, // Pixel coords
+                    const cv::Mat& scribble_mask_for_mask_mode); // CV_8UC1 with GC_ values
 };
