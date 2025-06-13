@@ -2184,6 +2184,21 @@ void DrawEffectUIForClip(Clip& clip, GLResources& gl_resources) {
             // Default settings are set in constructor
             clip.effect_graph->nodes.push_back(mask);
         }
+        if (ImGui::Button("Add Solid Color Overlay")) {
+            auto solid_fx = std::make_shared<SolidColorEffectNode>();
+            // Default values are set in constructor
+            clip.effect_graph->nodes.push_back(solid_fx);
+        }
+        if (ImGui::Button("Add Gradient Overlay")) {
+            auto grad_fx = std::make_shared<GradientEffectNode>();
+            // Default values are set in constructor
+            clip.effect_graph->nodes.push_back(grad_fx);
+        }
+        if (ImGui::Button("Add Drop Shadow")) {
+            auto shadow_fx = std::make_shared<DropShadowEffectNode>();
+            // Default values are in constructor
+            clip.effect_graph->nodes.push_back(shadow_fx);
+        }
 
         for (size_t i = 0; i < clip.effect_graph->nodes.size(); ++i) {
             bool effect_changed = false;
@@ -2356,6 +2371,57 @@ void DrawEffectUIForClip(Clip& clip, GLResources& gl_resources) {
                         case MaskEffectNode::MaskType::None:
                             break; // No specific controls needed
                     }
+                } else if (auto solid_color_node = std::dynamic_pointer_cast<SolidColorEffectNode>(node)) {
+                    ImGui::Text("Solid Color Properties:");
+                    ImGui::ColorEdit4("Color##Solid", &solid_color_node->color.x); // ImGui uses float pointers for colors
+                    DrawKeyframeTrackEditor("Red", solid_color_node->red_track);
+                    DrawKeyframeTrackEditor("Green", solid_color_node->green_track);
+                    DrawKeyframeTrackEditor("Blue", solid_color_node->blue_track);
+                    DrawKeyframeTrackEditor("Alpha", solid_color_node->alpha_track);
+                    ImGui::SliderFloat("Blend with Original##Solid", &solid_color_node->blend_with_original, 0.0f, 1.0f);
+                    DrawKeyframeTrackEditor("Blend", solid_color_node->blend_track);
+
+                } else if (auto gradient_node = std::dynamic_pointer_cast<GradientEffectNode>(node)) {
+                    ImGui::Text("Gradient Properties:");
+                    const char* grad_types[] = { "Linear", "Radial" };
+                    int current_g_type = static_cast<int>(gradient_node->type);
+                    if (ImGui::Combo("Type##Gradient", &current_g_type, grad_types, IM_ARRAYSIZE(grad_types))) {
+                        gradient_node->type = static_cast<GradientEffectNode::GradientType>(current_g_type);
+                    }
+
+                    ImGui::ColorEdit4("Start Color##Gradient", &gradient_node->color_start.x);
+                    ImGui::ColorEdit4("End Color##Gradient", &gradient_node->color_end.x);
+                    // Example keyframes for alpha
+                    DrawKeyframeTrackEditor("Start Alpha", gradient_node->start_color_alpha_track);
+                    DrawKeyframeTrackEditor("End Alpha", gradient_node->end_color_alpha_track);
+
+
+                    if (gradient_node->type == GradientEffectNode::GradientType::Linear) {
+                        ImGui::SliderFloat2("Start Point##LinearGrad", &gradient_node->start_point.x, 0.0f, 1.0f, "%.2f");
+                        ImGui::SliderFloat2("End Point##LinearGrad", &gradient_node->end_point.x, 0.0f, 1.0f, "%.2f");
+                    } else if (gradient_node->type == GradientEffectNode::GradientType::Radial) {
+                        ImGui::SliderFloat2("Center##RadialGrad", &gradient_node->center_point.x, 0.0f, 1.0f, "%.2f");
+                        ImGui::SliderFloat("Inner Radius##RadialGrad", &gradient_node->radius_inner, 0.0f, 1.0f, "%.3f");
+                        ImGui::SliderFloat("Outer Radius##RadialGrad", &gradient_node->radius_outer, 0.0f, 1.5f, "%.3f"); // Outer can go beyond 1
+                        ImGui::SliderFloat("Aspect Ratio##RadialGrad", &gradient_node->aspect_ratio, 0.1f, 10.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+                        ImGui::TextWrapped("Aspect ratio for radial. 1.0 attempts to use viewport aspect. Other values override.");
+                    }
+
+                    ImGui::SliderFloat("Blend with Original##Gradient", &gradient_node->blend_with_original, 0.0f, 1.0f);
+                    DrawKeyframeTrackEditor("Blend##Gradient", gradient_node->blend_track);
+                } else if (auto shadow_node = std::dynamic_pointer_cast<DropShadowEffectNode>(node)) {
+                    ImGui::Text("Drop Shadow Properties:");
+                    ImGui::DragFloat2("Offset##Shadow", &shadow_node->offset.x, 0.001f, -1.0f, 1.0f, "%.3f");
+                    DrawKeyframeTrackEditor("Offset X##Shadow", shadow_node->offset_x_track);
+                    DrawKeyframeTrackEditor("Offset Y##Shadow", shadow_node->offset_y_track);
+
+                    ImGui::ColorEdit4("Shadow Color##Shadow", &shadow_node->shadow_color.x);
+                    // Add keyframe editors for shadow_color components if desired
+                    // DrawKeyframeTrackEditor("Shadow R", shadow_node->shadow_r_track); ... etc.
+
+
+                    ImGui::SliderFloat("Blur Amount##Shadow", &shadow_node->blur_amount, 0.0f, 50.0f);
+                    DrawKeyframeTrackEditor("Blur Amount##Shadow", shadow_node->blur_amount_track);
                 }
 
                 // Render common UI elements

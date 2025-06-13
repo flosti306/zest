@@ -182,3 +182,98 @@ struct MaskEffectNode : public EffectNode {
                     const cv::Rect& roi_for_rect_mode, // Pixel coords
                     const cv::Mat& scribble_mask_for_mask_mode); // CV_8UC1 with GC_ values
 };
+
+struct SolidColorEffectNode : public EffectNode {
+    glm::vec4 color = glm::vec4(1.0f, 0.0f, 0.0f, 1.0f); // Default: Red, RGBA
+    float blend_with_original = 0.0f; // 0.0 = solid color, 1.0 = original image, 0.5 = 50/50 mix
+
+    // Keyframe Tracks (optional, but good for consistency)
+    KeyframeTrack<float> red_track;
+    KeyframeTrack<float> green_track;
+    KeyframeTrack<float> blue_track;
+    KeyframeTrack<float> alpha_track;
+    KeyframeTrack<float> blend_track;
+
+
+    SolidColorEffectNode() {
+        name = "Solid Color Overlay";
+    }
+
+    void Process(const EffectContext& ctx) override;
+};
+
+struct GradientEffectNode : public EffectNode {
+    enum class GradientType {
+        Linear,
+        Radial
+        // Bilinear, etc. (can be added later)
+    };
+
+    GradientType type = GradientType::Linear;
+    glm::vec4 color_start = glm::vec4(1.0f, 0.0f, 0.0f, 1.0f); // RGBA
+    glm::vec4 color_end = glm::vec4(0.0f, 0.0f, 1.0f, 1.0f);   // RGBA
+
+    // For Linear Gradient
+    glm::vec2 start_point = glm::vec2(0.0f, 0.5f); // Normalized UV [0,1]
+    glm::vec2 end_point = glm::vec2(1.0f, 0.5f);   // Normalized UV [0,1]
+
+    // For Radial Gradient
+    glm::vec2 center_point = glm::vec2(0.5f, 0.5f); // Normalized UV [0,1]
+    float radius_inner = 0.0f; // Normalized UV [0,1] (where start color is fully opaque)
+    float radius_outer = 0.5f; // Normalized UV [0,1] (where end color is fully opaque)
+    float aspect_ratio = 1.0f; // To make radial gradients circular if viewport is not square
+
+    float blend_with_original = 0.0f; // 0.0 = gradient only, 1.0 = original, 0.5 = mix
+
+    // Keyframe Tracks (optional)
+    // Example for start color alpha, you can add for R,G,B, points, radii etc.
+    KeyframeTrack<float> start_color_alpha_track;
+    KeyframeTrack<float> end_color_alpha_track;
+    KeyframeTrack<float> blend_track;
+    // Keyframes for vec2 (start_point, end_point, center_point) would require KeyframeTrack<glm::vec2>
+    // or separate tracks for X and Y components. For simplicity, let's omit full keyframing for points/radii for now.
+
+    GradientEffectNode() {
+        name = "Gradient Overlay";
+    }
+
+    void Process(const EffectContext& ctx) override;
+};
+
+struct DropShadowEffectNode : public EffectNode {
+    glm::vec2 offset = glm::vec2(0.01f, -0.01f); // Normalized UV offset (e.g., 1% right, 1% down from top-left if UVs are top-left)
+                                                // Or pixel offset if preferred, but normalized is more resolution-independent.
+                                                // For standard GL UVs (bottom-left 0,0), positive Y is up.
+                                                // Let's assume positive X = right, positive Y = up for offset.
+    glm::vec4 shadow_color = glm::vec4(0.0f, 0.0f, 0.0f, 0.5f); // Black, semi-transparent
+    float blur_amount = 5.0f;       // Similar to Gaussian blur amount
+    
+    // Keyframe Tracks (optional)
+    KeyframeTrack<float> offset_x_track;
+    KeyframeTrack<float> offset_y_track;
+    KeyframeTrack<float> shadow_r_track;
+    KeyframeTrack<float> shadow_g_track;
+    KeyframeTrack<float> shadow_b_track;
+    KeyframeTrack<float> shadow_a_track;
+    KeyframeTrack<float> blur_amount_track;
+
+    // Internal state for multipass rendering
+    GLuint temp_fbo1 = 0;
+    GLuint temp_tex1_alpha_mask = 0; // Stores the isolated alpha of the masked input
+    GLuint temp_tex2_blurred_alpha = 0; // Stores the blurred alpha mask
+
+    DropShadowEffectNode() {
+        name = "Drop Shadow";
+    }
+
+    ~DropShadowEffectNode() override {
+        if (temp_fbo1 != 0) glDeleteFramebuffers(1, &temp_fbo1);
+        if (temp_tex1_alpha_mask != 0) glDeleteTextures(1, &temp_tex1_alpha_mask);
+        if (temp_tex2_blurred_alpha != 0) glDeleteTextures(1, &temp_tex2_blurred_alpha);
+    }
+
+    // Helper to manage internal FBOs/textures
+    void EnsureTempResources(int width, int height);
+
+    void Process(const EffectContext& ctx) override;
+};
