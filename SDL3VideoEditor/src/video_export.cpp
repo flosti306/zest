@@ -39,8 +39,21 @@ std::mutex result_mutex;
 std::condition_variable worker_cv;
 std::atomic<bool> stop_thumbnail_worker_flag = false;
 
+std::thread decoder_thread;
+std::queue<DecodedFrameRequest> decoder_request_queue;
+std::queue<DecodedFrameResult> decoder_result_queue;
+std::mutex decoder_request_mutex;
+std::mutex decoder_result_mutex;
+std::condition_variable decoder_worker_cv;
+std::atomic<bool> stop_decoder_worker_flag = false;
+
+// Add request deduplication
+std::mutex pending_requests_mutex;
+std::set<std::pair<std::string, double>> global_pending_requests;
+
 void start_thumbnail_worker();
 void stop_thumbnail_worker();
+bool decode_frame_at_timestamp(DecoderState* state, double timestamp, DecodedFrameResult& result);
 
 // Debug function to check OpenGL context status
 void check_gl_context() {
@@ -104,6 +117,9 @@ bool initialize_video_resources(GLResources& res, const std::string& path) {
     }
 
     VideoData video;
+    video.consecutive_cache_hits = 0;
+    video.is_actively_playing = false;
+    video.last_request_time = std::chrono::steady_clock::now();
     
     // Open the file
     video.format_ctx = avformat_alloc_context();
@@ -413,8 +429,13 @@ bool update_texture_from_cache(VideoData& video, double target_time_seconds) {
         return false;
     }
 
-    // Find the closest frame in the cache (your existing logic for this is fine)
+    // --- ROBUST FRAME SELECTION LOGIC ---
     const DecodedFrame* best_frame = nullptr;
+
+    // Default to the most recent frame in the cache if no better match is found.
+    // This is a critical fallback to prevent showing nothing.
+    best_frame = &video.frame_cache.back(); 
+
     double min_diff = std::numeric_limits<double>::max();
     for (const auto& frame : video.frame_cache) {
         double diff = std::abs(frame.pts - target_time_seconds);
@@ -423,112 +444,44 @@ bool update_texture_from_cache(VideoData& video, double target_time_seconds) {
             best_frame = &frame;
         }
     }
+    // --- END ROBUST FRAME SELECTION ---
 
+    // Safety check - should never be null if cache is not empty, but good practice.
     if (!best_frame) {
-        return false; // No suitable frame found
+        return false;
     }
 
-    // --- ASYNCHRONOUS UPLOAD LOGIC ---
+    // --- The rest of the PBO UPLOAD LOGIC is correct and remains unchanged ---
     
     // 1. Bind the texture we want to update.
     glBindTexture(GL_TEXTURE_2D, video.texture_id);
     
     // 2. Bind the PBO that will receive the new pixel data.
-    // We ping-pong between pbo_index 0 and 1.
     video.pbo_index = (video.pbo_index + 1) % 2;
     int current_pbo_id = video.pbos[video.pbo_index];
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, current_pbo_id);
 
     // 3. Upload the pixel data to the PBO.
-    // First, we map the buffer, which gives us a pointer we can write to.
-    // This call will wait until the GPU is done with any *previous* operations on this PBO,
-    // which is why double-buffering is essential.
-    glBufferData(GL_PIXEL_UNPACK_BUFFER, video.pbo_buffer_size, 0, GL_STREAM_DRAW); // Orphan the buffer
+    glBufferData(GL_PIXEL_UNPACK_BUFFER, video.pbo_buffer_size, 0, GL_STREAM_DRAW);
     GLubyte* pbo_ptr = (GLubyte*)glMapBuffer(GL_PIXEL_UNPACK_BUFFER, GL_WRITE_ONLY);
     
     if (pbo_ptr) {
-        // Copy the decoded frame's pixels directly into the PBO's memory.
         memcpy(pbo_ptr, best_frame->pixels.data(), video.pbo_buffer_size);
-        glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER); // Release the pointer.
+        glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
     } else {
-        // Handle error if mapping fails.
         glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
         return false;
     }
 
     // 4. Issue the ASYNCHRONOUS texture update command.
-    // The last argument is `(void*)0`, which OpenGL interprets as an offset into the
-    // currently bound GL_PIXEL_UNPACK_BUFFER (our PBO), NOT a pointer to system RAM.
-    // This call returns IMMEDIATELY, letting the CPU continue its work. The GPU
-    // will perform the transfer from the PBO to the texture in the background.
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, video.width, video.height, GL_RGB, GL_UNSIGNED_BYTE, (void*)0);
 
-    // 5. Unbind everything for good measure.
+    // 5. Unbind everything.
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
     glBindTexture(GL_TEXTURE_2D, 0);
 
     return true;
 }
-
-// --- The NEW, consolidated preview update function ---
-void update_video_previews(GLResources& res, const std::vector<Clip>& active_clips, float current_time) {
-    // Step 1: Group all required media times by their source file path.
-    // This is the core optimization. We avoid redundant work on the same file.
-    std::map<std::string, std::vector<double>> required_times_by_path;
-
-    for (const auto& clip : active_clips) {
-        // Only process video clips that are actually from video files.
-        if (clip.type == ClipType::Video && is_video_file(clip.path)) {
-            // Calculate the timestamp needed from the source media file.
-            float media_time = (current_time - clip.start_time) + clip.media_start;
-            
-            // Only add valid, positive times to the request list.
-            if (media_time >= 0) {
-                required_times_by_path[clip.path].push_back(media_time);
-            }
-        }
-    }
-
-    // Step 2: For each unique video file, perform a single consolidated decoding pass.
-    for (auto const& [path, times] : required_times_by_path) {
-        auto it = res.video_cache.find(path);
-        if (it == res.video_cache.end() || !it->second.is_initialized) {
-            continue; // Skip if this video's resources aren't ready.
-        }
-
-        VideoData& video = it->second;
-
-        // Find the LATEST timestamp required for this file among all its clip segments.
-        double max_required_time = 0.0;
-        if (!times.empty()) {
-            max_required_time = *std::max_element(times.begin(), times.end());
-        }
-
-        // Add a small buffer to decode slightly ahead for smooth playback.
-        float decode_ahead_time = 2.0f / 30.0f; // 2 frames at 30fps
-        double decode_target_time = max_required_time + decode_ahead_time;
-
-        // Call the powerful ensure_video_decoded_upto function just ONCE for this file.
-        // It will efficiently seek or decode to get the file's internal state ready.
-        ensure_video_decoded_upto(video, decode_target_time);
-    }
-    
-    // Step 3: Now that all caches are populated, update the textures for each clip.
-    // This part is fast as it just finds the best frame in the cache and does a GL upload.
-    for (const auto& clip : active_clips) {
-        if (clip.type == ClipType::Video && is_video_file(clip.path)) {
-            auto it = res.video_cache.find(clip.path);
-            if (it != res.video_cache.end() && it->second.is_initialized) {
-                float media_time = (current_time - clip.start_time) + clip.media_start;
-                if (media_time >= 0) {
-                    // This function just reads from the cache we populated above.
-                    update_texture_from_cache(it->second, media_time);
-                }
-            }
-        }
-    }
-}
-
 
 // Loads ONLY image textures
 void load_textures(GLResources& res, const std::vector<Clip>& clips) {
@@ -1573,4 +1526,370 @@ void stop_thumbnail_worker() {
         std::lock_guard<std::mutex> lock(result_mutex);
         std::queue<ThumbnailResult>().swap(thumbnail_result_queue);
      }
+}
+
+// Enhanced decoder worker with better error handling and performance
+void decoder_worker_func() {
+    std::cout << "Decoder worker thread started." << std::endl;
+    std::map<std::string, std::unique_ptr<DecoderState>> decoder_cache;
+    
+    // Performance tracking
+    auto last_stats_time = std::chrono::steady_clock::now();
+    int frames_processed = 0;
+
+    while (!stop_decoder_worker_flag) {
+        DecodedFrameRequest request;
+
+        // Wait for request with timeout to allow periodic cleanup
+        {
+            std::unique_lock<std::mutex> lock(decoder_request_mutex);
+            bool got_request = decoder_worker_cv.wait_for(lock, std::chrono::milliseconds(100), [&] {
+                return !decoder_request_queue.empty() || stop_decoder_worker_flag;
+            });
+
+            if (stop_decoder_worker_flag) break;
+            
+            if (!got_request || decoder_request_queue.empty()) {
+                // Periodic cleanup of old decoder states
+                continue;
+            }
+            
+            // Prioritize latest requests during fast operations
+            while (decoder_request_queue.size() > 2) {
+                // NOTE: This can be a bit aggressive. If you find the preview stutters during
+                // fast scrubs, you might want to remove or adjust this block.
+                decoder_request_queue.pop();
+            }
+            
+            request = decoder_request_queue.front();
+            decoder_request_queue.pop();
+        }
+
+        // Process the request
+        DecodedFrameResult result;
+        result.clip_path = request.clip_path;
+        result.success = false;
+
+        // Get or create decoder state
+        DecoderState* state = nullptr;
+        auto it = decoder_cache.find(request.clip_path);
+        
+        if (it == decoder_cache.end()) {
+            // Create new decoder state
+            auto new_state = std::make_unique<DecoderState>();
+            try {
+                if (avformat_open_input(&new_state->fmt_ctx, request.clip_path.c_str(), nullptr, nullptr) != 0)
+                    throw std::runtime_error("Could not open video file");
+                if (avformat_find_stream_info(new_state->fmt_ctx, nullptr) < 0)
+                    throw std::runtime_error("Could not find stream info");
+                
+                new_state->video_stream_idx = av_find_best_stream(new_state->fmt_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+                if (new_state->video_stream_idx < 0) throw std::runtime_error("No video stream found");
+
+                AVCodecParameters* codec_params = new_state->fmt_ctx->streams[new_state->video_stream_idx]->codecpar;
+                const AVCodec* codec = avcodec_find_decoder(codec_params->codec_id);
+                if (!codec) throw std::runtime_error("Unsupported codec");
+                
+                new_state->codec_ctx = avcodec_alloc_context3(codec);
+                if (!new_state->codec_ctx || 
+                    avcodec_parameters_to_context(new_state->codec_ctx, codec_params) < 0 || 
+                    avcodec_open2(new_state->codec_ctx, codec, nullptr) < 0)
+                    throw std::runtime_error("Failed to setup codec context");
+
+                new_state->time_base = new_state->fmt_ctx->streams[new_state->video_stream_idx]->time_base;
+                
+                auto inserted_it = decoder_cache.emplace(request.clip_path, std::move(new_state));
+                state = inserted_it.first->second.get();
+
+            } catch (const std::runtime_error& e) {
+                result.error_message = e.what();
+                std::lock_guard<std::mutex> lock(decoder_result_mutex);
+                decoder_result_queue.push(std::move(result));
+                continue;
+            }
+        } else {
+            state = it->second.get();
+        }
+
+        // Decode the frame (calling our new, corrected function)
+        if (decode_frame_at_timestamp(state, request.timestamp, result)) {
+            frames_processed++;
+        } else {
+            // Optionally log the error message from the result
+            if(!result.error_message.empty()) {
+                // std::cerr << "Decoding failed for " << request.clip_path << ": " << result.error_message << std::endl;
+            }
+        }
+
+
+        // Send result back to the main thread
+        {
+            std::lock_guard<std::mutex> lock(decoder_result_mutex);
+            decoder_result_queue.push(std::move(result));
+        }
+
+        // Periodic performance logging
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_stats_time).count() >= 5) {
+            // std::cout << "Decoder thread: processed " << frames_processed << " frames in 5s" << std::endl;
+            frames_processed = 0;
+            last_stats_time = now;
+        }
+    }
+    
+    std::cout << "Decoder worker thread finished." << std::endl;
+}
+
+// Helper function to decode a single frame (extracted for clarity)
+bool decode_frame_at_timestamp(DecoderState* state, double timestamp, DecodedFrameResult& result) {
+    const double SEEK_THRESHOLD = 1.5; // Seek if target is more than 1.5s away
+
+    // Seek if the target is far from our last decoded position for this specific stream
+    if (state->last_decoded_pts < 0 || std::abs(timestamp - state->last_decoded_pts) > SEEK_THRESHOLD) {
+        int64_t target_ts = av_rescale_q(static_cast<int64_t>(timestamp * AV_TIME_BASE), AV_TIME_BASE_Q, state->time_base);
+        if (av_seek_frame(state->fmt_ctx, state->video_stream_idx, target_ts, AVSEEK_FLAG_BACKWARD) < 0) {
+            std::cerr << "Warning: Seek failed for " << result.clip_path << " to timestamp " << timestamp << std::endl;
+        }
+        avcodec_flush_buffers(state->codec_ctx);
+        state->last_decoded_pts = -1.0; // Invalidate last PTS after seek
+    }
+
+    AVFrame* frame = av_frame_alloc();
+    AVPacket* packet = av_packet_alloc();
+    if (!frame || !packet) {
+        if(frame) av_frame_free(&frame);
+        if(packet) av_packet_free(&packet);
+        result.error_message = "Failed to allocate frame/packet";
+        return false;
+    }
+
+    bool frame_found_and_converted = false;
+
+    // Main decoding loop
+    while (av_read_frame(state->fmt_ctx, packet) >= 0) {
+        if (packet->stream_index == state->video_stream_idx) {
+            if (avcodec_send_packet(state->codec_ctx, packet) >= 0) {
+                while (avcodec_receive_frame(state->codec_ctx, frame) >= 0) {
+                    double frame_pts = (frame->pts == AV_NOPTS_VALUE) 
+                                       ? -1.0 
+                                       : static_cast<double>(frame->pts) * av_q2d(state->time_base);
+                    
+                    state->last_decoded_pts = frame_pts;
+
+                    // We want the first frame that is AT or AFTER our target timestamp
+                    if (frame_pts >= timestamp) {
+                        // --- START OF THE CRITICAL FIX ---
+                        
+                        // Initialize SWS context for YUV->RGB conversion if it doesn't exist
+                        state->sws_ctx = sws_getCachedContext(state->sws_ctx,
+                                                           state->codec_ctx->width, state->codec_ctx->height, state->codec_ctx->pix_fmt,
+                                                           state->codec_ctx->width, state->codec_ctx->height, AV_PIX_FMT_RGB24,
+                                                           SWS_BILINEAR, nullptr, nullptr, nullptr);
+                        if (!state->sws_ctx) {
+                            result.error_message = "Failed to create SwsContext";
+                            av_frame_unref(frame);
+                            goto cleanup_and_fail;
+                        }
+
+                        // Populate the result structure with frame data and pixels
+                        result.frame.width = state->codec_ctx->width;
+                        result.frame.height = state->codec_ctx->height;
+                        result.frame.pts = frame_pts;
+                        result.frame.pixels.resize(result.frame.width * result.frame.height * 3); // For RGB24
+
+                        uint8_t* dest_data[4] = { result.frame.pixels.data(), nullptr, nullptr, nullptr };
+                        int dest_linesize[4] = { result.frame.width * 3, 0, 0, 0 };
+
+                        // Perform the color space conversion
+                        sws_scale(state->sws_ctx, frame->data, frame->linesize, 0, state->codec_ctx->height, dest_data, dest_linesize);
+
+                        result.success = true;
+                        frame_found_and_converted = true;
+
+                        // --- END OF THE CRITICAL FIX ---
+
+                        av_frame_unref(frame);
+                        goto cleanup_and_return; // Exit all loops once we have our frame.
+                    }
+                    av_frame_unref(frame); // Unref frame if it wasn't the one we wanted
+                }
+            }
+        }
+        av_packet_unref(packet);
+    }
+
+    // If loop finishes, we hit EOF or an error without finding the frame
+    result.error_message = "Reached EOF or error before finding target frame.";
+
+cleanup_and_fail:
+    frame_found_and_converted = false;
+
+cleanup_and_return:
+    av_frame_free(&frame);
+    av_packet_free(&packet);
+    return frame_found_and_converted;
+}
+
+// Add this function to detect playback state
+void update_playback_state(GLResources& res, float current_time, float last_time) {
+    float time_delta = current_time - last_time;
+    bool is_playing = std::abs(time_delta) > 0.001f; // Playing if time is advancing
+    bool is_scrubbing = std::abs(time_delta) > 0.1f; // Large jumps indicate scrubbing
+    
+    for (auto& [path, video] : res.video_cache) {
+        video.is_actively_playing = is_playing && !is_scrubbing;
+        
+        // Reset consecutive hits if we're jumping around
+        if (is_scrubbing) {
+            video.consecutive_cache_hits = 0;
+        }
+    }
+}
+
+// --- NEW: Functions to manage the thread ---
+void start_decoder_worker() {
+    stop_decoder_worker_flag = false;
+    decoder_thread = std::thread(decoder_worker_func);
+}
+
+void stop_decoder_worker() {
+    if (decoder_thread.joinable()) {
+        stop_decoder_worker_flag = true;
+        {
+            std::lock_guard<std::mutex> lock(decoder_request_mutex);
+            std::queue<DecodedFrameRequest>().swap(decoder_request_queue);
+        }
+        decoder_worker_cv.notify_one();
+        decoder_thread.join();
+        std::cout << "Decoder worker joined." << std::endl;
+    }
+    {
+        std::lock_guard<std::mutex> lock(decoder_result_mutex);
+        std::queue<DecodedFrameResult>().swap(decoder_result_queue);
+    }
+}
+
+bool is_frame_available_in_cache(const VideoData& video, double target_time, double tolerance = VideoData::CACHE_TOLERANCE) {
+    if (video.frame_cache.empty()) return false;
+    
+    for (const auto& frame : video.frame_cache) {
+        if (std::abs(frame.pts - target_time) <= tolerance) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool should_request_frame(VideoData& video, double target_time) {
+    auto now = std::chrono::steady_clock::now();
+    
+    // Throttle requests - don't request too frequently
+    auto time_since_last_request = std::chrono::duration_cast<std::chrono::duration<double>>(
+        now - video.last_request_time).count();
+    
+    if (time_since_last_request < VideoData::MIN_REQUEST_INTERVAL) {
+        return false;
+    }
+    
+    // Don't request if we already have too many pending
+    if (video.pending_requests.size() >= VideoData::MAX_PENDING_REQUESTS) {
+        return false;
+    }
+    
+    // Check if frame is already in cache with tolerance
+    if (is_frame_available_in_cache(video, target_time)) {
+        return false;
+    }
+    
+    // Check if we already have a pending request for this time (with tolerance)
+    for (double pending_time : video.pending_requests) {
+        if (std::abs(pending_time - target_time) <= VideoData::CACHE_TOLERANCE) {
+            return false;
+        }
+    }
+    
+    // Check global pending requests to avoid duplicate work across videos
+    {
+        std::lock_guard<std::mutex> lock(pending_requests_mutex);
+        for (const auto& [path, time] : global_pending_requests) {
+            if (std::abs(time - target_time) <= VideoData::CACHE_TOLERANCE) {
+                return false;
+            }
+        }
+    }
+    
+    return true;
+}
+
+void update_video_previews(GLResources& res, const std::vector<Clip>& active_clips, float current_time) {
+    for (const auto& clip : active_clips) {
+        if (clip.type == ClipType::Video && is_video_file(clip.path)) {
+            auto it = res.video_cache.find(clip.path);
+            if (it == res.video_cache.end() || !it->second.is_initialized) continue;
+
+            VideoData& video = it->second;
+            float media_time = (current_time - clip.start_time) + clip.media_start;
+            if (media_time < 0) continue;
+
+            // Check if a frame close enough is already in the cache.
+            bool frame_in_cache = false;
+            const float time_threshold = 0.02f; // ~half a 30fps frame
+            for (const auto& frame : video.frame_cache) {
+                if (std::abs(frame.pts - media_time) < time_threshold) {
+                    frame_in_cache = true;
+                    break;
+                }
+            }
+            
+            // Send a request only if the frame isn't already available.
+            if (!frame_in_cache) {
+                {
+                    std::lock_guard<std::mutex> lock(decoder_request_mutex);
+                    // Prevent the queue from bloating during extremely fast scrubs
+                    if (decoder_request_queue.size() > 5) {
+                        std::queue<DecodedFrameRequest>().swap(decoder_request_queue);
+                    }
+                    DecodedFrameRequest req;
+                    req.clip_path = clip.path;
+                    req.timestamp = media_time;
+                    decoder_request_queue.push(req);
+                }
+                decoder_worker_cv.notify_one();
+            }
+        }
+    }
+}
+
+// --- NEW: Function to process results from the decoder thread ---
+void process_decoded_frames(GLResources& res, int max_per_frame = 5) {
+    for (int i = 0; i < max_per_frame; ++i) {
+        DecodedFrameResult result;
+        {
+            std::lock_guard<std::mutex> lock(decoder_result_mutex);
+            if (decoder_result_queue.empty()) break;
+            result = std::move(decoder_result_queue.front());
+            decoder_result_queue.pop();
+        }
+
+        if (!result.success) continue;
+
+        auto it = res.video_cache.find(result.clip_path);
+        if (it == res.video_cache.end()) continue;
+        
+        VideoData& video = it->second;
+        
+        // Add the new frame to this video's cache
+        video.frame_cache.push_back(std::move(result.frame));
+        
+        // Keep the cache sorted by PTS
+        std::sort(video.frame_cache.begin(), video.frame_cache.end(), 
+                  [](const DecodedFrame& a, const DecodedFrame& b) {
+            return a.pts < b.pts;
+        });
+
+        // Trim cache if it's too large, removing the oldest frames.
+        while (video.frame_cache.size() > VideoData::MAX_CACHE_SIZE) {
+            video.frame_cache.pop_front();
+        }
+    }
 }

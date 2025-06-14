@@ -1,14 +1,13 @@
 #version 330 core
 out vec4 FragColor;
 
-in vec2 TexCoord;
+in vec2 TexCoords;
 
-uniform sampler2D uTexture;
-uniform vec4 uColor; // Includes opacity
+uniform sampler2D u_Texture;
+uniform float u_Opacity;
 
-void main() {
-    vec4 texColor = texture(uTexture, TexCoord);
-    FragColor = texColor * uColor;
-    // Premultiplied alpha could be done here if needed:
-    // FragColor.rgb *= FragColor.a;
+void main()
+{
+    vec4 texColor = texture(u_Texture, TexCoords);
+    FragColor = vec4(texColor.rgb, texColor.a * u_Opacity);
 }
