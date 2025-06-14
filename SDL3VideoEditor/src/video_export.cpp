@@ -199,6 +199,24 @@ bool initialize_video_resources(GLResources& res, const std::string& path) {
         std::cerr << "Warning: Could not determine duration for " << path << std::endl;
     }
 
+    // --- PBO INITIALIZATION ---
+    // Calculate the size needed for one frame's pixel data.
+    video.pbo_buffer_size = video.width * video.height * 3; // For RGB24
+
+    // Create two PBOs for double-buffering.
+    glGenBuffers(2, video.pbos);
+
+    // Initialize the first PBO
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, video.pbos[0]);
+    glBufferData(GL_PIXEL_UNPACK_BUFFER, video.pbo_buffer_size, 0, GL_STREAM_DRAW);
+
+    // Initialize the second PBO
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, video.pbos[1]);
+    glBufferData(GL_PIXEL_UNPACK_BUFFER, video.pbo_buffer_size, 0, GL_STREAM_DRAW);
+
+    // Unbind the PBO
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    // --- END PBO INITIALIZATION ---
 
     // Create OpenGL texture (initially empty)
     glGenTextures(1, &video.texture_id);
@@ -389,73 +407,123 @@ bool ensure_video_decoded_upto(VideoData& video, double target_time_seconds) {
     return true; // Successfully decoded up to or past the target
 }
 
-// Finds the best frame in cache for target_time and uploads it to the texture
+// Finds the best frame in cache and uploads it ASYNCHRONOUSLY to the texture via PBOs.
 bool update_texture_from_cache(VideoData& video, double target_time_seconds) {
-    if (!video.is_initialized || video.frame_cache.empty()) {
+    if (!video.is_initialized || video.frame_cache.empty() || video.pbos[0] == 0) {
         return false;
     }
 
-    // Find the closest frame in the cache
+    // Find the closest frame in the cache (your existing logic for this is fine)
     const DecodedFrame* best_frame = nullptr;
     double min_diff = std::numeric_limits<double>::max();
-
     for (const auto& frame : video.frame_cache) {
         double diff = std::abs(frame.pts - target_time_seconds);
         if (diff < min_diff) {
             min_diff = diff;
             best_frame = &frame;
         }
-        // Optimization: if we pass the target time significantly,
-        // the previous frame was likely the best one, unless cache is very small.
-        // For simplicity, we'll just find the absolute minimum diff.
     }
 
-    if (best_frame) {
-        // Check if this frame is already the one displayed (optional optimization)
-        // Requires storing the PTS of the currently displayed frame.
-        // static std::map<GLuint, double> displayed_pts;
-        // if (displayed_pts.count(video.texture_id) && displayed_pts[video.texture_id] == best_frame->pts) {
-        //     return true; // Already displaying this frame
-        // }
-
-
-        // Upload the pixels to the texture
-        glBindTexture(GL_TEXTURE_2D, video.texture_id);
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, best_frame->width, best_frame->height,
-                        GL_RGB, GL_UNSIGNED_BYTE, best_frame->pixels.data());
-        glBindTexture(GL_TEXTURE_2D, 0); // Unbind
-
-        GLenum err = glGetError();
-        if (err != GL_NO_ERROR) {
-            std::cerr << "OpenGL error updating texture " << video.texture_id << " from cache: " << err << std::endl;
-            return false;
-        }
-        // displayed_pts[video.texture_id] = best_frame->pts; // Mark as displayed
-        // std::cout << "Updated texture " << video.texture_id << " with frame PTS: " << best_frame->pts << "s (Target: " << target_time_seconds << "s)" << std::endl;
-        return true;
+    if (!best_frame) {
+        return false; // No suitable frame found
     }
 
-    return false; // No suitable frame found in cache
+    // --- ASYNCHRONOUS UPLOAD LOGIC ---
+    
+    // 1. Bind the texture we want to update.
+    glBindTexture(GL_TEXTURE_2D, video.texture_id);
+    
+    // 2. Bind the PBO that will receive the new pixel data.
+    // We ping-pong between pbo_index 0 and 1.
+    video.pbo_index = (video.pbo_index + 1) % 2;
+    int current_pbo_id = video.pbos[video.pbo_index];
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, current_pbo_id);
+
+    // 3. Upload the pixel data to the PBO.
+    // First, we map the buffer, which gives us a pointer we can write to.
+    // This call will wait until the GPU is done with any *previous* operations on this PBO,
+    // which is why double-buffering is essential.
+    glBufferData(GL_PIXEL_UNPACK_BUFFER, video.pbo_buffer_size, 0, GL_STREAM_DRAW); // Orphan the buffer
+    GLubyte* pbo_ptr = (GLubyte*)glMapBuffer(GL_PIXEL_UNPACK_BUFFER, GL_WRITE_ONLY);
+    
+    if (pbo_ptr) {
+        // Copy the decoded frame's pixels directly into the PBO's memory.
+        memcpy(pbo_ptr, best_frame->pixels.data(), video.pbo_buffer_size);
+        glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER); // Release the pointer.
+    } else {
+        // Handle error if mapping fails.
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+        return false;
+    }
+
+    // 4. Issue the ASYNCHRONOUS texture update command.
+    // The last argument is `(void*)0`, which OpenGL interprets as an offset into the
+    // currently bound GL_PIXEL_UNPACK_BUFFER (our PBO), NOT a pointer to system RAM.
+    // This call returns IMMEDIATELY, letting the CPU continue its work. The GPU
+    // will perform the transfer from the PBO to the texture in the background.
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, video.width, video.height, GL_RGB, GL_UNSIGNED_BYTE, (void*)0);
+
+    // 5. Unbind everything for good measure.
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    return true;
 }
 
-// --- Preview Update Orchestration ---
+// --- The NEW, consolidated preview update function ---
 void update_video_previews(GLResources& res, const std::vector<Clip>& active_clips, float current_time) {
-    // 1. Request decoding up to current time + a small buffer (e.g., 2 frames ahead)
-    float decode_ahead_time = 20.0f / 30.0f; // Example: 20 frames at 30fps
-    float target_decode_time = current_time + decode_ahead_time;
+    // Step 1: Group all required media times by their source file path.
+    // This is the core optimization. We avoid redundant work on the same file.
+    std::map<std::string, std::vector<double>> required_times_by_path;
 
+    for (const auto& clip : active_clips) {
+        // Only process video clips that are actually from video files.
+        if (clip.type == ClipType::Video && is_video_file(clip.path)) {
+            // Calculate the timestamp needed from the source media file.
+            float media_time = (current_time - clip.start_time) + clip.media_start;
+            
+            // Only add valid, positive times to the request list.
+            if (media_time >= 0) {
+                required_times_by_path[clip.path].push_back(media_time);
+            }
+        }
+    }
+
+    // Step 2: For each unique video file, perform a single consolidated decoding pass.
+    for (auto const& [path, times] : required_times_by_path) {
+        auto it = res.video_cache.find(path);
+        if (it == res.video_cache.end() || !it->second.is_initialized) {
+            continue; // Skip if this video's resources aren't ready.
+        }
+
+        VideoData& video = it->second;
+
+        // Find the LATEST timestamp required for this file among all its clip segments.
+        double max_required_time = 0.0;
+        if (!times.empty()) {
+            max_required_time = *std::max_element(times.begin(), times.end());
+        }
+
+        // Add a small buffer to decode slightly ahead for smooth playback.
+        float decode_ahead_time = 2.0f / 30.0f; // 2 frames at 30fps
+        double decode_target_time = max_required_time + decode_ahead_time;
+
+        // Call the powerful ensure_video_decoded_upto function just ONCE for this file.
+        // It will efficiently seek or decode to get the file's internal state ready.
+        ensure_video_decoded_upto(video, decode_target_time);
+    }
+    
+    // Step 3: Now that all caches are populated, update the textures for each clip.
+    // This part is fast as it just finds the best frame in the cache and does a GL upload.
     for (const auto& clip : active_clips) {
         if (clip.type == ClipType::Video && is_video_file(clip.path)) {
             auto it = res.video_cache.find(clip.path);
             if (it != res.video_cache.end() && it->second.is_initialized) {
-                float clip_target_time = current_time - clip.start_time + clip.media_start;
-                 float clip_decode_target_time = target_decode_time - clip.start_time + clip.media_start;
-
-                // Ensure decoding progresses
-                 ensure_video_decoded_upto(it->second, clip_decode_target_time);
-
-                 // Update texture with the best available frame for the *current* time
-                 update_texture_from_cache(it->second, clip_target_time);
+                float media_time = (current_time - clip.start_time) + clip.media_start;
+                if (media_time >= 0) {
+                    // This function just reads from the cache we populated above.
+                    update_texture_from_cache(it->second, media_time);
+                }
             }
         }
     }
@@ -747,6 +815,13 @@ void cleanup_video_resources(GLResources& res) {
             // av_free(video.buffer);          // Removed
             avcodec_free_context(&video.codec_ctx);
             avformat_close_input(&video.format_ctx);
+
+            if (video.pbos[0] != 0 || video.pbos[1] != 0) {
+                glDeleteBuffers(2, video.pbos);
+                video.pbos[0] = 0;
+                video.pbos[1] = 0;
+            }
+
             video.is_initialized = false; // Mark as cleaned
         }
     }

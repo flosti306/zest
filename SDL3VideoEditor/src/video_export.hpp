@@ -87,6 +87,10 @@ struct VideoData {
     bool is_seeking = false; // Use a regular bool for now
     double seek_target_pts = -1.0;
 
+    GLuint pbos[2] = {0, 0};
+    int pbo_index = 0; // Will be 0 or 1, to ping-pong between them
+    int pbo_buffer_size = 0;
+
     // (Optional for threading later)
     // std::mutex cache_mutex;
     // std::atomic<bool> decoder_running = false;

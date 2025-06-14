@@ -963,7 +963,7 @@ void DrawMaskEditorWindow(GLResources& res) { // Pass GLResources if needed late
 // --- Forward Declarations ---
 template<typename T>
 void DrawKeyframeTrackEditor(const std::string& label, KeyframeTrack<T>& track);
-void DrawTimelineEditor(std::vector<Clip>& clips, float& playhead_time, float& max_duration, float& zoom_factor, std::atomic<bool>& layers_changed, Clip*& selected_clip, GLResources& res);
+void DrawTimelineEditor(std::vector<Clip>& clips, float& playhead_time, float& max_duration, float& zoom_factor, std::atomic<bool>& layers_changed, Clip*& selected_clip, GLResources& res, float& last_playhead_time_for_velocity);
 void UpdatePreview(GLResources& res, const std::vector<Clip>& sorted_clips, int width, int height, float playhead_time, bool force_update);
 void RenderPreviewWindow(GLuint preview_tex, int preview_width, int preview_height);
 void DrawEffectUIForClip(Clip& clip, GLResources& gl_resources);
@@ -1036,6 +1036,8 @@ int main(int argc, char* argv[]) {
     std::vector<Clip> clips;
     float last_preview_update_time = -1.0f;
     const float PREVIEW_UPDATE_INTERVAL = 1.0f / 60.0f;
+    float last_playhead_time_for_velocity = 0.0f;
+    float playhead_velocity = 0.0f; // in timeline seconds per real-time second
 
     GLResources gl_resources;
     if (!setup_gl_resources(gl_resources, preview_width, preview_height)) {
@@ -1077,60 +1079,109 @@ int main(int argc, char* argv[]) {
             }
             // Use event.key.key and SDLK_B (Fix 3 & 4)
             else if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_B && (SDL_GetModState() & SDL_KMOD_CTRL) && selected_clip && event.key.down) {
-                // --- Blade Tool Logic ---
+                // --- DEFINITIVE, POINTER-SAFE BLADE TOOL LOGIC ---
+
+                // 1. Validate the cut position
                 float cut_time = playhead_time;
                 float clip_start_global = selected_clip->start_time;
                 float clip_end_global = selected_clip->start_time + selected_clip->duration;
-                if (cut_time > clip_start_global && cut_time < clip_end_global) {
-                    Clip* linked_clip_ptr = selected_clip->linked_clip;
-                    float relative_cut = cut_time - clip_start_global;
-                    float new_media_start = selected_clip->media_start + relative_cut;
-                    Clip new_clip = *selected_clip;
-                    new_clip.start_time = cut_time;
-                    new_clip.media_start = new_media_start;
-                    new_clip.duration = clip_end_global - cut_time;
-                    new_clip.name += " (Split)";
-                    new_clip.selected = false;
-                    new_clip.linked_clip = nullptr;
-                    selected_clip->duration = relative_cut;
-                    selected_clip->linked_clip = nullptr;
-                    Clip* new_linked_clip_ptr = nullptr;
-                    if (linked_clip_ptr) {
-                        bool linked_found = false;
-                        for (const auto& c : clips) { if (&c == linked_clip_ptr) { linked_found = true; break; } }
-                        if (linked_found) {
-                            Clip new_linked_clip = *linked_clip_ptr;
-                            new_linked_clip.start_time = cut_time;
-                            new_linked_clip.media_start = linked_clip_ptr->media_start + relative_cut;
-                            new_linked_clip.duration = new_clip.duration;
-                            new_linked_clip.name += " (Split)";
-                            new_linked_clip.selected = false;
-                            new_linked_clip.linked_clip = nullptr;
-                            linked_clip_ptr->duration = selected_clip->duration;
-                            linked_clip_ptr->linked_clip = nullptr;
-                            clips.push_back(new_linked_clip);
-                            new_linked_clip_ptr = &clips.back();
-                        } else {
-                            std::cerr << "Warning: Linked clip pointer was invalid during split." << std::endl;
-                            linked_clip_ptr = nullptr;
-                        }
-                    }
-                    clips.push_back(new_clip);
-                    Clip* new_clip_ptr = &clips.back();
-                    if (linked_clip_ptr) {
-                        selected_clip->linked_clip = linked_clip_ptr;
-                        linked_clip_ptr->linked_clip = selected_clip;
-                        if (new_linked_clip_ptr) {
-                            new_clip_ptr->linked_clip = new_linked_clip_ptr;
-                            new_linked_clip_ptr->linked_clip = new_clip_ptr;
-                        }
-                    }
-                    layers_changed = true;
-                    selected_clip = new_clip_ptr;
-                    std::cout << "Split clip at " << cut_time << "s\n";
-                } else {
-                    std::cout << "Split position (" << cut_time << ") is not within the selected clip bounds (" << clip_start_global << " - " << clip_end_global << ")\n";
+
+                if (cut_time <= clip_start_global + 0.01f || cut_time >= clip_end_global - 0.01f) {
+                    std::cout << "Split position is too close to the edge of the clip." << std::endl;
+                    continue; // Use continue to skip the rest of the event block
                 }
+
+                // 2. Find the INDICES of the original clips (video and audio). This is pointer-safe.
+                ptrdiff_t video_idx = -1;
+                ptrdiff_t audio_idx = -1;
+
+                // Find the index of the selected clip first
+                ptrdiff_t selected_idx = -1;
+                for(size_t i = 0; i < clips.size(); ++i) {
+                    if (&clips[i] == selected_clip) {
+                        selected_idx = i;
+                        break;
+                    }
+                }
+                if (selected_idx == -1) continue; // Should not happen, but safe
+
+                if (clips[selected_idx].type == ClipType::Video) {
+                    video_idx = selected_idx;
+                    // Find the linked audio clip's index
+                    if (clips[selected_idx].linked_clip) {
+                        for(size_t i = 0; i < clips.size(); ++i) {
+                            if (&clips[i] == clips[selected_idx].linked_clip) {
+                                audio_idx = i;
+                                break;
+                            }
+                        }
+                    }
+                } else { // Selected clip is Audio
+                    audio_idx = selected_idx;
+                    // Find the linked video clip's index
+                    if (clips[selected_idx].linked_clip) {
+                        for(size_t i = 0; i < clips.size(); ++i) {
+                            if (&clips[i] == clips[selected_idx].linked_clip) {
+                                video_idx = i;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // 3. Calculate split timings
+                float left_duration = cut_time - clips[video_idx].start_time;
+                float right_duration = clip_end_global - cut_time;
+                float media_start_offset_for_right_part = left_duration;
+
+                // 4. Create the new "right-hand" clips. They are not in the vector yet.
+                Clip right_video_part = clips[video_idx]; // Copy original
+                right_video_part.start_time = cut_time;
+                right_video_part.duration = right_duration;
+                right_video_part.media_start += media_start_offset_for_right_part;
+                right_video_part.name += " (B)";
+                right_video_part.selected = false;
+                right_video_part.linked_clip = nullptr; // Links will be set later
+
+                // 5. Modify the original clips (the "left-hand" parts) using their safe indices.
+                clips[video_idx].duration = left_duration;
+                // Important: Unlink originals for now. We will relink them after vector modification.
+                clips[video_idx].linked_clip = nullptr;
+
+                if (audio_idx != -1) {
+                    clips[audio_idx].duration = left_duration;
+                    clips[audio_idx].linked_clip = nullptr;
+                }
+                
+                // 6. Push new clips to the vector. This is the point where pointers could become invalid.
+                clips.push_back(right_video_part);
+                ptrdiff_t right_video_idx = clips.size() - 1;
+
+                if (audio_idx != -1) {
+                    Clip right_audio_part = clips[audio_idx]; // Copy original audio
+                    right_audio_part.start_time = cut_time;
+                    right_audio_part.duration = right_duration;
+                    right_audio_part.media_start += media_start_offset_for_right_part;
+                    right_audio_part.name += " (B)";
+                    right_audio_part.selected = false;
+                    right_audio_part.linked_clip = nullptr;
+                    
+                    clips.push_back(right_audio_part);
+                    ptrdiff_t right_audio_idx = clips.size() - 1;
+
+                    // 7. Re-establish ALL links using the now-stable indices.
+                    // Link the left pair
+                    clips[video_idx].linked_clip = &clips[audio_idx];
+                    clips[audio_idx].linked_clip = &clips[video_idx];
+                    // Link the right pair
+                    clips[right_video_idx].linked_clip = &clips[right_audio_idx];
+                    clips[right_audio_idx].linked_clip = &clips[right_video_idx];
+                }
+
+                // 8. Finalize state
+                layers_changed = true;
+                selected_clip = &clips[right_video_idx]; // Safely select the new clip
+                std::cout << "Split clip at " << cut_time << "s. All links correctly maintained." << std::endl;
                 // --- End Blade Tool ---
             }
             // Use event.key.key and SDLK_DELETE (Fix 3 & 4)
@@ -1184,18 +1235,26 @@ int main(int argc, char* argv[]) {
         }
 
         std::vector<Clip> active_clips_for_preview;
-        float preview_time_window = 5.0f;
+        float current_time = playhead_time; 
+
         for (const auto& clip : clips) {
-             // Need is_video_file (Fix 5 - requires declaration in hpp)
-            if (clip.type == ClipType::Video && is_video_file(clip.path)) {
-                 float clip_start = clip.start_time; float clip_end = clip.start_time + clip.duration;
-                if (std::max(clip_start, playhead_time - preview_time_window) < std::min(clip_end, playhead_time + preview_time_window)) {
-                    active_clips_for_preview.push_back(clip);
-                }
+            float clip_start = clip.start_time;
+            float clip_end = clip.start_time + clip.duration;
+            // A clip is active if the playhead is between its start and end.
+            if (current_time >= clip_start && current_time < clip_end) {
+                active_clips_for_preview.push_back(clip);
             }
         }
+
+        // Call the NEW, much faster update function.
         update_video_previews(gl_resources, active_clips_for_preview, playhead_time);
         if(show_thumbs) ProcessThumbnailResults(gl_resources, 2);
+
+        if (delta_time > 0) {
+            // Velocity = (change in timeline position) / (change in real time)
+            playhead_velocity = std::abs(playhead_time - last_playhead_time_for_velocity) / delta_time;
+        }
+        last_playhead_time_for_velocity = playhead_time;
 
         ImGui_ImplOpenGL3_NewFrame(); ImGui_ImplSDL3_NewFrame(); ImGui::NewFrame();
         RenderDockSpace();
@@ -1279,7 +1338,7 @@ int main(int argc, char* argv[]) {
         }
         ImGui::End(); // End Controls
 
-        DrawTimelineEditor(clips, playhead_time, max_duration, zoom_factor, layers_changed, selected_clip, gl_resources);
+        DrawTimelineEditor(clips, playhead_time, max_duration, zoom_factor, layers_changed, selected_clip, gl_resources, last_playhead_time_for_velocity);
 
         if (mask_editor_open) {
             DrawMaskEditorWindow(gl_resources); // Pass gl_resources if needed inside editor
@@ -1289,14 +1348,56 @@ int main(int argc, char* argv[]) {
             DrawSmartMaskEditorWindow(); // Call this similar to DrawMaskEditorWindow
         }
 
+        bool is_scrubbing_now = ImGui::IsMouseDragging(ImGuiMouseButton_Left) && ImGui::IsAnyItemActive();
         bool force_preview_update = layers_changed.load();
-        if (force_preview_update || std::abs(playhead_time - last_preview_update_time) > PREVIEW_UPDATE_INTERVAL) {
+
+        bool should_render_new_frame = false;
+
+        if (force_preview_update) {
+            should_render_new_frame = true;
+        } else if (is_scrubbing_now) {
+            // --- DYNAMIC CALCULATION ---
+            const float base_timeline_update_step = 1.0f / 60.0f; // A single frame at 60fps
+            const float skip_aggressiveness = 0.15f;
+            float dynamic_skip_interval = playhead_velocity * skip_aggressiveness * base_timeline_update_step;
+            
+            // We also want a maximum time between updates so it doesn't stop updating entirely on very fast scrubs
+            const float max_real_time_between_updates = 1.0f / 15.0f; // Update at least 15 times per second
+            static float last_real_time_update = 0.0f;
+            
+            if (std::abs(playhead_time - last_preview_update_time) > dynamic_skip_interval ||
+                (current_ticks/1000.0f) - last_real_time_update > max_real_time_between_updates) {
+                
+                should_render_new_frame = true;
+                last_real_time_update = (current_ticks/1000.0f);
+            }
+        } else {
+            if (playhead_time != last_preview_update_time) {
+                should_render_new_frame = true;
+            }
+        }
+
+        if (should_render_new_frame) {
+            // Find active clips for the current time
+            std::vector<Clip> active_clips_for_preview;
+            for (const auto& clip : clips) {
+                if (playhead_time >= clip.start_time && playhead_time < (clip.start_time + clip.duration)) {
+                    active_clips_for_preview.push_back(clip);
+                }
+            }
+            
+            // Update video data (decoding)
+            update_video_previews(gl_resources, active_clips_for_preview, playhead_time);
+
+            // Update GPU frame (compositing)
             std::vector<Clip> sorted_clips = clips;
             std::sort(sorted_clips.begin(), sorted_clips.end(), [](const Clip& a, const Clip& b) { return a.layer < b.layer; });
-            UpdatePreview(gl_resources, sorted_clips, preview_width, preview_height, playhead_time, force_preview_update);
+            UpdatePreview(gl_resources, sorted_clips, preview_width, preview_height, playhead_time, true);
+            
             last_preview_update_time = playhead_time;
-            layers_changed = false;
+            if (layers_changed) layers_changed = false;
         }
+        
         RenderPreviewWindow(gl_resources.render_tex, preview_width, preview_height);
 
         ImGui::Begin("Inspector"); ApplyWindowBackgroundGradients();
@@ -1453,7 +1554,8 @@ void DrawTimelineEditor(
     float& zoom_factor,
     std::atomic<bool>& layers_changed,
     Clip*& selected_clip,
-    GLResources& res
+    GLResources& res,
+    float& last_playhead_time_for_velocity
 ) {
     ImGui::Begin("Timeline Editor");
     ApplyWindowBackgroundGradients();
@@ -2077,6 +2179,7 @@ void DrawTimelineEditor(
         float mouse_x = ImGui::GetMousePos().x;
         playhead_time = (mouse_x - timeline_start.x) / pixels_per_second;
         playhead_time = std::clamp(playhead_time, 0.0f, max_duration);
+        last_playhead_time_for_velocity = playhead_time; 
     } else if (dragging_playhead && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
         dragging_playhead = false;
     }
@@ -2088,6 +2191,7 @@ void DrawTimelineEditor(
             mouse.x > timeline_start.x && mouse.x < timeline_end.x) {
             playhead_time = (mouse.x - timeline_start.x) / pixels_per_second;
             playhead_time = std::clamp(playhead_time, 0.0f, max_duration);
+            last_playhead_time_for_velocity = playhead_time; 
         }
     }
 
