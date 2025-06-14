@@ -264,26 +264,26 @@ void load_resources_for_clip(GLResources& res, const Clip& clip) {
 
 bool ensure_video_decoded_upto(VideoData& video, double target_time_seconds) {
     if (!video.is_initialized) return false;
-    if (video.is_seeking) return false; // Don't decode while seeking
+    if (video.is_seeking) return false; // Don't decode while another operation is in progress
 
     // --- Seeking Logic ---
-    // Check if a seek is necessary
+    // Check if a seek is necessary. This is the case if the target time is
+    // significantly behind the current position or completely outside our small frame cache.
     bool needs_seek = false;
-    if (target_time_seconds < video.last_decoded_pts - 1.0 // Target is significantly behind current pos (allow small backward jumps within cache)
-        || video.last_decoded_pts < 0) // Not decoded anything yet
-    {
-         // Check if target is outside the current cache range
-        if (video.frame_cache.empty() ||
-            target_time_seconds < video.frame_cache.front().pts - 0.5 || // Target before cache start
-            target_time_seconds > video.frame_cache.back().pts + 1.0)     // Target significantly after cache end
-        {
-             needs_seek = true;
-        }
+    if (video.last_decoded_pts < 0) { // Not decoded anything yet
+        needs_seek = true;
+    } else if (video.frame_cache.empty()) { // Cache is empty, might as well seek
+        needs_seek = true;
     }
+    // Check if target is outside the current cache's time range
+    else if (target_time_seconds < video.frame_cache.front().pts - 0.5 || // Target is before the cache starts
+             target_time_seconds > video.frame_cache.back().pts + 1.0) {   // Target is significantly after cache end
+        needs_seek = true;
+    }
+
 
     if (needs_seek) {
         video.is_seeking = true; // Signal start of seek
-        video.seek_target_pts = target_time_seconds;
 
         // Perform the seek
         int64_t seek_target_ts = av_rescale_q(static_cast<int64_t>(target_time_seconds * AV_TIME_BASE),
@@ -295,21 +295,25 @@ bool ensure_video_decoded_upto(VideoData& video, double target_time_seconds) {
         if (ret < 0) {
             char errbuf[AV_ERROR_MAX_STRING_SIZE];
             av_make_error_string(errbuf, sizeof(errbuf), ret);
-            std::cerr << "Error seeking video " << video.format_ctx->url << " to " << target_time_seconds << "s: " << errbuf << std::endl;
-            video.is_seeking = false;
-            return false; // Seek failed
+            std::cerr << "Warning: Error seeking video " << video.format_ctx->url << " to " << target_time_seconds << "s: " << errbuf << std::endl;
         }
 
-        avcodec_flush_buffers(video.codec_ctx); // Important after seek
-        video.last_decoded_pts = -1.0; // Reset decoded PTS
-        video.frame_cache.clear(); // Clear cache after seek
-        std::cout << "Seeked video " << video.format_ctx->url << " to ~" << target_time_seconds << "s" << std::endl;
-
+        // CRITICAL: Always flush the decoder's buffers after a seek.
+        avcodec_flush_buffers(video.codec_ctx);
+        // The cache is now invalid, clear it.
+        video.frame_cache.clear();
+        // Reset our tracking of the last decoded frame. This is important.
+        video.last_decoded_pts = -1.0; 
+        
+        // std::cout << "Seeked video " << video.format_ctx->url << " to ~" << target_time_seconds << "s" << std::endl;
+        
         video.is_seeking = false; // Signal end of seek
     }
 
 
     // --- Sequential Decoding Logic ---
+    // This part now runs correctly for both smooth playback (incrementing a few frames)
+    // and after a seek (decoding from the new keyframe to the target).
     while (video.last_decoded_pts < target_time_seconds) {
         // Try receiving frames first (in case some are buffered)
         int ret = avcodec_receive_frame(video.codec_ctx, video.frame);
@@ -320,79 +324,44 @@ bool ensure_video_decoded_upto(VideoData& video, double target_time_seconds) {
             ret = av_read_frame(video.format_ctx, video.packet);
             if (ret < 0) {
                 if (ret == AVERROR_EOF) {
-                    // End of file, flush decoder
+                    // End of file, flush the decoder to get any remaining frames.
                     avcodec_send_packet(video.codec_ctx, nullptr);
-                    // Try receiving final frames after flushing
-                     while (true) {
-                        ret = avcodec_receive_frame(video.codec_ctx, video.frame);
-                        if (ret == AVERROR_EOF || ret == AVERROR(EAGAIN)) break;
-                        if (ret < 0) { std::cerr << "Error receiving flushed frame\n"; break; }
-
-                         // Process the flushed frame (same as below)
-                        double pts_sec = (video.frame->pts == AV_NOPTS_VALUE) ?
-                                        video.last_decoded_pts + av_q2d(video.codec_ctx->time_base) : // Estimate if no PTS
-                                        static_cast<double>(video.frame->pts) * av_q2d(video.time_base);
-
-                        // Convert and cache
-                        DecodedFrame decoded;
-                        decoded.width = video.width;
-                        decoded.height = video.height;
-                        decoded.pts = pts_sec;
-                        decoded.pixels.resize(video.width * video.height * 3); // RGB24
-
-                        uint8_t* dest_data[4] = {decoded.pixels.data(), nullptr, nullptr, nullptr};
-                        int dest_linesize[4] = {video.width * 3, 0, 0, 0};
-
-                        sws_scale(video.sws_ctx, video.frame->data, video.frame->linesize, 0,
-                                  video.height, dest_data, dest_linesize);
-
-                        video.frame_cache.push_back(std::move(decoded));
-                        if (video.frame_cache.size() > VideoData::MAX_CACHE_SIZE) {
-                            video.frame_cache.pop_front();
-                        }
-                        video.last_decoded_pts = pts_sec;
-
-                    }
-                    std::cout << "EOF reached for " << video.format_ctx->url << std::endl;
-                    return true; // Reached end, considered "up to" any future time
-                } else {
-                    char errbuf[AV_ERROR_MAX_STRING_SIZE];
-                    av_make_error_string(errbuf, sizeof(errbuf), ret);
-                    std::cerr << "Error reading frame for " << video.format_ctx->url << ": " << errbuf << std::endl;
-                    return false; // Error reading
                 }
+                // Any other error means we stop.
+                break; 
             }
 
-            // Send the new packet if it's for our stream
+            // Send the new packet if it's for our video stream
             if (video.packet->stream_index == video.video_stream_idx) {
-                 ret = avcodec_send_packet(video.codec_ctx, video.packet);
-                if (ret < 0) {
-                    char errbuf[AV_ERROR_MAX_STRING_SIZE];
-                    av_make_error_string(errbuf, sizeof(errbuf), ret);
-                     std::cerr << "Error sending packet for " << video.format_ctx->url << ": " << errbuf << std::endl;
+                 if (avcodec_send_packet(video.codec_ctx, video.packet) < 0) {
                     av_packet_unref(video.packet);
-                    return false;
-                }
+                    break; // Error sending packet
+                 }
             }
-             av_packet_unref(video.packet); // Unref packet whether sent or not
+             av_packet_unref(video.packet);
              continue; // Loop back to try receiving again
+        
         } else if (ret == AVERROR_EOF) {
-            // Decoder flushed and finished
-             std::cout << "Decoder finished for " << video.format_ctx->url << std::endl;
-            return true; // Reached end
+            // Decoder is fully flushed and has no more frames.
+            return true; // Reached end, we are "up to" any future time.
+        
         } else if (ret < 0) {
-             char errbuf[AV_ERROR_MAX_STRING_SIZE];
-             av_make_error_string(errbuf, sizeof(errbuf), ret);
-             std::cerr << "Error receiving frame for " << video.format_ctx->url << ": " << errbuf << std::endl;
-            return false; // Decoding error
+             // A real decoding error occurred.
+            return false;
         }
 
         // --- Successfully Received a Frame ---
         double pts_sec = (video.frame->pts == AV_NOPTS_VALUE) ?
-                         video.last_decoded_pts + av_q2d(video.codec_ctx->time_base) : // Estimate if no PTS
+                         video.last_decoded_pts : // Best guess if PTS is missing
                          static_cast<double>(video.frame->pts) * av_q2d(video.time_base);
 
-         // Convert and cache the frame
+        // After a seek, the first few frames might have odd timestamps. We only want to move forward.
+        if (video.last_decoded_pts > 0 && pts_sec < video.last_decoded_pts) {
+            av_frame_unref(video.frame);
+            continue;
+        }
+
+        // Convert and cache the frame
         DecodedFrame decoded;
         decoded.width = video.width;
         decoded.height = video.height;
@@ -401,18 +370,17 @@ bool ensure_video_decoded_upto(VideoData& video, double target_time_seconds) {
 
         uint8_t* dest_data[4] = {decoded.pixels.data(), nullptr, nullptr, nullptr};
         int dest_linesize[4] = {video.width * 3, 0, 0, 0};
+        sws_scale(video.sws_ctx, video.frame->data, video.frame->linesize, 0, video.height, dest_data, dest_linesize);
 
-        sws_scale(video.sws_ctx, video.frame->data, video.frame->linesize, 0,
-                  video.height, dest_data, dest_linesize);
-
+        // Add to cache and manage cache size
         video.frame_cache.push_back(std::move(decoded));
         if (video.frame_cache.size() > VideoData::MAX_CACHE_SIZE) {
             video.frame_cache.pop_front();
         }
         video.last_decoded_pts = pts_sec;
-         // std::cout << "Cached frame PTS: " << pts_sec << "s for " << video.format_ctx->url << std::endl;
+        av_frame_unref(video.frame);
 
-        // If we've decoded past the target, we're done for now
+        // If we've decoded past the target, we're done for this call.
         if (pts_sec >= target_time_seconds) {
             break;
         }
@@ -473,7 +441,7 @@ bool update_texture_from_cache(VideoData& video, double target_time_seconds) {
 // --- Preview Update Orchestration ---
 void update_video_previews(GLResources& res, const std::vector<Clip>& active_clips, float current_time) {
     // 1. Request decoding up to current time + a small buffer (e.g., 2 frames ahead)
-    float decode_ahead_time = 10.0f / 30.0f; // Example: 10 frames at 30fps
+    float decode_ahead_time = 20.0f / 30.0f; // Example: 20 frames at 30fps
     float target_decode_time = current_time + decode_ahead_time;
 
     for (const auto& clip : active_clips) {

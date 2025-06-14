@@ -718,7 +718,7 @@ bool ApplyDrawnMask() {
 void SetupMaskEditorPreviewResources() {
     // Use the same vertex shader as your effects if it's a simple passthrough
     // Or create a specific "shaders/mask_editor_preview.vert"
-    mask_editor_preview_program = LoadShaderProgram("shaders/mask_editor_preview.vert", "shaders/mask_editor_preview.frag");
+    mask_editor_preview_program = LoadShaderProgram("shaders/mask_preview.vert", "shaders/mask_preview.frag");
     if (mask_editor_preview_program == 0) {
         std::cerr << "FATAL: Failed to load mask editor preview shader!" << std::endl;
         // Handle error
@@ -1184,7 +1184,7 @@ int main(int argc, char* argv[]) {
         }
 
         std::vector<Clip> active_clips_for_preview;
-        float preview_time_window = 1.0f;
+        float preview_time_window = 5.0f;
         for (const auto& clip : clips) {
              // Need is_video_file (Fix 5 - requires declaration in hpp)
             if (clip.type == ClipType::Video && is_video_file(clip.path)) {
