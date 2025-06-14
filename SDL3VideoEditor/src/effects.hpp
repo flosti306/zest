@@ -16,15 +16,67 @@
 #include "video_export.hpp" // For DecodedFrame (or shared.hpp if it's there)
 #include "shared.hpp"
 
-GLuint create_temp_fbo(glm::vec2 resolution, GLuint& texture_out);
+inline GLuint create_temp_fbo(glm::vec2 resolution, GLuint& texture_out) {
+    GLuint fbo = 0, tex = 0;
+    glGenFramebuffers(1, &fbo);
+    glGenTextures(1, &tex);
 
-void destroy_temp_fbo(GLuint fbo, GLuint tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    // Use GL_RGBA to be safe, it's more universally supported as a render target.
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, (int)resolution.x, (int)resolution.y, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    // These are important for effects!
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
-GLuint get_texture_from_fbo(GLuint fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        std::cerr << "ERROR::FRAMEBUFFER:: Temporary FBO is not complete!" << std::endl;
+        // Cleanup on failure
+        if (fbo != 0) glDeleteFramebuffers(1, &fbo);
+        if (tex != 0) glDeleteTextures(1, &tex);
+        return 0;
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    texture_out = tex;
+    return fbo;
+}
+
+inline void destroy_temp_fbo(GLuint fbo, GLuint tex) {
+    if (fbo != 0) {
+        glDeleteFramebuffers(1, &fbo);
+    }
+    if (tex != 0) {
+        glDeleteTextures(1, &tex);
+    }
+}
+
+inline GLuint get_texture_from_fbo(GLuint fbo) {
+    if (fbo == 0) return 0;
+    GLint tex_id = 0;
+    // Store the current FBO binding to restore it later
+    GLint last_fbo; 
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &last_fbo);
+    
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                          GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &tex_id);
+    
+    // Restore the previous FBO binding
+    glBindFramebuffer(GL_FRAMEBUFFER, last_fbo);
+    
+    return (GLuint)tex_id;
+}
 
 void RenderFullscreenQuad(float width, float height);
 
 GLuint LoadShaderProgram(const std::string& vert_path, const std::string& frag_path);
+
+GLuint GetShaderProgram(const std::string& vert_path, const std::string& frag_path);
 
 
 struct EffectContext {
@@ -37,6 +89,8 @@ struct EffectContext {
 struct EffectNode {
     std::string name = "Unnamed Effect";
     bool enabled = true;
+
+    GLuint shader_program = 0;
 
     virtual ~EffectNode() = default;
     virtual void Process(const EffectContext& ctx) = 0;
@@ -256,6 +310,10 @@ struct DropShadowEffectNode : public EffectNode {
     KeyframeTrack<float> shadow_b_track;
     KeyframeTrack<float> shadow_a_track;
     KeyframeTrack<float> blur_amount_track;
+
+    GLuint extract_alpha_prog = 0;
+    GLuint blur_prog = 0;
+    GLuint composite_prog = 0;
 
     // Internal state for multipass rendering
     GLuint temp_fbo1 = 0;

@@ -19,6 +19,7 @@
 #include "glm/glm.hpp"
 #include "shared.hpp"
 #include "video_export.hpp"
+#include "glm/gtc/matrix_transform.hpp"
 #include "effects.hpp"
 
 extern "C" {
@@ -41,6 +42,7 @@ std::atomic<bool> stop_thumbnail_worker_flag = false;
 
 void start_thumbnail_worker();
 void stop_thumbnail_worker();
+GLuint GetShaderProgram(const std::string& vert_path, const std::string& frag_path);
 
 // Debug function to check OpenGL context status
 void check_gl_context() {
@@ -200,10 +202,21 @@ bool initialize_video_resources(GLResources& res, const std::string& path) {
     }
 
 
-    // Create OpenGL texture (initially empty)
+    // --- OpenGL Texture Creation ---
     glGenTextures(1, &video.texture_id);
     glBindTexture(GL_TEXTURE_2D, video.texture_id);
+
+    // FIX: Tell OpenGL that our pixel data is tightly packed (no alignment).
+    // This is critical for widths that are not a multiple of 4.
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+
+    // Now create the texture storage.
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, video.width, video.height, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
+    
+    // It's good practice to reset the pixel store state to its default
+    // if other parts of the code might rely on the default.
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4); // Default is 4
+
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -443,27 +456,28 @@ bool update_texture_from_cache(VideoData& video, double target_time_seconds) {
     }
 
     if (best_frame) {
-        // Check if this frame is already the one displayed (optional optimization)
-        // Requires storing the PTS of the currently displayed frame.
-        // static std::map<GLuint, double> displayed_pts;
-        // if (displayed_pts.count(video.texture_id) && displayed_pts[video.texture_id] == best_frame->pts) {
-        //     return true; // Already displaying this frame
-        // }
-
-
-        // Upload the pixels to the texture
+        // FIX: Explicitly activate the texture unit we intend to use.
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        
+        glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, video.texture_id);
+
+        // FIX: Set the correct pixel unpack alignment before uploading data.
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, best_frame->width, best_frame->height,
                         GL_RGB, GL_UNSIGNED_BYTE, best_frame->pixels.data());
-        glBindTexture(GL_TEXTURE_2D, 0); // Unbind
+        
+        // Restore the default alignment
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        
+        glBindTexture(GL_TEXTURE_2D, 0);
 
         GLenum err = glGetError();
         if (err != GL_NO_ERROR) {
             std::cerr << "OpenGL error updating texture " << video.texture_id << " from cache: " << err << std::endl;
             return false;
         }
-        // displayed_pts[video.texture_id] = best_frame->pts; // Mark as displayed
-        // std::cout << "Updated texture " << video.texture_id << " with frame PTS: " << best_frame->pts << "s (Target: " << target_time_seconds << "s)" << std::endl;
         return true;
     }
 
@@ -560,9 +574,15 @@ void load_textures(GLResources& res, const std::vector<Clip>& clips) {
         }
         glBindTexture(GL_TEXTURE_2D, tex_id);
 
+        // FIX: Set pixel alignment before uploading image data.
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+
         // Upload pixel data
         glTexImage2D(GL_TEXTURE_2D, 0, gl_internal_format, formatted_surface->w, formatted_surface->h, 0,
                      gl_format, GL_UNSIGNED_BYTE, formatted_surface->pixels);
+        
+        // Restore default
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
 
         GLenum err = glGetError();
         if (err != GL_NO_ERROR) {
@@ -586,183 +606,131 @@ void load_textures(GLResources& res, const std::vector<Clip>& clips) {
 }
 
 
-// Renders using *existing* textures. Does NO decoding.
+// --- REWRITTEN FOR DEBUGGING: Shader-based render_frame ---
 void render_frame(GLResources& res, float current_time,
     const std::vector<Clip>& sorted_clips,
     int width, int height) {
+    
+    // --- Get Shaders (cached) ---
+    GLuint passthrough_shader = GetShaderProgram("shaders/passthrough.vert", "shaders/texture.frag");
+    GLuint composite_shader = GetShaderProgram("shaders/composite.vert", "shaders/composite.frag");
+    if (composite_shader == 0 || passthrough_shader == 0) {
+        std::cerr << "render_frame: Failed to get critical shaders." << std::endl;
+        return;
+    }
 
+    // 1. Prepare main scene FBO
     glBindFramebuffer(GL_FRAMEBUFFER, res.fbo);
     glViewport(0, 0, width, height);
-    glClearColor(0.1f, 0.1f, 0.1f, 1.0f); // Dark gray background
-    glClear(GL_COLOR_BUFFER_BIT); // No depth buffer needed for 2D compositing usually
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f); // Transparent black for proper alpha compositing
+    glClear(GL_COLOR_BUFFER_BIT);
 
-    glEnable(GL_TEXTURE_2D);
     glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); // Standard alpha blending
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
-    // Simple Ortho projection for [-1, 1] space
-    glMatrixMode(GL_PROJECTION);
-    glLoadIdentity();
-    glOrtho(-1.0 * width, 1.0 * width, -1.0 * height, 1.0 * height, -1.0, 1.0);
+    glm::mat4 projection = glm::ortho(-1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f);
 
-    glMatrixMode(GL_MODELVIEW);
-    glLoadIdentity();
-
-    bool rendered_any = false;
     for (const auto& clip : sorted_clips) {
-        // Set blending mode based on clip
-        switch (clip.blend_mode) {
-            case BlendMode::Normal:
-                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-                break;
-            case BlendMode::Additive:
-                glBlendFunc(GL_SRC_ALPHA, GL_ONE);
-                break;
-            case BlendMode::Multiply:
-                glBlendFunc(GL_DST_COLOR, GL_ZERO);
-                break;
-            case BlendMode::Screen:
-                glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_COLOR);
-                break;
-            case BlendMode::Darken:
-                glBlendFunc(GL_MIN, GL_ONE); // approximate
-                break;
-            case BlendMode::Lighten:
-                glBlendFunc(GL_MAX, GL_ONE); // approximate
-                break;
-            case BlendMode::Difference:
-                glBlendFunc(GL_ONE_MINUS_DST_COLOR, GL_ONE_MINUS_SRC_COLOR);
-                break;
-            case BlendMode::Subtract:
-                glBlendFunc(GL_ZERO, GL_ONE_MINUS_SRC_COLOR);
-                break;
-            case BlendMode::Divide:
-                // Not directly possible with glBlendFunc, would need shader
-                glBlendFunc(GL_ONE, GL_ONE); // approximate
-                break;
-            case BlendMode::Overlay:
-                // Overlay needs a shader normally. Approximate with multiply/screen hybrid
-                glBlendFunc(GL_SRC_ALPHA, GL_ONE);
-                break;
-        }
-
-        // Check if clip is active and is visual (Video type)
-        if (clip.type == ClipType::Video &&
-        current_time >= clip.start_time &&
-        current_time < (clip.start_time + clip.duration))
+        if (!(clip.type == ClipType::Video &&
+            current_time >= clip.start_time &&
+            current_time < (clip.start_time + clip.duration)))
         {
-            float local_time = current_time - clip.start_time; // relative to clip start
-
-        // --- Evaluate keyframes ---
-        float evaluated_pos_x = clip.pos_x_track.Evaluate(local_time);
-        float evaluated_pos_y = clip.pos_y_track.Evaluate(local_time);
-        float evaluated_scale = clip.scale_track.Evaluate(local_time);
-        float evaluated_rotation = clip.rotation_track.Evaluate(local_time);
-        float evaluated_opacity = clip.opacity_track.Evaluate(local_time);
-
-        // Fallback / Clamp
-        if (clip.pos_x_track.keyframes.empty()) evaluated_pos_x = clip.pos_x;
-        if (clip.pos_y_track.keyframes.empty()) evaluated_pos_y = clip.pos_y;
-        if (clip.scale_track.keyframes.empty()) evaluated_scale = clip.scale;
-        if (clip.rotation_track.keyframes.empty()) evaluated_rotation = clip.rotation;
-        if (clip.opacity_track.keyframes.empty()) evaluated_opacity = clip.opacity;
-
-        evaluated_scale = std::max(0.0f, evaluated_scale);     // Never allow 0 scale
-        evaluated_opacity = std::clamp(evaluated_opacity, 0.0f, 1.0f); // Clamp opacity
-
-        // (Optionally: evaluated_rotation if you add that too)
-
-        GLuint tex_id = 0;
-        bool is_video = is_video_file(clip.path);
-
-        // Find the texture
-        if (is_video) {
-            auto vid_it = res.video_cache.find(clip.path);
-            if (vid_it != res.video_cache.end() && vid_it->second.is_initialized) {
-                tex_id = vid_it->second.texture_id;
-            }
-        } else {
-            auto img_it = res.texture_cache.find(clip.path);
-            if (img_it != res.texture_cache.end()) {
-                tex_id = img_it->second;
-            }
+            continue; // Skip inactive clips
         }
-
-        if (tex_id != 0) {
-            // If the clip has effects, we need to handle them differently
-            if (clip.has_effects) {
-                // Create a temporary FBO to capture the clip with transforms applied
-                GLuint transformed_tex;
-                GLuint transformed_fbo = create_temp_fbo(glm::vec2(width, height), transformed_tex);
-                
-                // Render the clip with transforms to the temporary FBO
-                glBindFramebuffer(GL_FRAMEBUFFER, transformed_fbo);
-                glViewport(0, 0, width, height);
-                
-                // Bind the clip's texture
-                glBindTexture(GL_TEXTURE_2D, tex_id);
-                
-                glPushMatrix();
-                // Apply transforms
-                glTranslatef(evaluated_pos_x * width, evaluated_pos_y * height, 0.0f);
-                glRotatef(evaluated_rotation, 0.0f, 0.0f, 1.0f);
-                glScalef(evaluated_scale, evaluated_scale, 1.0f);
-                glColor4f(1.0f, 1.0f, 1.0f, evaluated_opacity);
-                
-                // Draw the texture with transforms applied
-                glBegin(GL_QUADS);
-                    glTexCoord2f(0.0f, 0.0f); glVertex2f(-1.0f * width, -1.0f * height);
-                    glTexCoord2f(1.0f, 0.0f); glVertex2f(1.0f * width, -1.0f * height);
-                    glTexCoord2f(1.0f, 1.0f); glVertex2f(1.0f * width, 1.0f * height);
-                    glTexCoord2f(0.0f, 1.0f); glVertex2f(-1.0f * width, 1.0f * height);
-                glEnd();
-                
-                glPopMatrix();
-                
-                // Process the effects using the transformed texture
-                glBindFramebuffer(GL_FRAMEBUFFER, res.fbo); // Back to main FBO
-                clip.effect_graph->Process(transformed_tex, res.fbo, current_time, glm::vec2(width, height));
-                
-                // Clean up
-                destroy_temp_fbo(transformed_fbo, transformed_tex);
-            } else {
-                // Normal rendering (no effects)
-                glBindTexture(GL_TEXTURE_2D, tex_id);
-                glPushMatrix();
-                
-                // Apply transforms
-                glTranslatef(evaluated_pos_x * width, evaluated_pos_y * height, 0.0f);
-                glRotatef(evaluated_rotation, 0.0f, 0.0f, 1.0f);
-                glScalef(evaluated_scale, evaluated_scale, 1.0f);
-                glColor4f(1.0f, 1.0f, 1.0f, evaluated_opacity);
-                
-                // Draw the quad
-                glBegin(GL_QUADS);
-                    glTexCoord2f(0.0f, 0.0f); glVertex2f(-1.0f * width, -1.0f * height);
-                    glTexCoord2f(1.0f, 0.0f); glVertex2f(1.0f * width, -1.0f * height);
-                    glTexCoord2f(1.0f, 1.0f); glVertex2f(1.0f * width, 1.0f * height);
-                    glTexCoord2f(0.0f, 1.0f); glVertex2f(-1.0f * width, 1.0f * height);
-                glEnd();
-                
-                glPopMatrix();
-            }
             
-            rendered_any = true;
+        // --- Get clip source texture ---
+        GLuint source_tex_id = 0;
+        if (is_video_file(clip.path)) {
+            if (res.video_cache.count(clip.path)) source_tex_id = res.video_cache.at(clip.path).texture_id;
         } else {
-            // Optionally render a placeholder if texture is missing/not ready
-            // std::cerr << "Texture ID 0 for active clip: " << clip.path << std::endl;
+            if (res.texture_cache.count(clip.path)) source_tex_id = res.texture_cache.at(clip.path);
         }
+        if (source_tex_id == 0) {
+            // std::cerr << "Skipping clip with no source texture: " << clip.name << std::endl;
+            continue;
+        }
+
+        // --- Build Transformation Matrix for this clip ---
+        // (Evaluation logic is fine, keeping it)
+        float local_time = current_time - clip.start_time;
+        float eval_pos_x = clip.pos_x_track.keyframes.empty() ? clip.pos_x : clip.pos_x_track.Evaluate(local_time);
+        float eval_pos_y = clip.pos_y_track.keyframes.empty() ? clip.pos_y : clip.pos_y_track.Evaluate(local_time);
+        float eval_scale = clip.scale_track.keyframes.empty() ? clip.scale : clip.scale_track.Evaluate(local_time);
+        float eval_rot = clip.rotation_track.keyframes.empty() ? clip.rotation : clip.rotation_track.Evaluate(local_time);
+        float eval_opacity = clip.opacity_track.keyframes.empty() ? clip.opacity : clip.opacity_track.Evaluate(local_time);
+        glm::mat4 model = glm::mat4(1.0f);
+        model = glm::translate(model, glm::vec3(eval_pos_x, eval_pos_y, 0.0f));
+        model = glm::rotate(model, glm::radians(eval_rot), glm::vec3(0.0f, 0.0f, 1.0f));
+        model = glm::scale(model, glm::vec3(eval_scale, eval_scale, 1.0f));
+        glm::mat4 transform = projection * model;
+        
+        // ======================= DEBUG RENDER LOGIC =========================
+        
+        // If the clip has NO effects graph, we draw it directly and are done.
+        // This path is known to work.
+        if (!clip.has_effects || !clip.effect_graph) {
+            glBindFramebuffer(GL_FRAMEBUFFER, res.fbo);
+            glViewport(0, 0, width, height);
+            glUseProgram(composite_shader);
+            glUniformMatrix4fv(glGetUniformLocation(composite_shader, "u_Transform"), 1, GL_FALSE, &transform[0][0]);
+            glUniform1f(glGetUniformLocation(composite_shader, "u_Opacity"), eval_opacity);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, source_tex_id);
+            glUniform1i(glGetUniformLocation(composite_shader, "u_Texture"), 0);
+            RenderFullscreenQuad(width, height);
+            continue; // Go to next clip
+        }
+        
+        // --- If we are here, the clip has an effect graph ---
+        // Let's create the temporary FBOs needed for the effects pipeline.
+
+        GLuint fboA = 0, texA = 0;
+        GLuint fboB = 0, texB = 0;
+        fboA = create_temp_fbo(glm::vec2(width, height), texA);
+        fboB = create_temp_fbo(glm::vec2(width, height), texB);
+
+        if (fboA == 0 || fboB == 0) {
+            std::cerr << "render_frame: Failed to create temporary FBOs for effects." << std::endl;
+            if(fboA) destroy_temp_fbo(fboA, texA);
+            if(fboB) destroy_temp_fbo(fboB, texB);
+            continue;
+        }
+
+        // 1. Draw the TRANSFORMED clip into texA.
+        glBindFramebuffer(GL_FRAMEBUFFER, fboA);
+        glViewport(0, 0, width, height);
+        glClearColor(0,0,0,0);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glUseProgram(composite_shader);
+        glUniformMatrix4fv(glGetUniformLocation(composite_shader, "u_Transform"), 1, GL_FALSE, &transform[0][0]);
+        glUniform1f(glGetUniformLocation(composite_shader, "u_Opacity"), eval_opacity);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, source_tex_id);
+        glUniform1i(glGetUniformLocation(composite_shader, "u_Texture"), 0);
+        RenderFullscreenQuad(width, height);
+
+        // 2. Run the effect graph.
+        // Input is texA, Output is texB.
+        clip.effect_graph->Process(texA, fboB, current_time, glm::vec2(width, height));
+        
+        // 3. Composite the final result (texB) onto the main scene (res.fbo).
+        glBindFramebuffer(GL_FRAMEBUFFER, res.fbo);
+        glViewport(0, 0, width, height);
+        glUseProgram(passthrough_shader);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, texB); // <-- This is the final texture to draw
+        glUniform1i(glGetUniformLocation(passthrough_shader, "u_Texture"), 0);
+        RenderFullscreenQuad(width, height);
+
+        // 4. Cleanup temporary resources
+        destroy_temp_fbo(fboA, texA);
+        destroy_temp_fbo(fboB, texB);
     }
-        }
-
-        // Reset color and disable states
-        glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
-        glDisable(GL_BLEND);
-        glDisable(GL_TEXTURE_2D);
-        glBindTexture(GL_TEXTURE_2D, 0);
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-
-    // if (!rendered_any) { std::cout << "Rendered empty frame at " << current_time << std::endl; }
+    
+    // Final cleanup after all clips are rendered
+    glUseProgram(0);
+    glDisable(GL_BLEND);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }
 
 
@@ -1017,176 +985,162 @@ void mix_audio_from_memory(const PreloadedAudio& audio, float time_sec, std::vec
 }
 
 
-// --- Video Export (Needs significant rewrite for performance) ---
-// This version still uses the slower render_frame + glReadPixels approach
-// but incorporates the updated render_frame and resource loading.
-// For faster export, pipe to FFmpeg or use libavcodec directly.
+// --- FULL, ASYNCHRONOUS PBO-BASED EXPORT FUNCTION ---
 bool start_video_export(const std::string& output_path, int width, int height, int fps,
     int duration_frames, const std::vector<Clip>& clips, SDL_Window* window) {
 
-std::cout << "Starting video export (using glReadPixels method)..." << std::endl;
-SDL_GLContext current_context = SDL_GL_GetCurrentContext();
-if (!current_context) { /* error */ return false; }
+    std::cout << "Starting video export (using PBOs for async transfer)..." << std::endl;
+    SDL_GL_MakeCurrent(window, SDL_GL_GetCurrentContext());
 
-// Backup GL state (optional but good practice)
-// GLint previous_viewport[4]; glGetIntegerv(GL_VIEWPORT, previous_viewport);
-// GLint previous_fbo; glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previous_fbo);
+    GLResources export_res;
+    if (!setup_gl_resources(export_res, width, height)) {
+        std::cerr << "Failed to setup GL resources for export." << std::endl;
+        return false;
+    }
 
-// Prepare resources specifically for export resolution
-GLResources export_res;
-if (!setup_gl_resources(export_res, width, height)) {
-std::cerr << "Failed to setup GL resources for export." << std::endl;
-return false;
-}
+    for (const auto& clip : clips) {
+        load_resources_for_clip(export_res, clip);
+    }
 
-// Load all necessary resources (textures, video/audio contexts, preload audio)
-for (const auto& clip : clips) {
-load_resources_for_clip(export_res, clip);
-}
+    auto sorted_clips = clips;
+    std::sort(sorted_clips.begin(), sorted_clips.end(), [](const Clip& a, const Clip& b) {
+        return a.layer < b.layer;
+    });
 
-// Sort clips by layer once
-auto sorted_clips = clips;
-std::sort(sorted_clips.begin(), sorted_clips.end(), [](const Clip& a, const Clip& b) {
-return a.layer < b.layer;
-});
+    std::ofstream video_file("video.raw", std::ios::binary);
+    std::ofstream audio_file("temp_audio.raw", std::ios::binary);
+    if (!video_file || !audio_file) {
+        std::cerr << "Failed to open temporary raw files for export." << std::endl;
+        cleanup_gl_resources(export_res);
+        cleanup_video_resources(export_res);
+        return false;
+    }
 
-// Open raw output files
-std::ofstream video_file("video.raw", std::ios::binary);
-std::ofstream audio_file("temp_audio.raw", std::ios::binary);
-if (!video_file || !audio_file) { /* error */ cleanup_gl_resources(export_res); cleanup_video_resources(export_res); return false; }
+    const int audio_sample_rate = 44100;
+    const int audio_channels = 2;
+    const int samples_per_frame = audio_sample_rate / fps;
+    std::vector<float> audio_float(samples_per_frame * audio_channels, 0.0f);
+    std::vector<int16_t> audio_s16(samples_per_frame * audio_channels);
+    std::vector<uint8_t> flipped_pixels(width * height * 3);
 
+    // --- PBO Setup ---
+    const int PBO_COUNT = 2;
+    GLuint pbos[PBO_COUNT];
+    glGenBuffers(PBO_COUNT, pbos);
+    const int data_size = width * height * 3;
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, pbos[0]);
+    glBufferData(GL_PIXEL_PACK_BUFFER, data_size, 0, GL_STREAM_READ);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, pbos[1]);
+    glBufferData(GL_PIXEL_PACK_BUFFER, data_size, 0, GL_STREAM_READ);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    int pbo_write_idx = 0;
+    
+    for (int frame_idx = 0; frame_idx < duration_frames; ++frame_idx) {
+        float current_time = static_cast<float>(frame_idx) / fps;
 
-std::vector<uint8_t> pixels(width * height * 3); // RGB
-const int audio_sample_rate = 44100;
-const int audio_channels = 2;
-const int samples_per_frame = audio_sample_rate / fps;
-std::vector<float> audio_float(samples_per_frame * audio_channels, 0.0f);
-std::vector<int16_t> audio_s16(samples_per_frame * audio_channels);
+        std::vector<Clip> active_video_clips;
+        for(const auto& clip : sorted_clips) {
+            if (clip.type == ClipType::Video && is_video_file(clip.path) &&
+                current_time >= clip.start_time && current_time < clip.start_time + clip.duration) {
+                active_video_clips.push_back(clip);
+            }
+        }
+        update_video_previews(export_res, active_video_clips, current_time);
+        
+        render_frame(export_res, current_time, sorted_clips, width, height);
 
+        int pbo_read_idx = pbo_write_idx;
+        pbo_write_idx = (pbo_write_idx + 1) % PBO_COUNT;
 
-// --- Render and Export Loop ---
-for (int frame_idx = 0; frame_idx < duration_frames; ++frame_idx) {
-float current_time = static_cast<float>(frame_idx) / fps;
+        glBindFramebuffer(GL_FRAMEBUFFER, export_res.fbo);
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, pbos[pbo_write_idx]);
+        glReadPixels(0, 0, width, height, GL_RGB, GL_UNSIGNED_BYTE, 0);
+        
+        if (frame_idx > 0) {
+            // Map the *read* PBO (from previous frame) and write its data.
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, pbos[pbo_read_idx]);
+            GLubyte* ptr = (GLubyte*)glMapBuffer(GL_PIXEL_PACK_BUFFER, GL_READ_ONLY);
+            if (ptr) {
+                // FIX: Manually flip the image rows before writing to the file.
+                const size_t row_size = width * 3;
+                for (int y = 0; y < height; ++y) {
+                    // Read from top to bottom instead of bottom to top
+                    memcpy(flipped_pixels.data() + y * row_size, ptr + y * row_size, row_size);
+                }
+                video_file.write(reinterpret_cast<const char*>(flipped_pixels.data()), data_size);
+                glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+            }
+        }
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
 
-// 1. Update video textures for this frame time
-// Collect active video clips for this frame
-std::vector<Clip> active_video_clips;
-for(const auto& clip : sorted_clips) {
-if (clip.type == ClipType::Video && is_video_file(clip.path) &&
-current_time >= clip.start_time && current_time < clip.start_time + clip.duration) {
-active_video_clips.push_back(clip);
-}
-}
-// Update previews (decode and upload textures)
-update_video_previews(export_res, active_video_clips, current_time);
+        std::fill(audio_float.begin(), audio_float.end(), 0.0f);
+        for (const auto& clip : sorted_clips) {
+            if (clip.type == ClipType::Audio && current_time >= clip.start_time && current_time < (clip.start_time + clip.duration)) {
+                auto audio_it = export_res.preloaded_audio.find(clip.path);
+                if (audio_it != export_res.preloaded_audio.end()) {
+                    const PreloadedAudio& audio = audio_it->second;
+                    float time_in_media = (current_time - clip.start_time) + clip.media_start;
+                    int start_sample_idx = static_cast<int>(time_in_media * audio.sample_rate);
+                    for (int i = 0; i < samples_per_frame; ++i) {
+                        int current_sample_idx = start_sample_idx + i;
+                        if (current_sample_idx * audio.channels + (audio.channels - 1) < audio.samples.size() && current_sample_idx >= 0) {
+                            for (int ch = 0; ch < audio.channels; ++ch) {
+                                audio_float[i * audio.channels + ch] += static_cast<float>(audio.samples[current_sample_idx * audio.channels + ch]) / 32768.0f;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for (size_t i = 0; i < audio_float.size(); ++i) audio_s16[i] = static_cast<int16_t>(std::clamp(audio_float[i], -1.0f, 1.0f) * 32767.0f);
+        audio_file.write(reinterpret_cast<const char*>(audio_s16.data()), audio_s16.size() * sizeof(int16_t));
+        
+        if (frame_idx % 30 == 0 || frame_idx == duration_frames - 1) {
+            std::cout << "Export progress: Frame " << frame_idx + 1 << " / " << duration_frames << std::endl;
+        }
+    }
+    
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, pbos[pbo_write_idx]);
+    GLubyte* ptr = (GLubyte*)glMapBuffer(GL_PIXEL_PACK_BUFFER, GL_READ_ONLY);
+    if (ptr) {
+        // FIX: Also flip the final frame
+        const size_t row_size = width * 3;
+        for (int y = 0; y < height; ++y) {
+            memcpy(flipped_pixels.data() + y * row_size, ptr + y * row_size, row_size);
+        }
+        video_file.write(reinterpret_cast<const char*>(flipped_pixels.data()), data_size);
+        glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+    }
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    glDeleteBuffers(PBO_COUNT, pbos);
 
+    video_file.close();
+    audio_file.close();
 
-// 2. Render the composited frame to FBO
-render_frame(export_res, current_time, sorted_clips, width, height);
+    std::string ffmpeg_cmd =
+        "ffmpeg -y "
+        "-f rawvideo -pix_fmt rgb24 -s " + std::to_string(width) + "x" + std::to_string(height) +
+        " -r " + std::to_string(fps) + " -i video.raw "
+        "-f s16le -ac 2 -ar " + std::to_string(audio_sample_rate) + " -i temp_audio.raw "
+        "-c:v libx264 -preset fast -crf 22 -pix_fmt yuv420p "
+        "-c:a aac -b:a 192k "
+        "-shortest \"" + output_path + "\"";
 
-// 3. Read back pixels (Slow part)
-glBindFramebuffer(GL_FRAMEBUFFER, export_res.fbo);
-glReadBuffer(GL_COLOR_ATTACHMENT0); // Ensure reading from the color attachment
-glReadPixels(0, 0, width, height, GL_RGB, GL_UNSIGNED_BYTE, pixels.data());
-glBindFramebuffer(GL_FRAMEBUFFER, 0); // Unbind FBO
+    std::cout << "Running FFmpeg command:\n" << ffmpeg_cmd << std::endl;
+    int ret = system(ffmpeg_cmd.c_str());
 
-// Flip vertically (OpenGL bottom-left origin vs Image top-left)
-/* size_t row_bytes = width * 3;
-std::vector<uint8_t> row_buffer(row_bytes);
-for (int y = 0; y < height / 2; ++y) {
-uint8_t* top_row = pixels.data() + y * row_bytes;
-uint8_t* bottom_row = pixels.data() + (height - 1 - y) * row_bytes;
-memcpy(row_buffer.data(), top_row, row_bytes);
-memcpy(top_row, bottom_row, row_bytes);
-memcpy(bottom_row, row_buffer.data(), row_bytes);
-} */
+    std::filesystem::remove("video.raw");
+    std::filesystem::remove("temp_audio.raw");
+    cleanup_gl_resources(export_res);
+    cleanup_video_resources(export_res);
 
-// Write video frame
-video_file.write(reinterpret_cast<const char*>(pixels.data()), pixels.size());
+    if (ret != 0) {
+        std::cerr << "FFmpeg export failed with code " << ret << std::endl;
+        return false;
+    }
 
-
-// 4. Mix Audio
-std::fill(audio_float.begin(), audio_float.end(), 0.0f);
-for (const auto& clip : sorted_clips) {
-if (clip.type == ClipType::Audio &&
-current_time >= clip.start_time &&
-current_time < (clip.start_time + clip.duration))
-{
-auto audio_it = export_res.preloaded_audio.find(clip.path);
-if (audio_it != export_res.preloaded_audio.end()) {
- const PreloadedAudio& audio = audio_it->second;
-  // Calculate start sample in the preloaded buffer based on clip timing
-  float time_into_clip = current_time - clip.start_time;
-  float effective_media_start = clip.media_start; // Use the clip's media start
-  float time_in_media = time_into_clip + effective_media_start;
-
- int start_sample_idx = static_cast<int>(time_in_media * audio.sample_rate);
-
- for (int i = 0; i < samples_per_frame; ++i) {
-     int current_sample_idx = start_sample_idx + i;
-      // Check bounds for the preloaded audio samples
-     if (current_sample_idx * audio.channels + (audio.channels - 1) < audio.samples.size() && current_sample_idx >= 0) {
-         for (int ch = 0; ch < audio.channels; ++ch) {
-             int16_t sample_s16 = audio.samples[current_sample_idx * audio.channels + ch];
-             audio_float[i * audio.channels + ch] += static_cast<float>(sample_s16) / 32768.0f;
-         }
-     } else {
-         // Optionally handle running out of samples (e.g., break loop)
-          break;
-     }
- }
-}
-}
-}
-
-// Clamp and convert float audio to S16
-for (size_t i = 0; i < audio_float.size(); ++i) {
-float sample_f = std::max(-1.0f, std::min(1.0f, audio_float[i])); // Clamp
-audio_s16[i] = static_cast<int16_t>(sample_f * 32767.0f);
-}
-audio_file.write(reinterpret_cast<const char*>(audio_s16.data()), audio_s16.size() * sizeof(int16_t));
-
-
-// Progress update
-if (frame_idx % 30 == 0 || frame_idx == duration_frames - 1) {
-std::cout << "Export progress: Frame " << frame_idx + 1 << "/" << duration_frames << std::endl;
-}
-}
-
-video_file.close();
-audio_file.close();
-
-// --- FFmpeg Command (Keep as is for now) ---
-std::string ffmpeg_cmd =
-"ffmpeg -y "
-"-f rawvideo -pix_fmt rgb24 -s " + std::to_string(width) + "x" + std::to_string(height) + // Use -s for size
-" -r " + std::to_string(fps) + " -i video.raw "
-"-f s16le -ac 2 -ar " + std::to_string(audio_sample_rate) + " -i temp_audio.raw "
-"-c:v libx264 -preset fast -crf 22 -pix_fmt yuv420p " // Use pix_fmt for output
-"-c:a aac -b:a 192k "
-"-shortest \"" + output_path + "\""; // Use shortest to stop when shortest input ends
-
-std::cout << "Running FFmpeg command:\n" << ffmpeg_cmd << std::endl;
-int ret = system(ffmpeg_cmd.c_str());
-
-// Cleanup
-std::filesystem::remove("video.raw");
-std::filesystem::remove("temp_audio.raw");
-cleanup_gl_resources(export_res);
-cleanup_video_resources(export_res); // Cleans up FFmpeg contexts too
-
-// Restore GL state (if backed up)
-// glBindFramebuffer(GL_FRAMEBUFFER, previous_fbo);
-// glViewport(previous_viewport[0], previous_viewport[1], previous_viewport[2], previous_viewport[3]);
-
-
-if (ret != 0) {
-std::cerr << "FFmpeg export failed with code " << ret << std::endl;
-return false;
-}
-
-std::cout << "Video export finished successfully." << std::endl;
-return true;
+    std::cout << "Video export finished successfully." << std::endl;
+    return true;
 }
 
 std::vector<float> GenerateWaveformPreview(const std::vector<int16_t>& samples, int channels, int samples_per_pixel = 256) {

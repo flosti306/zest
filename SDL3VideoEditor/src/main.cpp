@@ -718,7 +718,7 @@ bool ApplyDrawnMask() {
 void SetupMaskEditorPreviewResources() {
     // Use the same vertex shader as your effects if it's a simple passthrough
     // Or create a specific "shaders/mask_editor_preview.vert"
-    mask_editor_preview_program = LoadShaderProgram("shaders/mask_editor_preview.vert", "shaders/mask_editor_preview.frag");
+    mask_editor_preview_program = LoadShaderProgram("shaders/mask_preview.vert", "shaders/mask_preview.frag");
     if (mask_editor_preview_program == 0) {
         std::cerr << "FATAL: Failed to load mask editor preview shader!" << std::endl;
         // Handle error
@@ -1397,27 +1397,6 @@ int main(int argc, char* argv[]) {
 // --- Updated UpdatePreview Function ---
 void UpdatePreview(GLResources& res, const std::vector<Clip>& sorted_clips, int width, int height, float playhead_time, bool force_update) {
     render_frame(res, playhead_time, sorted_clips, width, height);
-}
-
-// --- RenderFullscreenQuad Function ---
-void RenderFullscreenQuad(float width, float height) {
-    // Backup GL state
-    GLint last_viewport[4];
-    glGetIntegerv(GL_VIEWPORT, last_viewport);
-
-    // Set viewport to match the quad size
-    glViewport(0, 0, static_cast<GLsizei>(width), static_cast<GLsizei>(height));
-
-    // Render a simple fullscreen quad
-    glBegin(GL_QUADS);
-    glTexCoord2f(0.0f, 0.0f); glVertex2f(-1.0f, -1.0f);
-    glTexCoord2f(1.0f, 0.0f); glVertex2f(1.0f, -1.0f);
-    glTexCoord2f(1.0f, 1.0f); glVertex2f(1.0f, 1.0f);
-    glTexCoord2f(0.0f, 1.0f); glVertex2f(-1.0f, 1.0f);
-    glEnd();
-
-    // Restore GL state
-    glViewport(last_viewport[0], last_viewport[1], last_viewport[2], last_viewport[3]);
 }
 
 // --- RenderPreviewWindow ---
