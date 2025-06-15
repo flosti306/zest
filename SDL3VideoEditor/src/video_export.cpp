@@ -444,7 +444,26 @@ bool update_texture_from_cache(VideoData& video, double target_time_seconds) {
             best_frame = &frame;
         }
     }
-    // --- END ROBUST FRAME SELECTION ---
+    
+    // If we don't have a close enough match, try to find bracketing frames
+    if (min_diff > 0.05 && video.frame_cache.size() >= 2) { // 50ms threshold
+        for (size_t i = 0; i < video.frame_cache.size() - 1; i++) {
+            if (video.frame_cache[i].pts <= target_time_seconds && 
+                video.frame_cache[i + 1].pts >= target_time_seconds) {
+                // Use the frame that's closer to our target time
+                double diff1 = std::abs(video.frame_cache[i].pts - target_time_seconds);
+                double diff2 = std::abs(video.frame_cache[i + 1].pts - target_time_seconds);
+                best_frame = diff1 < diff2 ? &video.frame_cache[i] : &video.frame_cache[i + 1];
+                break;
+            }
+        }
+    }
+    
+    // If we still don't have a frame or the best frame is too far away, use the closest one
+    if (!best_frame || min_diff > 0.1) { // 100ms threshold
+        best_frame = &video.frame_cache.back();
+    }
+    // --- END IMPROVED FRAME SELECTION ---
 
     // Safety check - should never be null if cache is not empty, but good practice.
     if (!best_frame) {
@@ -1020,169 +1039,157 @@ void mix_audio_from_memory(const PreloadedAudio& audio, float time_sec, std::vec
 bool start_video_export(const std::string& output_path, int width, int height, int fps,
     int duration_frames, const std::vector<Clip>& clips, SDL_Window* window) {
 
-std::cout << "Starting video export (using glReadPixels method)..." << std::endl;
-SDL_GLContext current_context = SDL_GL_GetCurrentContext();
-if (!current_context) { /* error */ return false; }
+    std::cout << "Starting video export (using glReadPixels method)..." << std::endl;
+    SDL_GLContext current_context = SDL_GL_GetCurrentContext();
+    if (!current_context) { /* error */ return false; }
 
-// Backup GL state (optional but good practice)
-// GLint previous_viewport[4]; glGetIntegerv(GL_VIEWPORT, previous_viewport);
-// GLint previous_fbo; glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previous_fbo);
+    // Prepare resources specifically for export resolution
+    GLResources export_res;
+    if (!setup_gl_resources(export_res, width, height)) {
+        std::cerr << "Failed to setup GL resources for export." << std::endl;
+        return false;
+    }
 
-// Prepare resources specifically for export resolution
-GLResources export_res;
-if (!setup_gl_resources(export_res, width, height)) {
-std::cerr << "Failed to setup GL resources for export." << std::endl;
-return false;
-}
+    // Load all necessary resources (textures, video/audio contexts, preload audio)
+    for (const auto& clip : clips) {
+        load_resources_for_clip(export_res, clip);
+    }
 
-// Load all necessary resources (textures, video/audio contexts, preload audio)
-for (const auto& clip : clips) {
-load_resources_for_clip(export_res, clip);
-}
+    // Sort clips by layer once
+    auto sorted_clips = clips;
+    std::sort(sorted_clips.begin(), sorted_clips.end(), [](const Clip& a, const Clip& b) {
+        return a.layer < b.layer;
+    });
 
-// Sort clips by layer once
-auto sorted_clips = clips;
-std::sort(sorted_clips.begin(), sorted_clips.end(), [](const Clip& a, const Clip& b) {
-return a.layer < b.layer;
-});
+    // Open raw output files
+    std::ofstream video_file("video.raw", std::ios::binary);
+    std::ofstream audio_file("temp_audio.raw", std::ios::binary);
+    if (!video_file || !audio_file) { 
+        cleanup_gl_resources(export_res); 
+        cleanup_video_resources(export_res); 
+        return false; 
+    }
 
-// Open raw output files
-std::ofstream video_file("video.raw", std::ios::binary);
-std::ofstream audio_file("temp_audio.raw", std::ios::binary);
-if (!video_file || !audio_file) { /* error */ cleanup_gl_resources(export_res); cleanup_video_resources(export_res); return false; }
+    std::vector<uint8_t> pixels(width * height * 3); // RGB
+    const int audio_sample_rate = 44100;
+    const int audio_channels = 2;
+    const int samples_per_frame = audio_sample_rate / fps;
+    std::vector<float> audio_float(samples_per_frame * audio_channels, 0.0f);
+    std::vector<int16_t> audio_s16(samples_per_frame * audio_channels);
 
+    // --- Render and Export Loop ---
+    for (int frame_idx = 0; frame_idx < duration_frames; ++frame_idx) {
+        float current_time = static_cast<float>(frame_idx) / fps;
 
-std::vector<uint8_t> pixels(width * height * 3); // RGB
-const int audio_sample_rate = 44100;
-const int audio_channels = 2;
-const int samples_per_frame = audio_sample_rate / fps;
-std::vector<float> audio_float(samples_per_frame * audio_channels, 0.0f);
-std::vector<int16_t> audio_s16(samples_per_frame * audio_channels);
+        // 1. Update video textures for this frame time
+        // Collect active video clips for this frame
+        std::vector<Clip> active_video_clips;
+        for(const auto& clip : sorted_clips) {
+            if (clip.type == ClipType::Video && is_video_file(clip.path) &&
+                current_time >= clip.start_time && current_time < clip.start_time + clip.duration) {
+                active_video_clips.push_back(clip);
+            }
+        }
 
+        // Ensure all video frames are decoded before rendering
+        for (const auto& clip : active_video_clips) {
+            auto it = export_res.video_cache.find(clip.path);
+            if (it != export_res.video_cache.end()) {
+                VideoData& video = it->second;
+                float media_time = (current_time - clip.start_time) + clip.media_start;
+                if (media_time >= 0) {
+                    // Force decode the frame we need
+                    ensure_video_decoded_upto(video, media_time);
+                    // Update the texture with the decoded frame
+                    update_texture_from_cache(video, media_time);
+                }
+            }
+        }
 
-// --- Render and Export Loop ---
-for (int frame_idx = 0; frame_idx < duration_frames; ++frame_idx) {
-float current_time = static_cast<float>(frame_idx) / fps;
+        // 2. Render the composited frame to FBO
+        render_frame(export_res, current_time, sorted_clips, width, height);
 
-// 1. Update video textures for this frame time
-// Collect active video clips for this frame
-std::vector<Clip> active_video_clips;
-for(const auto& clip : sorted_clips) {
-if (clip.type == ClipType::Video && is_video_file(clip.path) &&
-current_time >= clip.start_time && current_time < clip.start_time + clip.duration) {
-active_video_clips.push_back(clip);
-}
-}
-// Update previews (decode and upload textures)
-update_video_previews(export_res, active_video_clips, current_time);
+        // 3. Read back pixels
+        glBindFramebuffer(GL_FRAMEBUFFER, export_res.fbo);
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
+        glReadPixels(0, 0, width, height, GL_RGB, GL_UNSIGNED_BYTE, pixels.data());
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
+        // Write video frame
+        video_file.write(reinterpret_cast<const char*>(pixels.data()), pixels.size());
 
-// 2. Render the composited frame to FBO
-render_frame(export_res, current_time, sorted_clips, width, height);
+        // 4. Mix Audio
+        std::fill(audio_float.begin(), audio_float.end(), 0.0f);
+        for (const auto& clip : sorted_clips) {
+            if (clip.type == ClipType::Audio &&
+                current_time >= clip.start_time &&
+                current_time < (clip.start_time + clip.duration))
+            {
+                auto audio_it = export_res.preloaded_audio.find(clip.path);
+                if (audio_it != export_res.preloaded_audio.end()) {
+                    const PreloadedAudio& audio = audio_it->second;
+                    float time_into_clip = current_time - clip.start_time;
+                    float effective_media_start = clip.media_start;
+                    float time_in_media = time_into_clip + effective_media_start;
+                    int start_sample_idx = static_cast<int>(time_in_media * audio.sample_rate);
 
-// 3. Read back pixels (Slow part)
-glBindFramebuffer(GL_FRAMEBUFFER, export_res.fbo);
-glReadBuffer(GL_COLOR_ATTACHMENT0); // Ensure reading from the color attachment
-glReadPixels(0, 0, width, height, GL_RGB, GL_UNSIGNED_BYTE, pixels.data());
-glBindFramebuffer(GL_FRAMEBUFFER, 0); // Unbind FBO
+                    for (int i = 0; i < samples_per_frame; ++i) {
+                        int current_sample_idx = start_sample_idx + i;
+                        if (current_sample_idx * audio.channels + (audio.channels - 1) < audio.samples.size() && current_sample_idx >= 0) {
+                            for (int ch = 0; ch < audio.channels; ++ch) {
+                                int16_t sample_s16 = audio.samples[current_sample_idx * audio.channels + ch];
+                                audio_float[i * audio.channels + ch] += static_cast<float>(sample_s16) / 32768.0f;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
 
-// Flip vertically (OpenGL bottom-left origin vs Image top-left)
-/* size_t row_bytes = width * 3;
-std::vector<uint8_t> row_buffer(row_bytes);
-for (int y = 0; y < height / 2; ++y) {
-uint8_t* top_row = pixels.data() + y * row_bytes;
-uint8_t* bottom_row = pixels.data() + (height - 1 - y) * row_bytes;
-memcpy(row_buffer.data(), top_row, row_bytes);
-memcpy(top_row, bottom_row, row_bytes);
-memcpy(bottom_row, row_buffer.data(), row_bytes);
-} */
+        // Clamp and convert float audio to S16
+        for (size_t i = 0; i < audio_float.size(); ++i) {
+            float sample_f = std::max(-1.0f, std::min(1.0f, audio_float[i]));
+            audio_s16[i] = static_cast<int16_t>(sample_f * 32767.0f);
+        }
+        audio_file.write(reinterpret_cast<const char*>(audio_s16.data()), audio_s16.size() * sizeof(int16_t));
 
-// Write video frame
-video_file.write(reinterpret_cast<const char*>(pixels.data()), pixels.size());
+        // Progress update
+        if (frame_idx % 30 == 0 || frame_idx == duration_frames - 1) {
+            std::cout << "Export progress: Frame " << frame_idx + 1 << "/" << duration_frames << std::endl;
+        }
+    }
 
+    video_file.close();
+    audio_file.close();
 
-// 4. Mix Audio
-std::fill(audio_float.begin(), audio_float.end(), 0.0f);
-for (const auto& clip : sorted_clips) {
-if (clip.type == ClipType::Audio &&
-current_time >= clip.start_time &&
-current_time < (clip.start_time + clip.duration))
-{
-auto audio_it = export_res.preloaded_audio.find(clip.path);
-if (audio_it != export_res.preloaded_audio.end()) {
- const PreloadedAudio& audio = audio_it->second;
-  // Calculate start sample in the preloaded buffer based on clip timing
-  float time_into_clip = current_time - clip.start_time;
-  float effective_media_start = clip.media_start; // Use the clip's media start
-  float time_in_media = time_into_clip + effective_media_start;
+    // --- FFmpeg Command ---
+    std::string ffmpeg_cmd =
+        "ffmpeg -y "
+        "-f rawvideo -pix_fmt rgb24 -s " + std::to_string(width) + "x" + std::to_string(height) +
+        " -r " + std::to_string(fps) + " -i video.raw "
+        "-f s16le -ac 2 -ar " + std::to_string(audio_sample_rate) + " -i temp_audio.raw "
+        "-c:v libx264 -preset fast -crf 22 -pix_fmt yuv420p "
+        "-c:a aac -b:a 192k "
+        "-shortest \"" + output_path + "\"";
 
- int start_sample_idx = static_cast<int>(time_in_media * audio.sample_rate);
+    std::cout << "Running FFmpeg command:\n" << ffmpeg_cmd << std::endl;
+    int ret = system(ffmpeg_cmd.c_str());
 
- for (int i = 0; i < samples_per_frame; ++i) {
-     int current_sample_idx = start_sample_idx + i;
-      // Check bounds for the preloaded audio samples
-     if (current_sample_idx * audio.channels + (audio.channels - 1) < audio.samples.size() && current_sample_idx >= 0) {
-         for (int ch = 0; ch < audio.channels; ++ch) {
-             int16_t sample_s16 = audio.samples[current_sample_idx * audio.channels + ch];
-             audio_float[i * audio.channels + ch] += static_cast<float>(sample_s16) / 32768.0f;
-         }
-     } else {
-         // Optionally handle running out of samples (e.g., break loop)
-          break;
-     }
- }
-}
-}
-}
+    // Cleanup
+    std::filesystem::remove("video.raw");
+    std::filesystem::remove("temp_audio.raw");
+    cleanup_gl_resources(export_res);
+    cleanup_video_resources(export_res);
 
-// Clamp and convert float audio to S16
-for (size_t i = 0; i < audio_float.size(); ++i) {
-float sample_f = std::max(-1.0f, std::min(1.0f, audio_float[i])); // Clamp
-audio_s16[i] = static_cast<int16_t>(sample_f * 32767.0f);
-}
-audio_file.write(reinterpret_cast<const char*>(audio_s16.data()), audio_s16.size() * sizeof(int16_t));
+    if (ret != 0) {
+        std::cerr << "FFmpeg export failed with code " << ret << std::endl;
+        return false;
+    }
 
-
-// Progress update
-if (frame_idx % 30 == 0 || frame_idx == duration_frames - 1) {
-std::cout << "Export progress: Frame " << frame_idx + 1 << "/" << duration_frames << std::endl;
-}
-}
-
-video_file.close();
-audio_file.close();
-
-// --- FFmpeg Command (Keep as is for now) ---
-std::string ffmpeg_cmd =
-"ffmpeg -y "
-"-f rawvideo -pix_fmt rgb24 -s " + std::to_string(width) + "x" + std::to_string(height) + // Use -s for size
-" -r " + std::to_string(fps) + " -i video.raw "
-"-f s16le -ac 2 -ar " + std::to_string(audio_sample_rate) + " -i temp_audio.raw "
-"-c:v libx264 -preset fast -crf 22 -pix_fmt yuv420p " // Use pix_fmt for output
-"-c:a aac -b:a 192k "
-"-shortest \"" + output_path + "\""; // Use shortest to stop when shortest input ends
-
-std::cout << "Running FFmpeg command:\n" << ffmpeg_cmd << std::endl;
-int ret = system(ffmpeg_cmd.c_str());
-
-// Cleanup
-std::filesystem::remove("video.raw");
-std::filesystem::remove("temp_audio.raw");
-cleanup_gl_resources(export_res);
-cleanup_video_resources(export_res); // Cleans up FFmpeg contexts too
-
-// Restore GL state (if backed up)
-// glBindFramebuffer(GL_FRAMEBUFFER, previous_fbo);
-// glViewport(previous_viewport[0], previous_viewport[1], previous_viewport[2], previous_viewport[3]);
-
-
-if (ret != 0) {
-std::cerr << "FFmpeg export failed with code " << ret << std::endl;
-return false;
-}
-
-std::cout << "Video export finished successfully." << std::endl;
-return true;
+    std::cout << "Video export finished successfully." << std::endl;
+    return true;
 }
 
 std::vector<float> GenerateWaveformPreview(const std::vector<int16_t>& samples, int channels, int samples_per_pixel = 256) {
@@ -1737,7 +1744,15 @@ void update_playback_state(GLResources& res, float current_time, float last_time
     bool is_scrubbing = std::abs(time_delta) > 0.1f; // Large jumps indicate scrubbing
     
     for (auto& [path, video] : res.video_cache) {
+        bool was_playing = video.is_actively_playing;
         video.is_actively_playing = is_playing && !is_scrubbing;
+        
+        // If we just paused, clear the frame cache to prevent looping
+        if (was_playing && !video.is_actively_playing) {
+            video.frame_cache.clear();
+            video.last_decoded_pts = -1.0;
+            video.is_seeking = false;
+        }
         
         // Reset consecutive hits if we're jumping around
         if (is_scrubbing) {
@@ -1821,6 +1836,25 @@ bool should_request_frame(VideoData& video, double target_time) {
     return true;
 }
 
+// Add this new function to force cache refresh for a clip
+void force_cache_refresh(GLResources& res, const std::string& clip_path) {
+    auto it = res.video_cache.find(clip_path);
+    if (it != res.video_cache.end()) {
+        VideoData& video = it->second;
+        video.frame_cache.clear();
+        video.last_decoded_pts = -1.0;
+        video.is_seeking = false;
+        
+        // Force a seek to the current position
+        if (video.format_ctx && video.video_stream_idx >= 0) {
+            int64_t seek_target_ts = av_rescale_q(static_cast<int64_t>(0 * AV_TIME_BASE),
+                                                AV_TIME_BASE_Q, video.time_base);
+            av_seek_frame(video.format_ctx, video.video_stream_idx, seek_target_ts, AVSEEK_FLAG_BACKWARD);
+            avcodec_flush_buffers(video.codec_ctx);
+        }
+    }
+}
+
 void update_video_previews(GLResources& res, const std::vector<Clip>& active_clips, float current_time) {
     for (const auto& clip : active_clips) {
         if (clip.type == ClipType::Video && is_video_file(clip.path)) {
@@ -1841,12 +1875,27 @@ void update_video_previews(GLResources& res, const std::vector<Clip>& active_cli
                 }
             }
             
-            // Send a request only if the frame isn't already available.
+            // If no exact match, check if we have frames that bracket our target time
+            if (!frame_in_cache && video.frame_cache.size() >= 2) {
+                bool has_bracketing_frames = false;
+                for (size_t i = 0; i < video.frame_cache.size() - 1; i++) {
+                    if (video.frame_cache[i].pts <= media_time && 
+                        video.frame_cache[i + 1].pts >= media_time) {
+                        has_bracketing_frames = true;
+                        break;
+                    }
+                }
+                frame_in_cache = has_bracketing_frames;
+            }
+            
+            // If we don't have a suitable frame, force a cache refresh and request new frames
             if (!frame_in_cache) {
+                force_cache_refresh(res, clip.path);
+                
                 {
                     std::lock_guard<std::mutex> lock(decoder_request_mutex);
-                    // Prevent the queue from bloating during extremely fast scrubs
-                    if (decoder_request_queue.size() > 5) {
+                    // Only clear the queue if it's extremely large
+                    if (decoder_request_queue.size() > 20) {
                         std::queue<DecodedFrameRequest>().swap(decoder_request_queue);
                     }
                     DecodedFrameRequest req;
