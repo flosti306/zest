@@ -23,6 +23,7 @@ extern "C" {
 #include <thread>
 #include <condition_variable>
 #include <queue> // Can use queue or deque
+#include <set> // For tracking requested frames
 #include <SDL.h>
 #include <SDL_render.h>
 #include <string>
@@ -33,6 +34,8 @@ struct Clip;
 struct GLResources;
 struct ThumbnailRequest;
 struct ThumbnailResult;
+struct DecodedFrameRequest;
+struct DecodedFrameResult;
 
 extern std::thread thumbnail_worker;
 extern std::queue<ThumbnailRequest> thumbnail_request_queue;
@@ -42,6 +45,14 @@ extern std::mutex result_mutex;
 extern std::condition_variable worker_cv;
 extern std::atomic<bool> stop_thumbnail_worker_flag;
 
+extern std::thread decoder_thread;
+extern std::queue<DecodedFrameRequest> decoder_request_queue;
+extern std::queue<DecodedFrameResult> decoder_result_queue;
+extern std::mutex decoder_request_mutex;
+extern std::mutex decoder_result_mutex;
+extern std::condition_variable decoder_worker_cv;
+extern std::atomic<bool> stop_decoder_worker_flag;
+
 constexpr int THUMBNAIL_WIDTH = 64;
 constexpr int THUMBNAIL_HEIGHT = 36;
 
@@ -50,6 +61,12 @@ void start_thumbnail_worker();
 void stop_thumbnail_worker();
 void ProcessThumbnailResults(GLResources& res, int max_per_frame);
 void thumbnail_worker_func(); // Declaration for the worker thread function itself
+
+// --- Add NEW function declarations for the decoder thread ---
+void start_decoder_worker();
+void stop_decoder_worker();
+void process_decoded_frames(GLResources& res, int max_per_frame); // Processes results from the thread
+void decoder_worker_func(); // The thread's main function
 
 // Holds RGB data for a single decoded frame
 struct DecodedFrame {
@@ -81,7 +98,6 @@ struct VideoData {
     double duration_sec = 0.0;        // Duration in seconds
 
     std::deque<DecodedFrame> frame_cache; // Simple FIFO cache of decoded RGB frames
-    static const size_t MAX_CACHE_SIZE = 5; // Adjust as needed
 
     // Seeking state
     bool is_seeking = false; // Use a regular bool for now
@@ -90,11 +106,24 @@ struct VideoData {
     GLuint pbos[2] = {0, 0};
     int pbo_index = 0; // Will be 0 or 1, to ping-pong between them
     int pbo_buffer_size = 0;
+    
 
-    // (Optional for threading later)
-    // std::mutex cache_mutex;
-    // std::atomic<bool> decoder_running = false;
-    // std::thread decoder_thread;
+    // Enhanced request tracking
+    std::set<double> pending_requests;
+    std::chrono::steady_clock::time_point last_request_time;
+    double last_successful_decode_time = -1.0;
+    
+    // Performance tracking
+    int consecutive_cache_hits = 0;
+    bool is_actively_playing = false;
+    
+    // Request throttling
+    static constexpr double MIN_REQUEST_INTERVAL = 0.001; // Allow more frequent requests
+    static constexpr double CACHE_TOLERANCE = 1.0 / 1000.0; // 1 frame at 60fps
+    static constexpr int MAX_PENDING_REQUESTS = 30;       // Allow more in-flight requests
+    
+    // Cache management
+    static constexpr size_t MAX_CACHE_SIZE = 15; // Reduced from potentially larger value
 };
 
 struct AudioData {
@@ -152,6 +181,33 @@ struct ThumbnailResult {
     std::string error_message;
 };
 
+struct DecodedFrameRequest {
+    std::string clip_path;
+    double timestamp = 0.0f; // The media timestamp to decode
+};
+
+struct DecodedFrameResult {
+    std::string clip_path;
+    bool success = false;
+    std::string error_message;
+    DecodedFrame frame; // Contains the pixels, w, h, and pts
+};
+
+struct DecoderState {
+    AVFormatContext* fmt_ctx = nullptr;
+    AVCodecContext* codec_ctx = nullptr;
+    SwsContext* sws_ctx = nullptr; // For color conversion
+    int video_stream_idx = -1;
+    AVRational time_base = {0, 1};
+    double last_decoded_pts = -1.0; // State for this specific decoder
+
+    ~DecoderState() {
+        sws_freeContext(sws_ctx);
+        if (codec_ctx) avcodec_free_context(&codec_ctx);
+        if (fmt_ctx) avformat_close_input(&fmt_ctx);
+    }
+};
+
 bool setup_gl_resources(GLResources& res, int width, int height);
 void load_textures(GLResources& res, const std::vector<Clip>& clips); // Only loads images now
 
@@ -169,9 +225,6 @@ bool ensure_video_decoded_upto(VideoData& video, double target_time_seconds);
 
 // Gets the *best available* cached frame near target_time and uploads if needed
 bool update_texture_from_cache(VideoData& video, double target_time_seconds);
-
-// The main preview update function, orchestrates decoding requests and texture uploads
-void update_video_previews(GLResources& res, const std::vector<Clip>& active_clips, float current_time);
 
 // Renders the final composited frame using *existing* textures
 void render_frame(GLResources& res, float current_time, const std::vector<Clip>& sorted_clips, int width, int height);
@@ -194,3 +247,7 @@ void ProcessThumbnailTasks(GLResources& res, int max_per_frame);
 
 void start_thumbnail_worker();
 void stop_thumbnail_worker();
+
+void update_video_previews(GLResources& res, const std::vector<Clip>& active_clips, float current_time);
+bool update_texture_from_cache(VideoData& video, double target_time_seconds);
+void update_playback_state(GLResources& res, float current_time, float last_time);

@@ -1052,6 +1052,7 @@ int main(int argc, char* argv[]) {
     SetupMaskEditorPreviewResources();
 
     if(show_thumbs) start_thumbnail_worker();
+    start_decoder_worker();
 
     bool running = true;
     last_frame_ticks = SDL_GetTicks();
@@ -1246,8 +1247,16 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // Call the NEW, much faster update function.
-        update_video_previews(gl_resources, active_clips_for_preview, playhead_time);
+        static float last_time = 0.0f;
+        update_playback_state(gl_resources, current_time, last_time);
+        last_time = current_time;
+
+        // Update previews with improved logic
+        update_video_previews(gl_resources, active_clips_for_preview, current_time);
+        
+        // This function checks for completed frames from the decoder thread and adds them to the cache.
+        process_decoded_frames(gl_resources, 3);
+
         if(show_thumbs) ProcessThumbnailResults(gl_resources, 2);
 
         if (delta_time > 0) {
@@ -1348,56 +1357,30 @@ int main(int argc, char* argv[]) {
             DrawSmartMaskEditorWindow(); // Call this similar to DrawMaskEditorWindow
         }
 
-        bool is_scrubbing_now = ImGui::IsMouseDragging(ImGuiMouseButton_Left) && ImGui::IsAnyItemActive();
-        bool force_preview_update = layers_changed.load();
-
-        bool should_render_new_frame = false;
-
-        if (force_preview_update) {
-            should_render_new_frame = true;
-        } else if (is_scrubbing_now) {
-            // --- DYNAMIC CALCULATION ---
-            const float base_timeline_update_step = 1.0f / 60.0f; // A single frame at 60fps
-            const float skip_aggressiveness = 0.15f;
-            float dynamic_skip_interval = playhead_velocity * skip_aggressiveness * base_timeline_update_step;
-            
-            // We also want a maximum time between updates so it doesn't stop updating entirely on very fast scrubs
-            const float max_real_time_between_updates = 1.0f / 15.0f; // Update at least 15 times per second
-            static float last_real_time_update = 0.0f;
-            
-            if (std::abs(playhead_time - last_preview_update_time) > dynamic_skip_interval ||
-                (current_ticks/1000.0f) - last_real_time_update > max_real_time_between_updates) {
-                
-                should_render_new_frame = true;
-                last_real_time_update = (current_ticks/1000.0f);
-            }
-        } else {
-            if (playhead_time != last_preview_update_time) {
-                should_render_new_frame = true;
-            }
-        }
-
-        if (should_render_new_frame) {
-            // Find active clips for the current time
-            std::vector<Clip> active_clips_for_preview;
-            for (const auto& clip : clips) {
-                if (playhead_time >= clip.start_time && playhead_time < (clip.start_time + clip.duration)) {
-                    active_clips_for_preview.push_back(clip);
+        // --- The PREVIEW RENDERING LOGIC ---
+        // This logic is now simpler. We don't need fancy rate limiting because the main thread
+        // is so fast. We just update the texture if the playhead moved.
+       // This block runs every frame to keep the preview live.
+        
+        // 1. Update video textures from cache for any active video clips.
+        // This is a fast, non-blocking operation that just uploads the best-available frame.
+        for (const auto& clip : active_clips_for_preview) {
+            if (is_video_file(clip.path)) {
+                auto it = gl_resources.video_cache.find(clip.path);
+                if (it != gl_resources.video_cache.end() && it->second.is_initialized) {
+                    double media_time = (playhead_time - clip.start_time) + clip.media_start;
+                    // update_texture_from_cache is now robust enough to handle any media_time value.
+                    update_texture_from_cache(it->second, media_time);
                 }
             }
-            
-            // Update video data (decoding)
-            update_video_previews(gl_resources, active_clips_for_preview, playhead_time);
-
-            // Update GPU frame (compositing)
-            std::vector<Clip> sorted_clips = clips;
-            std::sort(sorted_clips.begin(), sorted_clips.end(), [](const Clip& a, const Clip& b) { return a.layer < b.layer; });
-            UpdatePreview(gl_resources, sorted_clips, preview_width, preview_height, playhead_time, true);
-            
-            last_preview_update_time = playhead_time;
-            if (layers_changed) layers_changed = false;
         }
         
+        // 2. Render the final composite frame to the FBO using the now-updated textures.
+        // This is a fast GPU-only operation.
+        std::vector<Clip> sorted_clips = clips;
+        std::sort(sorted_clips.begin(), sorted_clips.end(), [](const Clip& a, const Clip& b) { return a.layer < b.layer; });
+        render_frame(gl_resources, playhead_time, sorted_clips, preview_width, preview_height);
+
         RenderPreviewWindow(gl_resources.render_tex, preview_width, preview_height);
 
         ImGui::Begin("Inspector"); ApplyWindowBackgroundGradients();
@@ -1483,6 +1466,7 @@ int main(int argc, char* argv[]) {
     std::cout << "Cleaning up resources..." << std::endl;
 
     stop_thumbnail_worker();
+    stop_decoder_worker();
 
     if (ImGui::GetIO().UserData) { IM_DELETE((GradientData*)ImGui::GetIO().UserData); ImGui::GetIO().UserData = nullptr; }
     cleanup_gl_resources(gl_resources); cleanup_video_resources(gl_resources);
