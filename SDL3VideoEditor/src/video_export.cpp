@@ -446,7 +446,7 @@ bool update_texture_from_cache(VideoData& video, double target_time_seconds) {
     }
     
     // If we don't have a close enough match, try to find bracketing frames
-    if (min_diff > 0.05 && video.frame_cache.size() >= 2) { // 50ms threshold
+    if (min_diff > 0.005 && video.frame_cache.size() >= 2) { // 5ms threshold
         for (size_t i = 0; i < video.frame_cache.size() - 1; i++) {
             if (video.frame_cache[i].pts <= target_time_seconds && 
                 video.frame_cache[i + 1].pts >= target_time_seconds) {
@@ -460,7 +460,7 @@ bool update_texture_from_cache(VideoData& video, double target_time_seconds) {
     }
     
     // If we still don't have a frame or the best frame is too far away, use the closest one
-    if (!best_frame || min_diff > 0.1) { // 100ms threshold
+    if (!best_frame || min_diff > 0.05) { // 50ms threshold
         best_frame = &video.frame_cache.back();
     }
     // --- END IMPROVED FRAME SELECTION ---

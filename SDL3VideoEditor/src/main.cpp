@@ -1077,6 +1077,27 @@ int main(int argc, char* argv[]) {
             if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_SPACE && event.key.down) {
                 playing = !playing.load();
                 std::cout << "Playback " << (playing ? "started" : "paused") << "\n";
+            } else if (event.type == SDL_EVENT_KEY_DOWN && (event.key.key == SDLK_LEFT || event.key.key == SDLK_RIGHT) && event.key.down) {
+                if (export_fps > 0) {
+                    // 1. Calculate the duration of a single frame.
+                    const float frame_duration = 1.0f / static_cast<float>(export_fps);
+
+                    // 2. Pause playback, as frame-stepping is a manual action.
+                    if (playing) {
+                        playing = false;
+                        std::cout << "Playback paused due to frame-step." << std::endl;
+                    }
+
+                    // 3. Adjust playhead time by one frame.
+                    if (event.key.key == SDLK_LEFT) {
+                        playhead_time -= frame_duration;
+                    } else { // Right Arrow
+                        playhead_time += frame_duration;
+                    }
+
+                    // 4. Clamp the playhead to the timeline boundaries.
+                    playhead_time = std::max(0.0f, std::min(playhead_time, max_duration));
+                }
             }
             // Use event.key.key and SDLK_B (Fix 3 & 4)
             else if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_B && (SDL_GetModState() & SDL_KMOD_CTRL) && selected_clip && event.key.down) {
