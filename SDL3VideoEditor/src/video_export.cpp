@@ -424,18 +424,12 @@ bool ensure_video_decoded_upto(VideoData& video, double target_time_seconds) {
 }
 
 // Finds the best frame in cache and uploads it ASYNCHRONOUSLY to the texture via PBOs.
-bool update_texture_from_cache(VideoData& video, double target_time_seconds) {
+bool update_texture_from_cache(VideoData& video, double target_time_seconds, bool strict = false) {
     if (!video.is_initialized || video.frame_cache.empty() || video.pbos[0] == 0) {
         return false;
     }
 
-    // --- ROBUST FRAME SELECTION LOGIC ---
     const DecodedFrame* best_frame = nullptr;
-
-    // Default to the most recent frame in the cache if no better match is found.
-    // This is a critical fallback to prevent showing nothing.
-    best_frame = &video.frame_cache.back(); 
-
     double min_diff = std::numeric_limits<double>::max();
     for (const auto& frame : video.frame_cache) {
         double diff = std::abs(frame.pts - target_time_seconds);
@@ -444,46 +438,21 @@ bool update_texture_from_cache(VideoData& video, double target_time_seconds) {
             best_frame = &frame;
         }
     }
-    
-    // If we don't have a close enough match, try to find bracketing frames
-    if (min_diff > 0.005 && video.frame_cache.size() >= 2) { // 5ms threshold
-        for (size_t i = 0; i < video.frame_cache.size() - 1; i++) {
-            if (video.frame_cache[i].pts <= target_time_seconds && 
-                video.frame_cache[i + 1].pts >= target_time_seconds) {
-                // Use the frame that's closer to our target time
-                double diff1 = std::abs(video.frame_cache[i].pts - target_time_seconds);
-                double diff2 = std::abs(video.frame_cache[i + 1].pts - target_time_seconds);
-                best_frame = diff1 < diff2 ? &video.frame_cache[i] : &video.frame_cache[i + 1];
-                break;
-            }
-        }
-    }
-    
-    // If we still don't have a frame or the best frame is too far away, use the closest one
-    if (!best_frame || min_diff > 0.05) { // 50ms threshold
-        best_frame = &video.frame_cache.back();
-    }
-    // --- END IMPROVED FRAME SELECTION ---
 
-    // Safety check - should never be null if cache is not empty, but good practice.
-    if (!best_frame) {
-        return false;
+    // --- STRICT MODE: Only show if exact frame is available ---
+    if (strict && (min_diff > 0.05)) { // 5ms tolerance
+        return false; // Don't update texture, wait for exact frame
     }
 
-    // --- The rest of the PBO UPLOAD LOGIC is correct and remains unchanged ---
-    
-    // 1. Bind the texture we want to update.
+    if (!best_frame) return false;
+
+    // ...existing PBO upload logic...
     glBindTexture(GL_TEXTURE_2D, video.texture_id);
-    
-    // 2. Bind the PBO that will receive the new pixel data.
     video.pbo_index = (video.pbo_index + 1) % 2;
     int current_pbo_id = video.pbos[video.pbo_index];
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, current_pbo_id);
-
-    // 3. Upload the pixel data to the PBO.
     glBufferData(GL_PIXEL_UNPACK_BUFFER, video.pbo_buffer_size, 0, GL_STREAM_DRAW);
     GLubyte* pbo_ptr = (GLubyte*)glMapBuffer(GL_PIXEL_UNPACK_BUFFER, GL_WRITE_ONLY);
-    
     if (pbo_ptr) {
         memcpy(pbo_ptr, best_frame->pixels.data(), video.pbo_buffer_size);
         glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
@@ -491,11 +460,7 @@ bool update_texture_from_cache(VideoData& video, double target_time_seconds) {
         glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
         return false;
     }
-
-    // 4. Issue the ASYNCHRONOUS texture update command.
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, video.width, video.height, GL_RGB, GL_UNSIGNED_BYTE, (void*)0);
-
-    // 5. Unbind everything.
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
     glBindTexture(GL_TEXTURE_2D, 0);
 
@@ -1101,7 +1066,7 @@ bool start_video_export(const std::string& output_path, int width, int height, i
                     // Force decode the frame we need
                     ensure_video_decoded_upto(video, media_time);
                     // Update the texture with the decoded frame
-                    update_texture_from_cache(video, media_time);
+                    update_texture_from_cache(video, media_time, false);
                 }
             }
         }
@@ -1637,8 +1602,8 @@ void decoder_worker_func() {
 
         // Periodic performance logging
         auto now = std::chrono::steady_clock::now();
-        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_stats_time).count() >= 5) {
-            // std::cout << "Decoder thread: processed " << frames_processed << " frames in 5s" << std::endl;
+        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_stats_time).count() >= 10) {
+            std::cout << "Decoder thread: processed " << frames_processed << " frames in 10s" << std::endl;
             frames_processed = 0;
             last_stats_time = now;
         }
@@ -1856,6 +1821,14 @@ void force_cache_refresh(GLResources& res, const std::string& clip_path) {
 }
 
 void update_video_previews(GLResources& res, const std::vector<Clip>& active_clips, float current_time) {
+    static float last_time = 0.0f;
+    float delta = std::abs(current_time - last_time);
+    last_time = current_time;
+
+    bool is_paused = delta < 0.0001f;
+    bool is_small_jump = delta > 0.0005f && delta < 0.1f;
+    bool is_seek = delta >= 0.5f; // Large jump (slider, mouse, or big step)
+
     for (const auto& clip : active_clips) {
         if (clip.type == ClipType::Video && is_video_file(clip.path)) {
             auto it = res.video_cache.find(clip.path);
@@ -1865,45 +1838,55 @@ void update_video_previews(GLResources& res, const std::vector<Clip>& active_cli
             float media_time = (current_time - clip.start_time) + clip.media_start;
             if (media_time < 0) continue;
 
-            // Check if a frame close enough is already in the cache.
-            bool frame_in_cache = false;
-            const float time_threshold = 0.02f; // ~half a 30fps frame
-            for (const auto& frame : video.frame_cache) {
-                if (std::abs(frame.pts - media_time) < time_threshold) {
-                    frame_in_cache = true;
-                    break;
-                }
+            // --- Only flush cache on large seek, NOT on small jump/frame-step ---
+            if (is_seek) {
+                video.frame_cache.clear();
+                video.last_decoded_pts = -1.0;
+                video.is_seeking = false;
             }
-            
-            // If no exact match, check if we have frames that bracket our target time
-            if (!frame_in_cache && video.frame_cache.size() >= 2) {
-                bool has_bracketing_frames = false;
-                for (size_t i = 0; i < video.frame_cache.size() - 1; i++) {
-                    if (video.frame_cache[i].pts <= media_time && 
-                        video.frame_cache[i + 1].pts >= media_time) {
-                        has_bracketing_frames = true;
-                        break;
-                    }
-                }
-                frame_in_cache = has_bracketing_frames;
-            }
-            
-            // If we don't have a suitable frame, force a cache refresh and request new frames
-            if (!frame_in_cache) {
-                force_cache_refresh(res, clip.path);
-                
-                {
-                    std::lock_guard<std::mutex> lock(decoder_request_mutex);
-                    // Only clear the queue if it's extremely large
-                    if (decoder_request_queue.size() > 20) {
-                        std::queue<DecodedFrameRequest>().swap(decoder_request_queue);
-                    }
-                    DecodedFrameRequest req;
-                    req.clip_path = clip.path;
-                    req.timestamp = media_time;
-                    decoder_request_queue.push(req);
-                }
+
+            bool have_exact = is_frame_available_in_cache(video, media_time, 0.05);
+
+            // Always request the exact frame if not in cache (paused, step, or seek)
+            if ((is_paused || is_small_jump || is_seek) && !have_exact && should_request_frame(video, media_time)) {
+                std::lock_guard<std::mutex> lock(decoder_request_mutex);
+                DecodedFrameRequest req;
+                req.clip_path = clip.path;
+                req.timestamp = media_time;
+                decoder_request_queue.push(req);
                 decoder_worker_cv.notify_one();
+            }
+
+            // Only prefetch ahead during smooth playback (not after seek/step)
+            if (!is_paused && !is_small_jump && !is_seek) {
+                int prefetch_count = 8;
+                float frame_duration = 1.0f / 30.0f; // Or use actual video FPS if known
+                for (int i = 0; i < prefetch_count; ++i) {
+                    double prefetch_time = media_time + i * frame_duration;
+                    if (should_request_frame(video, prefetch_time)) {
+                        std::lock_guard<std::mutex> lock(decoder_request_mutex);
+                        DecodedFrameRequest req;
+                        req.clip_path = clip.path;
+                        req.timestamp = prefetch_time;
+                        decoder_request_queue.push(req);
+                        decoder_worker_cv.notify_one();
+                    }
+                }
+            } else if (video.frame_cache.empty()) {
+                // Proactively prefetch first 4 frames for instant scrubbing/preview
+                int prefetch_count = 4;
+                float frame_duration = 1.0f / 30.0f; // Or use actual FPS
+                for (int i = 0; i < prefetch_count; ++i) {
+                    double prefetch_time = media_time + i * frame_duration;
+                    if (should_request_frame(video, prefetch_time)) {
+                        std::lock_guard<std::mutex> lock(decoder_request_mutex);
+                        DecodedFrameRequest req;
+                        req.clip_path = clip.path;
+                        req.timestamp = prefetch_time;
+                        decoder_request_queue.push(req);
+                        decoder_worker_cv.notify_one();
+                    }
+                }
             }
         }
     }

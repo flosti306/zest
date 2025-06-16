@@ -414,6 +414,22 @@ void AddNewClip(std::vector<Clip>& clips, const std::string& input_path, float v
              std::cout << "Added Video clip (No audio stream found/preloaded) for: " << input_path << std::endl;
         }
     }
+
+    if (is_video_file(input_path)) {
+        auto it = res.video_cache.find(input_path);
+        if (it != res.video_cache.end() && it->second.is_initialized) {
+            VideoData& video = it->second;
+            float first_frame_time = 0.0f; // Or clip.media_start if needed
+            if (should_request_frame(video, first_frame_time)) {
+                std::lock_guard<std::mutex> lock(decoder_request_mutex);
+                DecodedFrameRequest req;
+                req.clip_path = input_path;
+                req.timestamp = first_frame_time;
+                decoder_request_queue.push(req);
+                decoder_worker_cv.notify_one();
+            }
+        }
+    }
 }
 
 // --- Video Duration Helper ---
@@ -1255,7 +1271,8 @@ int main(int argc, char* argv[]) {
             if (playhead_time > max_duration) { playhead_time = max_duration; playing = false; }
             playhead_time = std::max(0.0f, playhead_time);
         }
-
+        
+        static float last_time = 0.0f;
         std::vector<Clip> active_clips_for_preview;
         float current_time = playhead_time; 
 
@@ -1268,7 +1285,6 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        static float last_time = 0.0f;
         update_playback_state(gl_resources, current_time, last_time);
         last_time = current_time;
 
@@ -1276,7 +1292,7 @@ int main(int argc, char* argv[]) {
         update_video_previews(gl_resources, active_clips_for_preview, current_time);
         
         // This function checks for completed frames from the decoder thread and adds them to the cache.
-        process_decoded_frames(gl_resources, 3);
+        process_decoded_frames(gl_resources, 30);
 
         if(show_thumbs) ProcessThumbnailResults(gl_resources, 2);
 
@@ -1391,7 +1407,7 @@ int main(int argc, char* argv[]) {
                 if (it != gl_resources.video_cache.end() && it->second.is_initialized) {
                     double media_time = (playhead_time - clip.start_time) + clip.media_start;
                     // update_texture_from_cache is now robust enough to handle any media_time value.
-                    update_texture_from_cache(it->second, media_time);
+                    update_texture_from_cache(it->second, media_time, !playing);
                 }
             }
         }

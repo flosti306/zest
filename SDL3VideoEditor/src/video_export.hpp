@@ -123,7 +123,7 @@ struct VideoData {
     static constexpr int MAX_PENDING_REQUESTS = 30;       // Allow more in-flight requests
     
     // Cache management
-    static constexpr size_t MAX_CACHE_SIZE = 15; // Reduced from potentially larger value
+    static constexpr size_t MAX_CACHE_SIZE = 150; // Reduced from potentially larger value
 };
 
 struct AudioData {
@@ -249,5 +249,6 @@ void start_thumbnail_worker();
 void stop_thumbnail_worker();
 
 void update_video_previews(GLResources& res, const std::vector<Clip>& active_clips, float current_time);
-bool update_texture_from_cache(VideoData& video, double target_time_seconds);
+bool update_texture_from_cache(VideoData& video, double target_time_seconds, bool strict);
 void update_playback_state(GLResources& res, float current_time, float last_time);
+bool should_request_frame(VideoData& video, double target_time);
