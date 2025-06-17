@@ -14,6 +14,7 @@
 #include <deque>   // For VideoData frame_cache
 #include <mutex>   // For potential future threading
 #include <limits>  // For numeric_limits
+#include <stack>
 
 // External C libraries (FFmpeg, glad, tinyfiledialogs)
 extern "C" {
@@ -99,6 +100,9 @@ static SmartMaskEditTool smart_mask_current_tool = SmartMaskEditTool::ROI_RECT;
 static cv::Mat smart_mask_editor_scribble_hints_cv; // CV_8UC1, stores GC_BGD, GC_FGD, etc.
 static GLuint smart_mask_editor_scribble_display_tex = 0; // To visualize scribbles
 static float smart_mask_brush_size_px = 10.0f;
+
+std::stack<std::string> undo_stack;
+std::stack<std::string> redo_stack;
 
 // Error checking macros
 #define CHECK_AV_ERROR(ret, message) \
@@ -977,6 +981,41 @@ void DrawMaskEditorWindow(GLResources& res) { // Pass GLResources if needed late
     }
 }
 
+std::string SerializeProject(const std::vector<Clip>& clips, float playhead_time, float zoom_factor) {
+    std::ostringstream oss;
+    SaveProjectToStream(oss, clips, playhead_time, zoom_factor); // Implement this using your SaveProject logic
+    return oss.str();
+}
+
+bool DeserializeProject(const std::string& data, std::vector<Clip>& clips, float& playhead_time, float& zoom_factor) {
+    std::istringstream iss(data);
+    return LoadProjectFromStream(iss, clips, playhead_time, zoom_factor); // Implement this using your LoadProject logic
+}
+
+void PushUndo(const std::vector<Clip>& clips, float playhead_time, float zoom_factor) {
+    undo_stack.push(SerializeProject(clips, playhead_time, zoom_factor));
+    // Clear redo stack on new action
+    while (!redo_stack.empty()) redo_stack.pop();
+}
+
+void Undo(std::vector<Clip>& clips, float& playhead_time, float& zoom_factor) {
+    if (undo_stack.empty()) return;
+    // Push current state to redo stack
+    redo_stack.push(SerializeProject(clips, playhead_time, zoom_factor));
+    // Restore previous state
+    std::string prev = undo_stack.top(); undo_stack.pop();
+    DeserializeProject(prev, clips, playhead_time, zoom_factor);
+}
+
+void Redo(std::vector<Clip>& clips, float& playhead_time, float& zoom_factor) {
+    if (redo_stack.empty()) return;
+    // Push current state to undo stack
+    undo_stack.push(SerializeProject(clips, playhead_time, zoom_factor));
+    // Restore next state
+    std::string next = redo_stack.top(); redo_stack.pop();
+    DeserializeProject(next, clips, playhead_time, zoom_factor);
+}
+
 // --- Forward Declarations ---
 template<typename T>
 void DrawKeyframeTrackEditor(const std::string& label, KeyframeTrack<T>& track);
@@ -1137,6 +1176,7 @@ int main(int argc, char* argv[]) {
             // Use event.key.key and SDLK_B (Fix 3 & 4)
             else if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_B && (SDL_GetModState() & SDL_KMOD_CTRL) && selected_clip && event.key.down) {
                 // --- DEFINITIVE, POINTER-SAFE BLADE TOOL LOGIC ---
+                PushUndo(clips, playhead_time, zoom_factor);
 
                 // 1. Validate the cut position
                 float cut_time = playhead_time;
@@ -1243,6 +1283,7 @@ int main(int argc, char* argv[]) {
             }
             // Use event.key.key and SDLK_DELETE (Fix 3 & 4)
             else if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_DELETE && selected_clip && event.key.down) {
+                PushUndo(clips, playhead_time, zoom_factor);
                 ptrdiff_t selected_index = -1;
                 for(size_t i = 0; i < clips.size(); ++i) { if (&clips[i] == selected_clip) { selected_index = i; break; } }
                 if (selected_index != -1) {
@@ -1253,6 +1294,16 @@ int main(int argc, char* argv[]) {
                         layers_changed = true;
                         process_message = "Deleted clip.";
                         std::cout << "Deleted selected clip." << std::endl;
+                }
+            } else if (event.type == SDL_EVENT_KEY_DOWN && (SDL_GetModState() & SDL_KMOD_CTRL)) {
+                if (event.key.key == SDLK_Z) {
+                    Undo(clips, playhead_time, zoom_factor);
+                    layers_changed = true;
+                    process_message = "Undo";
+                } else if (event.key.key == SDLK_Y) {
+                    Redo(clips, playhead_time, zoom_factor);
+                    layers_changed = true;
+                    process_message = "Redo";
                 }
             }
 
@@ -1271,6 +1322,7 @@ int main(int argc, char* argv[]) {
             if (std::filesystem::exists(dropped_path_str)) {
                 float duration = get_video_duration(dropped_path_str);
                 if (duration >= 0) {
+                    PushUndo(clips, playhead_time, zoom_factor);
                     AddNewClip(clips, dropped_path_str, duration, 0, gl_resources);
                     layers_changed = true;
                     process_message = "Added clip: " + std::filesystem::path(dropped_path_str).filename().string();
@@ -2104,6 +2156,7 @@ void DrawTimelineEditor(
         if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
 
         if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+            PushUndo(clips, playhead_time, zoom_factor);
             if (dragging_clip_index == -1) {
                 dragging_clip_index = i;
                 float mouse_x = ImGui::GetMousePos().x;
@@ -2138,6 +2191,7 @@ void DrawTimelineEditor(
 
         if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
             if (!resizing_right) {
+                PushUndo(clips, playhead_time, zoom_factor);
                 resizing_left = true;
                 float mouse_x = ImGui::GetMousePos().x;
                 float new_start = (mouse_x - timeline_start.x) / pixels_per_second;
@@ -2164,6 +2218,7 @@ void DrawTimelineEditor(
 
         if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
             if (!resizing_left) {
+                PushUndo(clips, playhead_time, zoom_factor);
                 resizing_right = true;
                 float mouse_x = ImGui::GetMousePos().x;
                 float new_end = (mouse_x - timeline_start.x) / pixels_per_second;
