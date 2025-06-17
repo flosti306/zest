@@ -399,6 +399,7 @@ void AddNewClip(std::vector<Clip>& clips, const std::string& input_path, float v
         audio_clip.scale = 1.0f;
         audio_clip.pos_x = 0.0f;
         audio_clip.pos_y = 0.0f;
+        audio_clip.volume = 1.0f;
         audio_clip.selected = false;
 
         audio_clip.linked_clip = &clips[video_index];
@@ -1440,20 +1441,22 @@ int main(int argc, char* argv[]) {
 
         ImGui::Begin("Inspector"); ApplyWindowBackgroundGradients();
         if (selected_clip) {
-            ImGui::Text("Selected: %s", selected_clip->name.c_str()); ImGui::Text("Path: %s", selected_clip->path.c_str());
+            ImGui::Text("Selected: %s", selected_clip->name.c_str()); 
+            ImGui::Text("Path: %s", selected_clip->path.c_str());
             bool changed = false;
-            ImGui::SeparatorText("Transform");
-            changed |= ImGui::SliderFloat("Pos X", &selected_clip->pos_x, -1.0f, 1.0f, "%.3f");
-            changed |= ImGui::SliderFloat("Pos Y", &selected_clip->pos_y, -1.0f, 1.0f, "%.3f");
-            changed |= ImGui::SliderFloat("Scale", &selected_clip->scale, 0.0f, 10.0f, "%.3f");
-            changed |= ImGui::SliderFloat("Rotation", &selected_clip->rotation, 0.0f, 360.0f, "%.3f");
-            changed |= ImGui::SliderFloat("Opacity", &selected_clip->opacity, 0.0f, 1.0f, "%.3f");
+
+            // Common properties for all clip types
             ImGui::SeparatorText("Timing & Trimming");
-            changed |= ImGui::InputFloat("Start Time", &selected_clip->start_time, 0.1f, 1.0f, "%.2f"); selected_clip->start_time = std::max(0.0f, selected_clip->start_time);
-            changed |= ImGui::InputFloat("Media Start", &selected_clip->media_start, 0.1f, 1.0f, "%.2f"); selected_clip->media_start = std::max(0.0f, selected_clip->media_start);
-            changed |= ImGui::InputFloat("Duration", &selected_clip->duration, 0.1f, 1.0f, "%.2f"); selected_clip->duration = std::max(0.01f, selected_clip->duration);
+            changed |= ImGui::InputFloat("Start Time", &selected_clip->start_time, 0.1f, 1.0f, "%.2f"); 
+            selected_clip->start_time = std::max(0.0f, selected_clip->start_time);
+            changed |= ImGui::InputFloat("Media Start", &selected_clip->media_start, 0.1f, 1.0f, "%.2f"); 
+            selected_clip->media_start = std::max(0.0f, selected_clip->media_start);
+            changed |= ImGui::InputFloat("Duration", &selected_clip->duration, 0.1f, 1.0f, "%.2f"); 
+            selected_clip->duration = std::max(0.01f, selected_clip->duration);
+
             ImGui::SeparatorText("Layering");
-            changed |= ImGui::InputInt("Layer", &selected_clip->layer); selected_clip->layer = std::max(0, selected_clip->layer);
+            changed |= ImGui::InputInt("Layer", &selected_clip->layer); 
+            selected_clip->layer = std::max(0, selected_clip->layer);
             const char* blend_modes[] = { "Normal", "Additive", "Multiply", "Screen", "Darken", "Lighten", "Difference", "Subtract", "Divide", "Overlay"};
             int current_mode = static_cast<int>(selected_clip->blend_mode);
 
@@ -1461,14 +1464,60 @@ int main(int argc, char* argv[]) {
                 selected_clip->blend_mode = static_cast<BlendMode>(current_mode);
                 changed = true;
             }
-            ImGui::SeparatorText("Keying");
-            DrawKeyframeTrackEditor("Opacity Keyframes", selected_clip->opacity_track);
-            DrawKeyframeTrackEditor("Position X Keyframes", selected_clip->pos_x_track);
-            DrawKeyframeTrackEditor("Position Y Keyframes", selected_clip->pos_y_track);
-            DrawKeyframeTrackEditor("Rotation Keyframes", selected_clip->rotation_track);
-            DrawKeyframeTrackEditor("Scale Keyframes", selected_clip->scale_track);
-            ImGui::SeparatorText("Effects");
-            DrawEffectUIForClip(*selected_clip, gl_resources);
+
+            // Type-specific properties
+            if (selected_clip->type == ClipType::Video) {
+                ImGui::SeparatorText("Transform");
+                changed |= ImGui::SliderFloat("Pos X", &selected_clip->pos_x, -1.0f, 1.0f, "%.3f");
+                changed |= ImGui::SliderFloat("Pos Y", &selected_clip->pos_y, -1.0f, 1.0f, "%.3f");
+                changed |= ImGui::SliderFloat("Scale", &selected_clip->scale, 0.0f, 10.0f, "%.3f");
+                changed |= ImGui::SliderFloat("Rotation", &selected_clip->rotation, 0.0f, 360.0f, "%.3f");
+                changed |= ImGui::SliderFloat("Opacity", &selected_clip->opacity, 0.0f, 1.0f, "%.3f");
+
+                ImGui::SeparatorText("Keying");
+                DrawKeyframeTrackEditor("Opacity Keyframes", selected_clip->opacity_track);
+                DrawKeyframeTrackEditor("Position X Keyframes", selected_clip->pos_x_track);
+                DrawKeyframeTrackEditor("Position Y Keyframes", selected_clip->pos_y_track);
+                DrawKeyframeTrackEditor("Rotation Keyframes", selected_clip->rotation_track);
+                DrawKeyframeTrackEditor("Scale Keyframes", selected_clip->scale_track);
+
+                ImGui::SeparatorText("Effects");
+                DrawEffectUIForClip(*selected_clip, gl_resources);
+            } else if (selected_clip->type == ClipType::Audio) {
+                ImGui::SeparatorText("Audio Properties");
+                changed |= ImGui::SliderFloat("Volume", &selected_clip->volume, 0.0f, 1.0f, "%.3f");
+                DrawKeyframeTrackEditor("Volume Keyframes", selected_clip->volume_track);
+
+                // Display waveform if available
+                if (!selected_clip->waveform.empty()) {
+                    ImGui::SeparatorText("Waveform");
+                    ImVec2 waveform_size = ImVec2(ImGui::GetContentRegionAvail().x, 100);
+                    ImDrawList* draw_list = ImGui::GetWindowDrawList();
+                    ImVec2 waveform_pos = ImGui::GetCursorScreenPos();
+                    ImVec2 waveform_end = ImVec2(waveform_pos.x + waveform_size.x, waveform_pos.y + waveform_size.y);
+                    
+                    // Draw background
+                    draw_list->AddRectFilled(waveform_pos, waveform_end, IM_COL32(30, 30, 30, 255));
+                    
+                    // Draw waveform
+                    float center_y = waveform_pos.y + waveform_size.y * 0.5f;
+                    float max_height = waveform_size.y * 0.4f;
+                    ImU32 waveform_color = IM_COL32(100, 200, 255, 255);
+                    
+                    for (size_t i = 0; i < selected_clip->waveform.size(); ++i) {
+                        float x = waveform_pos.x + (float)i / selected_clip->waveform.size() * waveform_size.x;
+                        float height = selected_clip->waveform[i] * max_height;
+                        draw_list->AddLine(
+                            ImVec2(x, center_y - height),
+                            ImVec2(x, center_y + height),
+                            waveform_color
+                        );
+                    }
+                    
+                    ImGui::Dummy(waveform_size);
+                }
+            }
+
             if (changed) {
                 layers_changed = true;
                 if (selected_clip->linked_clip) {

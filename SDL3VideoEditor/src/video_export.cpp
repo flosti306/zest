@@ -1098,12 +1098,17 @@ bool start_video_export(const std::string& output_path, int width, int height, i
                     float time_in_media = time_into_clip + effective_media_start;
                     int start_sample_idx = static_cast<int>(time_in_media * audio.sample_rate);
 
+                    // Get the clip's volume from keyframes or base volume if no keyframes
+                    float clip_volume = clip.volume_track.keyframes.empty() ? 
+                        clip.volume : 
+                        clip.volume_track.Evaluate(time_into_clip) * clip.volume;
+
                     for (int i = 0; i < samples_per_frame; ++i) {
                         int current_sample_idx = start_sample_idx + i;
                         if (current_sample_idx * audio.channels + (audio.channels - 1) < audio.samples.size() && current_sample_idx >= 0) {
                             for (int ch = 0; ch < audio.channels; ++ch) {
                                 int16_t sample_s16 = audio.samples[current_sample_idx * audio.channels + ch];
-                                audio_float[i * audio.channels + ch] += static_cast<float>(sample_s16) / 32768.0f;
+                                audio_float[i * audio.channels + ch] += (static_cast<float>(sample_s16) / 32768.0f) * clip_volume;
                             }
                         } else {
                             break;
@@ -2025,6 +2030,11 @@ void update_audio_playback(AudioPlaybackState& state, const std::vector<Clip>& c
             // Calculate sample position
             int64_t start_sample = static_cast<int64_t>(time_in_media * audio.sample_rate);
             
+            // Get the clip's volume from keyframes or base volume if no keyframes
+            float clip_volume = clip->volume_track.keyframes.empty() ? 
+                clip->volume : 
+                clip->volume_track.Evaluate(time_into_clip) * clip->volume;
+            
             // Simple nearest-neighbor sampling for now
             for (int i = 0; i < samples_per_frame; ++i) {
                 int64_t current_sample = start_sample + i;
@@ -2033,7 +2043,7 @@ void update_audio_playback(AudioPlaybackState& state, const std::vector<Clip>& c
                     
                     for (int ch = 0; ch < audio.channels; ++ch) {
                         int16_t sample = audio.samples[current_sample * audio.channels + ch];
-                        mixed_audio[i * 2 + ch] += (static_cast<float>(sample) / 32768.0f) * state.volume;
+                        mixed_audio[i * 2 + ch] += (static_cast<float>(sample) / 32768.0f) * clip_volume * state.volume;
                     }
                 }
             }
