@@ -252,3 +252,20 @@ void update_video_previews(GLResources& res, const std::vector<Clip>& active_cli
 bool update_texture_from_cache(VideoData& video, double target_time_seconds, bool strict);
 void update_playback_state(GLResources& res, float current_time, float last_time);
 bool should_request_frame(VideoData& video, double target_time);
+
+struct AudioPlaybackState {
+    SDL_AudioDeviceID device = 0;
+    SDL_AudioStream* stream = nullptr;
+    bool is_playing = false;
+    float volume = 1.0f;
+    double current_time = 0.0;
+    std::vector<const Clip*> active_clips;
+};
+
+// Function declarations for audio playback
+bool initialize_audio_playback(AudioPlaybackState& state);
+void cleanup_audio_playback(AudioPlaybackState& state);
+void update_audio_playback(AudioPlaybackState& state, const std::vector<Clip>& clips, float current_time, GLResources& res);
+void pause_audio_playback(AudioPlaybackState& state);
+void resume_audio_playback(AudioPlaybackState& state);
+void set_audio_volume(AudioPlaybackState& state, float volume);

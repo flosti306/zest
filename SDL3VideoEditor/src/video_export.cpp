@@ -1925,3 +1925,177 @@ void process_decoded_frames(GLResources& res, int max_per_frame = 5) {
         }
     }
 }
+
+bool initialize_audio_playback(AudioPlaybackState& state) {
+    SDL_AudioSpec desired_spec = {};
+    desired_spec.freq = 44100;
+    desired_spec.format = SDL_AUDIO_S16;
+    desired_spec.channels = 2;
+
+    state.device = SDL_OpenAudioDevice(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &desired_spec);
+    if (!state.device) {
+        std::cerr << "Failed to open audio device: " << SDL_GetError() << std::endl;
+        return false;
+    }
+    std::cout << "Audio device opened successfully. Device ID: " << state.device << std::endl;
+
+    SDL_AudioSpec src_spec = {};
+    src_spec.freq = 44100;
+    src_spec.format = SDL_AUDIO_S16;
+    src_spec.channels = 2;
+
+    SDL_AudioSpec dst_spec = src_spec;  // Use same format for source and destination
+
+    state.stream = SDL_CreateAudioStream(&src_spec, &dst_spec);
+    if (!state.stream) {
+        std::cerr << "Failed to create audio stream: " << SDL_GetError() << std::endl;
+        SDL_CloseAudioDevice(state.device);
+        state.device = 0;
+        return false;
+    }
+    std::cout << "Audio stream created successfully." << std::endl;
+
+    if (SDL_BindAudioStream(state.device, state.stream) < 0) {
+        std::cerr << "Failed to bind audio stream: " << SDL_GetError() << std::endl;
+        SDL_DestroyAudioStream(state.stream);
+        SDL_CloseAudioDevice(state.device);
+        state.stream = nullptr;
+        state.device = 0;
+        return false;
+    }
+    std::cout << "Audio stream bound successfully." << std::endl;
+
+    state.is_playing = true;
+    state.volume = 1.0f;
+    return true;
+}
+
+void update_audio_playback(AudioPlaybackState& state, const std::vector<Clip>& clips, float current_time, GLResources& res) {
+    if (!state.device || !state.stream) {
+        std::cerr << "Audio device or stream not initialized" << std::endl;
+        return;
+    }
+
+    // Find active audio clips
+    std::vector<const Clip*> new_active_clips;
+    for (const auto& clip : clips) {
+        if (clip.type == ClipType::Audio &&
+            current_time >= clip.start_time &&
+            current_time < (clip.start_time + clip.duration)) {
+            new_active_clips.push_back(&clip);
+        }
+    }
+
+    // Check if active clips changed
+    bool clips_changed = new_active_clips.size() != state.active_clips.size();
+    if (!clips_changed) {
+        for (size_t i = 0; i < new_active_clips.size(); ++i) {
+            if (new_active_clips[i] != state.active_clips[i]) {
+                clips_changed = true;
+                break;
+            }
+        }
+    }
+
+    // If clips changed, clear the stream and update active clips
+    if (clips_changed) {
+        SDL_ClearAudioStream(state.stream);
+        state.active_clips = std::move(new_active_clips);
+    }
+
+    // Calculate how much audio data we need to generate
+    int queued = SDL_GetAudioStreamQueued(state.stream);
+    int needed = 2048 - queued; // Smaller buffer size for lower latency
+    if (needed <= 0) return; // We have enough data queued
+
+    // Mix audio from active clips
+    std::vector<float> mixed_audio;
+    const int samples_per_frame = needed;
+    mixed_audio.resize(samples_per_frame * 2); // Stereo
+    std::fill(mixed_audio.begin(), mixed_audio.end(), 0.0f);
+
+    for (const auto* clip : state.active_clips) {
+        auto audio_it = res.preloaded_audio.find(clip->path);
+        if (audio_it != res.preloaded_audio.end()) {
+            const PreloadedAudio& audio = audio_it->second;
+            float time_into_clip = current_time - clip->start_time;
+            float effective_media_start = clip->media_start;
+            float time_in_media = time_into_clip + effective_media_start;
+
+            // Calculate sample position
+            int64_t start_sample = static_cast<int64_t>(time_in_media * audio.sample_rate);
+            
+            // Simple nearest-neighbor sampling for now
+            for (int i = 0; i < samples_per_frame; ++i) {
+                int64_t current_sample = start_sample + i;
+                if (current_sample >= 0 && 
+                    (current_sample + 1) * audio.channels <= audio.samples.size()) {
+                    
+                    for (int ch = 0; ch < audio.channels; ++ch) {
+                        int16_t sample = audio.samples[current_sample * audio.channels + ch];
+                        mixed_audio[i * 2 + ch] += (static_cast<float>(sample) / 32768.0f) * state.volume;
+                    }
+                }
+            }
+        }
+    }
+
+    // Simple limiter to prevent clipping
+    float max_sample = 0.0f;
+    for (float sample : mixed_audio) {
+        max_sample = std::max(max_sample, std::abs(sample));
+    }
+    
+    if (max_sample > 1.0f) {
+        float scale = 1.0f / max_sample;
+        for (float& sample : mixed_audio) {
+            sample *= scale;
+        }
+    }
+
+    // Convert float audio to S16 and send to stream
+    std::vector<int16_t> audio_s16(samples_per_frame * 2);
+    for (size_t i = 0; i < mixed_audio.size(); ++i) {
+        float sample_f = std::max(-1.0f, std::min(1.0f, mixed_audio[i]));
+        audio_s16[i] = static_cast<int16_t>(sample_f * 32767.0f);
+    }
+
+    int result = SDL_PutAudioStreamData(state.stream, audio_s16.data(), audio_s16.size() * sizeof(int16_t));
+    if (result < 0) {
+        std::cerr << "Failed to put audio data into stream: " << SDL_GetError() << std::endl;
+    }
+}
+
+void cleanup_audio_playback(AudioPlaybackState& state) {
+    if (state.stream) {
+        SDL_DestroyAudioStream(state.stream);
+        state.stream = nullptr;
+    }
+    if (state.device) {
+        SDL_CloseAudioDevice(state.device);
+        state.device = 0;
+    }
+    state.is_playing = false;
+    state.active_clips.clear();
+}
+
+void pause_audio_playback(AudioPlaybackState& state) {
+    if (state.device && state.is_playing) {
+        SDL_PauseAudioDevice(state.device);
+        state.is_playing = false;
+    }
+}
+
+void resume_audio_playback(AudioPlaybackState& state) {
+    if (state.device && !state.is_playing) {
+        SDL_ResumeAudioDevice(state.device);
+        state.is_playing = true;
+    }
+}
+
+void set_audio_volume(AudioPlaybackState& state, float volume) {
+    state.volume = std::max(0.0f, std::min(1.0f, volume));
+    if (state.device) {
+        SDL_SetAudioDeviceGain(state.device, state.volume);
+    }
+}

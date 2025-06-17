@@ -990,7 +990,17 @@ void DrawSmartMaskEditorWindow();
 int main(int argc, char* argv[]) {
     avformat_network_init();
 
-    SDL_Init(SDL_INIT_VIDEO);
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) < 0) {
+        std::cerr << "Failed to initialize SDL: " << SDL_GetError() << std::endl;
+        return 1;
+    }
+
+    // Initialize SDL audio subsystem specifically
+    if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0) {
+        std::cerr << "Failed to initialize SDL audio subsystem: " << SDL_GetError() << std::endl;
+        SDL_Quit();
+        return 1;
+    }
 
     SDL_Window* window = SDL_CreateWindow(
         "Zest",
@@ -1072,6 +1082,14 @@ int main(int argc, char* argv[]) {
 
     bool running = true;
     last_frame_ticks = SDL_GetTicks();
+
+    // Initialize audio playback
+    AudioPlaybackState audio_state;
+    if (!initialize_audio_playback(audio_state)) {
+        std::cerr << "Failed to initialize audio playback. Continuing without audio." << std::endl;
+    } else {
+        std::cout << "Audio playback initialized successfully." << std::endl;
+    }
 
     while (running) {
         Uint64 current_ticks = SDL_GetTicks();
@@ -1498,6 +1516,11 @@ int main(int argc, char* argv[]) {
         }
         SDL_GL_SwapWindow(window);
 
+        // Update audio playback
+        if (playing) {
+            update_audio_playback(audio_state, clips, playhead_time, gl_resources);
+        }
+
     } // End main loop
 
     std::cout << "Cleaning up resources..." << std::endl;
@@ -1512,6 +1535,10 @@ int main(int argc, char* argv[]) {
     SDL_GL_DestroyContext(gl_context);
     SDL_DestroyWindow(window); SDL_Quit(); avformat_network_deinit();
     std::cout << "Exiting application." << std::endl;
+
+    // Cleanup
+    cleanup_audio_playback(audio_state);
+
     return 0;
 }
 
