@@ -1,6 +1,17 @@
 PROJECTNAME = Zest
 OUTPUT_DIR = build
 
+# --- Build Configuration ---
+# Set BUILD_TYPE=release for optimized build, debug for debugging (default)
+BUILD_TYPE ?= debug
+
+# Optimization flags based on build type
+ifeq ($(BUILD_TYPE),release)
+    OPT_FLAGS = -O2 -DNDEBUG -march=native
+else
+    OPT_FLAGS = -O0 -g
+endif
+
 # --- OpenCV Configuration (Point to your installed OpenCV) ---
 OPENCV_INSTALL_DIR = C:/Programs/OpenCV/opencv/build_mingw/install
 OPENCV_SUBDIR_FOR_LIBS_BINS = x64/mingw
@@ -46,6 +57,10 @@ RES = res/zest_icon.res
 
 $(shell mkdir -p $(OUTPUT_DIR))
 
+$(info === Build Configuration ===============)
+$(info BUILD_TYPE: $(BUILD_TYPE))
+$(info OPT_FLAGS: $(OPT_FLAGS))
+$(info =======================================)
 $(info OPENCV_INSTALL_DIR is: [$(OPENCV_INSTALL_DIR)])
 $(info OPENCV_SUBDIR_FOR_LIBS_BINS is: [$(OPENCV_SUBDIR_FOR_LIBS_BINS)])
 $(info OPENCV_LIB_DIR is: [$(OPENCV_LIB_DIR)])
@@ -58,16 +73,16 @@ $(RES): res/zest_icon.rc
 	windres $< -O coff -o $@
 
 %.o: %.cpp
-	g++ -c $< -o $@ $(INCLUDE_DIRS) -std=c++17 -Wall -g -Wno-deprecated-declarations
+	g++ -c $< -o $@ $(INCLUDE_DIRS) -std=c++17 -Wall $(OPT_FLAGS) -Wno-deprecated-declarations
 
 %.o: %.c
-	gcc -c $< -o $@ $(INCLUDE_DIRS) -Wall -g
+	gcc -c $< -o $@ $(INCLUDE_DIRS) -Wall $(OPT_FLAGS)
 
 $(OUTPUT_DIR)/$(PROJECTNAME).exe: $(OBJ) $(RES)
 	@echo "--- Linking ---"
 	@echo "Full linker command would be:"
 	@echo "g++ $(OBJ) $(RES) -o $@ $(LIB_DIRS) $(LIBS)"
-	g++ $(OBJ) $(RES) -o $@ $(LIB_DIRS) $(LIBS)
+	g++ $(OBJ) $(RES) -o $@ $(LIB_DIRS) $(LIBS) $(OPT_FLAGS)
 
 clean:
 	rm -rf $(OUTPUT_DIR)/*.exe res/*.res $(OBJ)

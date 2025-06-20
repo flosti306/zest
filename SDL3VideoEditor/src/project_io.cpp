@@ -3,6 +3,8 @@
 #include <sstream>
 #include <nlohmann/json.hpp>
 #include <miniz.h>
+#include <map> // For pointer-to-index mapping
+#include <vector>
 
 using json = nlohmann::json;
 
@@ -40,7 +42,9 @@ void from_json(const json& j, std::shared_ptr<EffectGraph>& graph) {
     graph = nullptr;
 }
 
-// --- Clip serialization ---
+// --- Clip serialization (NO CHANGE NEEDED HERE) ---
+// This function correctly omits the `linked_clip` pointer, which is what we want.
+// The pointer's representation (the index) will be added by the higher-level SaveProject function.
 void to_json(json& j, const Clip& clip) {
     j = json{
         {"name", clip.name},
@@ -72,6 +76,7 @@ void to_json(json& j, const Clip& clip) {
     // Waveform is not serialized (can be regenerated)
 }
 
+// This function correctly doesn't try to deserialize the pointer.
 void from_json(const json& j, Clip& clip) {
     clip.name = j.value("name", "");
     clip.path = j.value("path", "");
@@ -100,6 +105,7 @@ void from_json(const json& j, Clip& clip) {
     if (j.contains("scale_track")) from_json(j["scale_track"], clip.scale_track);
     if (j.contains("volume_track")) from_json(j["volume_track"], clip.volume_track);
     // waveform is not loaded (regenerate after load)
+    // linked_clip is not loaded here; it's handled in a second pass by the LoadProject function.
 }
 
 // --- Compression helpers (unchanged) ---
@@ -136,11 +142,35 @@ bool decompress_string(const std::string& input, std::string& output) {
 }
 
 // --- File-based Save/Load ---
+// REWRITTEN to handle linked_clip pointers by saving their index instead.
 bool SaveProject(const std::string& filename, const std::vector<Clip>& clips, float playhead_time, float zoom_factor) {
     json j;
     j["playhead_time"] = playhead_time;
     j["zoom_factor"] = zoom_factor;
-    j["clips"] = clips;
+
+    // Create a map from clip address to index for fast lookups
+    std::map<const Clip*, size_t> clip_to_index_map;
+    for(size_t i = 0; i < clips.size(); ++i) {
+        clip_to_index_map[&clips[i]] = i;
+    }
+
+    json clips_json = json::array();
+    for (const auto& clip : clips) {
+        // Convert clip to json using the existing ADL function
+        json clip_json = clip; 
+
+        // Find the index of the linked clip and add it to the json object
+        ptrdiff_t linked_idx = -1;
+        if (clip.linked_clip) {
+            auto it = clip_to_index_map.find(clip.linked_clip);
+            if (it != clip_to_index_map.end()) {
+                linked_idx = it->second;
+            }
+        }
+        clip_json["linked_clip_index"] = linked_idx;
+        clips_json.push_back(clip_json);
+    }
+    j["clips"] = clips_json;
 
     std::string json_str = j.dump();
     std::string compressed;
@@ -152,6 +182,7 @@ bool SaveProject(const std::string& filename, const std::vector<Clip>& clips, fl
     return true;
 }
 
+// REWRITTEN to use a two-pass approach to re-link pointers after loading.
 bool LoadProject(const std::string& filename, std::vector<Clip>& clips, float& playhead_time, float& zoom_factor) {
     std::ifstream in(filename, std::ios::binary | std::ios::ate);
     if (!in) return false;
@@ -159,42 +190,107 @@ bool LoadProject(const std::string& filename, std::vector<Clip>& clips, float& p
     std::streamsize size = in.tellg();
     in.seekg(0, std::ios::beg);
     std::string buffer(size, '\0');
-    in.read(buffer.data(), size);
+    if(size > 0) in.read(buffer.data(), size);
 
     std::string json_str;
     if (!decompress_string(buffer, json_str)) return false;
 
-    json j = json::parse(json_str);
+    json j = json::parse(json_str, nullptr, false); // No-throw parse
+    if (j.is_discarded()) return false; // Handle corrupted file
 
     playhead_time = j.value("playhead_time", 0.0f);
     zoom_factor = j.value("zoom_factor", 1.0f);
+    
+    // --- Two-pass loading to re-establish links ---
     clips.clear();
-    if (j.contains("clips")) {
-        for (const auto& jc : j["clips"]) {
-            clips.push_back(jc.get<Clip>());
+    if (!j.contains("clips") || !j["clips"].is_array()) {
+        return true; // Project might be empty, which is valid.
+    }
+
+    const json& clips_json = j["clips"];
+    std::vector<ptrdiff_t> link_indices;
+    link_indices.reserve(clips_json.size());
+
+    // First pass: Deserialize all clip data and store link indices
+    for (const auto& jc : clips_json) {
+        clips.push_back(jc.get<Clip>());
+        link_indices.push_back(jc.value("linked_clip_index", (ptrdiff_t)-1));
+    }
+
+    // Second pass: Re-establish pointers
+    for (size_t i = 0; i < clips.size(); ++i) {
+        ptrdiff_t linked_idx = link_indices[i];
+        if (linked_idx >= 0 && static_cast<size_t>(linked_idx) < clips.size()) {
+            clips[i].linked_clip = &clips[linked_idx];
+        } else {
+            clips[i].linked_clip = nullptr;
         }
     }
     return true;
 }
 
 // --- Stream-based Save/Load for Undo/Redo ---
+// REWRITTEN to handle linked_clip pointers correctly.
 bool SaveProjectToStream(std::ostream& out, const std::vector<Clip>& clips, float playhead_time, float zoom_factor) {
     json j;
     j["playhead_time"] = playhead_time;
     j["zoom_factor"] = zoom_factor;
-    j["clips"] = clips;
+
+    std::map<const Clip*, size_t> clip_to_index_map;
+    for(size_t i = 0; i < clips.size(); ++i) {
+        clip_to_index_map[&clips[i]] = i;
+    }
+
+    json clips_json = json::array();
+    for (const auto& clip : clips) {
+        json clip_json = clip;
+        ptrdiff_t linked_idx = -1;
+        if (clip.linked_clip) {
+            auto it = clip_to_index_map.find(clip.linked_clip);
+            if (it != clip_to_index_map.end()) {
+                linked_idx = it->second;
+            }
+        }
+        clip_json["linked_clip_index"] = linked_idx;
+        clips_json.push_back(clip_json);
+    }
+    j["clips"] = clips_json;
+    
     out << j.dump();
     return true;
 }
+
+// REWRITTEN to handle re-linking pointers correctly.
 bool LoadProjectFromStream(std::istream& in, std::vector<Clip>& clips, float& playhead_time, float& zoom_factor) {
     json j;
     in >> j;
+    if (in.fail()) return false;
+
     playhead_time = j.value("playhead_time", 0.0f);
     zoom_factor = j.value("zoom_factor", 1.0f);
+    
     clips.clear();
-    if (j.contains("clips")) {
-        for (const auto& jc : j["clips"]) {
-            clips.push_back(jc.get<Clip>());
+    if (!j.contains("clips") || !j["clips"].is_array()) {
+        return true;
+    }
+
+    const json& clips_json = j["clips"];
+    std::vector<ptrdiff_t> link_indices;
+    link_indices.reserve(clips_json.size());
+
+    // Pass 1: Deserialize clips and get link indices
+    for (const auto& jc : clips_json) {
+        clips.push_back(jc.get<Clip>());
+        link_indices.push_back(jc.value("linked_clip_index", (ptrdiff_t)-1));
+    }
+
+    // Pass 2: Re-establish links
+    for (size_t i = 0; i < clips.size(); ++i) {
+        ptrdiff_t linked_idx = link_indices[i];
+        if (linked_idx >= 0 && static_cast<size_t>(linked_idx) < clips.size()) {
+            clips[i].linked_clip = &clips[linked_idx];
+        } else {
+            clips[i].linked_clip = nullptr;
         }
     }
     return true;
