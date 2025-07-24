@@ -1714,6 +1714,9 @@ void DrawTimelineEditor(
     const float timeline_width = ImGui::GetContentRegionAvail().x - label_width;
     const float layer_height = 60.0f;
     const float layer_padding = 10.0f;
+    const float scrollbar_height = 12.0f;
+
+    static float scroll_x = 0.0f;
 
     // Styling constants from theme
     ImVec4 bg_dark = ImVec4(0.13f, 0.12f, 0.15f, 1.00f);
@@ -1783,8 +1786,13 @@ void DrawTimelineEditor(
     ImVec2 cursor_pos = ImGui::GetCursorScreenPos();
     ImVec2 labels_start = cursor_pos;
     ImVec2 timeline_start = ImVec2(labels_start.x + label_width, labels_start.y);
+    ImVec2 timeline_end = ImVec2(timeline_start.x + timeline_width, timeline_start.y + timeline_height);
     
     ImDrawList* draw_list = ImGui::GetWindowDrawList();
+
+    // --- NEW: Calculate and clamp scroll range ---
+    float max_scroll_x = std::max(0.0f, timeline_size - timeline_width);
+    scroll_x = std::clamp(scroll_x, 0.0f, max_scroll_x);
     
     // Draw labels background with gradient (top to bottom)
     ImVec2 labels_end = ImVec2(labels_start.x + label_width, labels_start.y + timeline_height);
@@ -1805,8 +1813,10 @@ void DrawTimelineEditor(
         2.0f
     );
 
+    // --- NEW: Push a clipping rectangle for the scrolling timeline area ---
+    draw_list->PushClipRect(ImVec2(timeline_start.x, timeline_start.y - 25.0f), timeline_end, true);
+
     // Draw timeline background with subtle gradient
-    ImVec2 timeline_end = ImVec2(timeline_start.x + timeline_width, timeline_start.y + timeline_height);
     draw_list->AddRectFilledMultiColor(
         timeline_start, 
         timeline_end,
@@ -1816,93 +1826,6 @@ void DrawTimelineEditor(
         ImGui::ColorConvertFloat4ToU32(ImVec4(0.14f, 0.14f, 0.16f, 1.00f))  // Bottom left
     );
 
-    // Draw the labels in their own area
-    // Video track labels
-    for (int i = 0; i < max_video_layer; ++i) {
-        float y = labels_start.y + (max_video_layer - i - 1) * (layer_height + layer_padding);
-        
-        // Better styling for labels
-        ImVec2 label_rect_min = ImVec2(labels_start.x, y);
-        ImVec2 label_rect_max = ImVec2(labels_start.x + label_width - 2, y + layer_height);
-        
-         // Gradient background for label using theme colors
-         draw_list->AddRectFilledMultiColor(
-            label_rect_min,
-            label_rect_max,
-            ImGui::ColorConvertFloat4ToU32(ImVec4(0.60f, 0.30f, 0.20f, 1.00f)), // Top
-            ImGui::ColorConvertFloat4ToU32(ImVec4(0.45f, 0.22f, 0.15f, 1.00f)), // Top right
-            ImGui::ColorConvertFloat4ToU32(ImVec4(0.17f, 0.16f, 0.19f, 1.00f)), // Bottom right
-            ImGui::ColorConvertFloat4ToU32(ImVec4(0.17f, 0.16f, 0.19f, 1.00f))  // Bottom left
-        );
-        
-        // Add subtle accent color border
-        draw_list->AddRect(
-            label_rect_min,
-            label_rect_max,
-            ImGui::ColorConvertFloat4ToU32(ImVec4(accent.x, accent.y, accent.z, 0.3f)),
-            4.0f, // Rounded corners
-            0,
-            1.0f  // Line width
-        );
-        
-        // Label text with better positioning and styling
-        std::string label = "Video " + std::to_string(i + 1);
-        ImVec2 text_size = ImGui::CalcTextSize(label.c_str());
-        draw_list->AddText(
-            ImVec2(labels_start.x + (label_width - text_size.x) / 2, y + (layer_height - text_size.y) / 2),
-            col_text,
-            label.c_str()
-        );
-    }
-    
-    // Audio track labels
-    for (int i = 0; i < max_audio_layer; ++i) {
-        float y = labels_start.y + (max_video_layer + i) * (layer_height + layer_padding);
-        
-        // Better styling for labels
-        ImVec2 label_rect_min = ImVec2(labels_start.x, y);
-        ImVec2 label_rect_max = ImVec2(labels_start.x + label_width - 2, y + layer_height);
-        
-        // Gradient background for label with slightly different hue
-        draw_list->AddRectFilledMultiColor(
-            label_rect_min,
-            label_rect_max,
-            ImGui::ColorConvertFloat4ToU32(ImVec4(0.19f, 0.18f, 0.22f, 1.00f)), // Top
-            ImGui::ColorConvertFloat4ToU32(ImVec4(0.19f, 0.18f, 0.22f, 1.00f)), // Top right
-            ImGui::ColorConvertFloat4ToU32(ImVec4(0.25f, 0.30f, 0.45f, 1.00f)), // Bottom right
-            ImGui::ColorConvertFloat4ToU32(ImVec4(0.18f, 0.22f, 0.35f, 1.00f))  // Bottom left
-        );
-        
-        // Add subtle accent color border
-        draw_list->AddRect(
-            label_rect_min,
-            label_rect_max,
-            ImGui::ColorConvertFloat4ToU32(ImVec4(accent.x, accent.y, accent.z, 0.3f)),
-            4.0f, // Rounded corners
-            0,
-            1.0f  // Line width
-        );
-        
-        // Label text with better positioning and styling
-        std::string label = "Audio " + std::to_string(i + 1);
-        ImVec2 text_size = ImGui::CalcTextSize(label.c_str());
-        draw_list->AddText(
-            ImVec2(labels_start.x + (label_width - text_size.x) / 2, y + (layer_height - text_size.y) / 2),
-            col_text,
-            label.c_str()
-        );
-    }
-
-    // Layer lines with subtle styling
-    for (int layer = 0; layer <= (max_video_layer + max_audio_layer); ++layer) {
-        float y = timeline_start.y + layer * (layer_height + layer_padding);
-        // Subtle grid lines
-        draw_list->AddLine(
-            ImVec2(timeline_start.x, y),
-            ImVec2(timeline_end.x, y),
-            ImGui::ColorConvertFloat4ToU32(ImVec4(1.0f, 1.0f, 1.0f, 0.12f))
-        );
-    }
 
     // === Draw Ruler Overlay ===
     const float tick_major_height = timeline_height;
@@ -1919,18 +1842,19 @@ void DrawTimelineEditor(
         1.0f
     );
 
-    int major_step = 1;
-    while (pixels_per_second * major_step < 80.0f)
-        major_step *= 2;
+    int major_step_seconds = 1;
+    while (pixels_per_second * major_step_seconds < 80.0f) {
+        major_step_seconds = (major_step_seconds == 1) ? 2 : (major_step_seconds == 2 ? 5 : major_step_seconds * 2);
+    }
+    
+    int first_visible_sec = static_cast<int>(scroll_x / pixels_per_second);
+    int last_visible_sec = static_cast<int>((scroll_x + timeline_width) / pixels_per_second) + 1;
 
-    int num_ticks = int(project_duration) + 4;
-    for (int t = 0; t < num_ticks; ++t) {
-        float x = timeline_start.x + t * pixels_per_second;
+    for (int t = first_visible_sec; t <= last_visible_sec; ++t) {
+        float x = timeline_start.x + t * pixels_per_second - scroll_x; // Apply scroll offset
+    
+        bool is_major = (t % major_step_seconds == 0);
 
-        if (x < timeline_start.x - 100 || x > timeline_end.x + 100)
-            continue;
-
-        bool is_major = (t % major_step == 0);
         ImU32 tick_color = is_major ? 
             ImGui::ColorConvertFloat4ToU32(ImVec4(1.0f, 0.71f, 0.52f, 0.3f)) : 
             ImGui::ColorConvertFloat4ToU32(ImVec4(1.0f, 0.69f, 0.46f, 0.18f));
@@ -1959,8 +1883,14 @@ void DrawTimelineEditor(
     for (size_t i = 0; i < clips.size(); ++i) {
         auto& clip = clips[i];
 
-        float clip_start_x = timeline_start.x + (clip.start_time * pixels_per_second);
+        // --- UPDATED with scroll offset ---
+        float clip_start_x = timeline_start.x + (clip.start_time * pixels_per_second) - scroll_x;
         float clip_end_x = clip_start_x + (clip.duration * pixels_per_second);
+
+        // --- Culling: Don't process or draw clips that are fully off-screen ---
+        if (clip_end_x < timeline_start.x || clip_start_x > timeline_end.x) {
+            continue;
+        }
 
         int y_index = clip.type == ClipType::Video
         ? max_video_layer - clip.layer - 1
@@ -2165,7 +2095,7 @@ void DrawTimelineEditor(
 
             if (dragging_clip_index == i) {
                 float mouse_x = ImGui::GetMousePos().x;
-                float new_start = (mouse_x - timeline_start.x) / pixels_per_second - drag_offset_time;
+                float new_start = (mouse_x - timeline_start.x + scroll_x) / pixels_per_second - drag_offset_time;
                 new_start = std::max(0.0f, new_start);
                 float old_start = clip.start_time;
                 clip.start_time = new_start;
@@ -2194,7 +2124,7 @@ void DrawTimelineEditor(
                 PushUndo(clips, playhead_time, zoom_factor);
                 resizing_left = true;
                 float mouse_x = ImGui::GetMousePos().x;
-                float new_start = (mouse_x - timeline_start.x) / pixels_per_second;
+                float new_start = (mouse_x - timeline_start.x + scroll_x) / pixels_per_second;
                 float new_duration = clip.start_time + clip.duration - new_start;
                 float delta = new_start - clip.start_time;
                 if (delta > 0.0f) clip.media_start += delta;
@@ -2221,7 +2151,7 @@ void DrawTimelineEditor(
                 PushUndo(clips, playhead_time, zoom_factor);
                 resizing_right = true;
                 float mouse_x = ImGui::GetMousePos().x;
-                float new_end = (mouse_x - timeline_start.x) / pixels_per_second;
+                float new_end = (mouse_x - timeline_start.x + scroll_x) / pixels_per_second;
                 float old_duration = clip.duration;
                 clip.duration = std::max(0.1f, new_end - clip.start_time);
 
@@ -2255,7 +2185,7 @@ void DrawTimelineEditor(
     }
 
     // Playhead rendering
-    float playhead_x = timeline_start.x + playhead_time * pixels_per_second;
+    float playhead_x = timeline_start.x + playhead_time * pixels_per_second - scroll_x;
     
     const float line_width = 2.5f;
     const float head_width = 12.5f;
@@ -2267,60 +2197,64 @@ void DrawTimelineEditor(
     const float shadow_offset = 1.5f;
     const float shadow_blur = 3.0f;
 
-    // Head shadow (mathematically offset path)
-    draw_list->PathClear();
-    draw_list->PathLineTo(ImVec2(playhead_x + shadow_offset, timeline_start.y + head_height + shadow_offset));
-    draw_list->PathBezierCubicCurveTo(
-        ImVec2(playhead_x - head_width*0.42f + shadow_offset, timeline_start.y + head_height*0.66f + shadow_offset),
-        ImVec2(playhead_x - head_width*0.66f + shadow_offset, timeline_start.y + line_width + shadow_offset),
-        ImVec2(playhead_x + shadow_offset, timeline_start.y + shadow_offset)
-    );
-    draw_list->PathBezierCubicCurveTo(
-        ImVec2(playhead_x + head_width*0.66f + shadow_offset, timeline_start.y + line_width + shadow_offset),
-        ImVec2(playhead_x + head_width*0.42f + shadow_offset, timeline_start.y + head_height*0.66f + shadow_offset),
-        ImVec2(playhead_x + shadow_offset, timeline_start.y + head_height + shadow_offset)
-    );
-    draw_list->PathStroke(shadow_color, false, shadow_blur);
+    if (playhead_x >= timeline_start.x && playhead_x <= timeline_end.x) {
 
-    // Line shadow with perfect width matching
-    draw_list->AddLine(
-        ImVec2(playhead_x + shadow_offset, timeline_start.y + head_height + shadow_offset - line_width/2),
-        ImVec2(playhead_x + shadow_offset, timeline_start.y + timeline_height),
-        shadow_color, line_width + shadow_blur
-    );
+        // Head shadow (mathematically offset path)
+        draw_list->PathClear();
+        draw_list->PathLineTo(ImVec2(playhead_x + shadow_offset, timeline_start.y + head_height + shadow_offset));
+        draw_list->PathBezierCubicCurveTo(
+            ImVec2(playhead_x - head_width*0.42f + shadow_offset, timeline_start.y + head_height*0.66f + shadow_offset),
+            ImVec2(playhead_x - head_width*0.66f + shadow_offset, timeline_start.y + line_width + shadow_offset),
+            ImVec2(playhead_x + shadow_offset, timeline_start.y + shadow_offset)
+        );
+        draw_list->PathBezierCubicCurveTo(
+            ImVec2(playhead_x + head_width*0.66f + shadow_offset, timeline_start.y + line_width + shadow_offset),
+            ImVec2(playhead_x + head_width*0.42f + shadow_offset, timeline_start.y + head_height*0.66f + shadow_offset),
+            ImVec2(playhead_x + shadow_offset, timeline_start.y + head_height + shadow_offset)
+        );
+        draw_list->PathStroke(shadow_color, false, shadow_blur);
 
-    // ===== MATHEMATICALLY PERFECT HEAD-LINE CONNECTION =====
-    const float connection_radius = line_width * 0.8f;
-    const ImVec2 connection_point = ImVec2(playhead_x, timeline_start.y + head_height - connection_radius);
+        // Line shadow with perfect width matching
+        draw_list->AddLine(
+            ImVec2(playhead_x + shadow_offset, timeline_start.y + head_height + shadow_offset - line_width/2),
+            ImVec2(playhead_x + shadow_offset, timeline_start.y + timeline_height),
+            shadow_color, line_width + shadow_blur
+        );
 
-    // Head shape with exact line-width termination
-    draw_list->PathClear();
-    draw_list->PathLineTo(connection_point);
-    draw_list->PathBezierCubicCurveTo(
-        ImVec2(playhead_x - head_width*0.47f, timeline_start.y + head_height*0.6f),
-        ImVec2(playhead_x - head_width*0.65f, timeline_start.y + line_width*1.95f),
-        ImVec2(playhead_x, timeline_start.y)
-    );
-    draw_list->PathBezierCubicCurveTo(
-        ImVec2(playhead_x + head_width*0.65f, timeline_start.y + line_width*1.95f),
-        ImVec2(playhead_x + head_width*0.47f, timeline_start.y + head_height*0.6f),
-        connection_point
-    );
-    draw_list->PathFillConvex(playhead_color);
+        // ===== MATHEMATICALLY PERFECT HEAD-LINE CONNECTION =====
+        const float connection_radius = line_width * 0.8f;
+        const ImVec2 connection_point = ImVec2(playhead_x, timeline_start.y + head_height - connection_radius);
 
-    // Vertical line with exact width matching
-    draw_list->AddLine(
-        connection_point,
-        ImVec2(playhead_x - 1.0f, timeline_start.y + timeline_height),
-        playhead_color, line_width
-    );
+        // Head shape with exact line-width termination
+        draw_list->PathClear();
+        draw_list->PathLineTo(connection_point);
+        draw_list->PathBezierCubicCurveTo(
+            ImVec2(playhead_x - head_width*0.47f, timeline_start.y + head_height*0.6f),
+            ImVec2(playhead_x - head_width*0.65f, timeline_start.y + line_width*1.95f),
+            ImVec2(playhead_x, timeline_start.y)
+        );
+        draw_list->PathBezierCubicCurveTo(
+            ImVec2(playhead_x + head_width*0.65f, timeline_start.y + line_width*1.95f),
+            ImVec2(playhead_x + head_width*0.47f, timeline_start.y + head_height*0.6f),
+            connection_point
+        );
+        draw_list->PathFillConvex(playhead_color);
 
-    // Connection reinforcement
-    draw_list->AddCircleFilled(
-        connection_point,
-        connection_radius,
-        playhead_color
-    );
+        // Vertical line with exact width matching
+        draw_list->AddLine(
+            connection_point,
+            ImVec2(playhead_x - 1.0f, timeline_start.y + timeline_height),
+            playhead_color, line_width
+        );
+
+        // Connection reinforcement
+        draw_list->AddCircleFilled(
+            connection_point,
+            connection_radius,
+            playhead_color
+        );
+
+    }
 
     // Dragging the playhead (only within timeline area)
     static bool dragging_playhead = false;
@@ -2329,7 +2263,7 @@ void DrawTimelineEditor(
     if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
         dragging_playhead = true;
         float mouse_x = ImGui::GetMousePos().x;
-        playhead_time = (mouse_x - timeline_start.x) / pixels_per_second;
+        playhead_time = (mouse_x - timeline_start.x + scroll_x) / pixels_per_second;
         playhead_time = std::clamp(playhead_time, 0.0f, max_duration);
         last_playhead_time_for_velocity = playhead_time; 
     } else if (dragging_playhead && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
@@ -2341,11 +2275,129 @@ void DrawTimelineEditor(
         ImVec2 mouse = ImGui::GetMousePos();
         if (mouse.y > timeline_start.y && mouse.y < timeline_end.y && 
             mouse.x > timeline_start.x && mouse.x < timeline_end.x) {
-            playhead_time = (mouse.x - timeline_start.x) / pixels_per_second;
+            playhead_time = (mouse.x - timeline_start.x + scroll_x) / pixels_per_second;
             playhead_time = std::clamp(playhead_time, 0.0f, max_duration);
             last_playhead_time_for_velocity = playhead_time; 
         }
     }
+
+    draw_list->PopClipRect();
+
+    // Draw the labels in their own area
+    // Video track labels
+    for (int i = 0; i < max_video_layer; ++i) {
+        float y = labels_start.y + (max_video_layer - i - 1) * (layer_height + layer_padding);
+        
+        // Better styling for labels
+        ImVec2 label_rect_min = ImVec2(labels_start.x, y);
+        ImVec2 label_rect_max = ImVec2(labels_start.x + label_width - 2, y + layer_height);
+        
+         // Gradient background for label using theme colors
+         draw_list->AddRectFilledMultiColor(
+            label_rect_min,
+            label_rect_max,
+            ImGui::ColorConvertFloat4ToU32(ImVec4(0.60f, 0.30f, 0.20f, 1.00f)), // Top
+            ImGui::ColorConvertFloat4ToU32(ImVec4(0.45f, 0.22f, 0.15f, 1.00f)), // Top right
+            ImGui::ColorConvertFloat4ToU32(ImVec4(0.17f, 0.16f, 0.19f, 1.00f)), // Bottom right
+            ImGui::ColorConvertFloat4ToU32(ImVec4(0.17f, 0.16f, 0.19f, 1.00f))  // Bottom left
+        );
+        
+        // Add subtle accent color border
+        draw_list->AddRect(
+            label_rect_min,
+            label_rect_max,
+            ImGui::ColorConvertFloat4ToU32(ImVec4(accent.x, accent.y, accent.z, 0.3f)),
+            4.0f, // Rounded corners
+            0,
+            1.0f  // Line width
+        );
+        
+        // Label text with better positioning and styling
+        std::string label = "Video " + std::to_string(i + 1);
+        ImVec2 text_size = ImGui::CalcTextSize(label.c_str());
+        draw_list->AddText(
+            ImVec2(labels_start.x + (label_width - text_size.x) / 2, y + (layer_height - text_size.y) / 2),
+            col_text,
+            label.c_str()
+        );
+    }
+
+
+    
+    // Audio track labels
+    for (int i = 0; i < max_audio_layer; ++i) {
+        float y = labels_start.y + (max_video_layer + i) * (layer_height + layer_padding);
+        
+        // Better styling for labels
+        ImVec2 label_rect_min = ImVec2(labels_start.x, y);
+        ImVec2 label_rect_max = ImVec2(labels_start.x + label_width - 2, y + layer_height);
+        
+        // Gradient background for label with slightly different hue
+        draw_list->AddRectFilledMultiColor(
+            label_rect_min,
+            label_rect_max,
+            ImGui::ColorConvertFloat4ToU32(ImVec4(0.19f, 0.18f, 0.22f, 1.00f)), // Top
+            ImGui::ColorConvertFloat4ToU32(ImVec4(0.19f, 0.18f, 0.22f, 1.00f)), // Top right
+            ImGui::ColorConvertFloat4ToU32(ImVec4(0.25f, 0.30f, 0.45f, 1.00f)), // Bottom right
+            ImGui::ColorConvertFloat4ToU32(ImVec4(0.18f, 0.22f, 0.35f, 1.00f))  // Bottom left
+        );
+        
+        // Add subtle accent color border
+        draw_list->AddRect(
+            label_rect_min,
+            label_rect_max,
+            ImGui::ColorConvertFloat4ToU32(ImVec4(accent.x, accent.y, accent.z, 0.3f)),
+            4.0f, // Rounded corners
+            0,
+            1.0f  // Line width
+        );
+        
+        // Label text with better positioning and styling
+        std::string label = "Audio " + std::to_string(i + 1);
+        ImVec2 text_size = ImGui::CalcTextSize(label.c_str());
+        draw_list->AddText(
+            ImVec2(labels_start.x + (label_width - text_size.x) / 2, y + (layer_height - text_size.y) / 2),
+            col_text,
+            label.c_str()
+        );
+    }
+
+    // Layer lines with subtle styling
+    for (int layer = 0; layer <= (max_video_layer + max_audio_layer); ++layer) {
+        float y = timeline_start.y + layer * (layer_height + layer_padding);
+        // Subtle grid lines
+        draw_list->AddLine(
+            ImVec2(timeline_start.x, y),
+            ImVec2(timeline_end.x, y),
+            ImGui::ColorConvertFloat4ToU32(ImVec4(1.0f, 1.0f, 1.0f, 0.12f))
+        );
+    }
+
+    // --- NEW: Custom Scrollbar ---
+    if (max_scroll_x > 0) {
+        ImGui::SetCursorScreenPos(ImVec2(timeline_start.x, timeline_end.y + 2)); // Position below timeline
+        // Background
+        draw_list->AddRectFilled(ImGui::GetCursorScreenPos(), ImVec2(timeline_end.x, timeline_end.y + scrollbar_height), IM_COL32(25, 25, 28, 255), 4.0f);
+        
+        // Handle
+        float handle_width = (timeline_width / timeline_size) * timeline_width;
+        handle_width = std::max(handle_width, 25.0f); // Min handle size
+        float handle_pos_x = timeline_start.x + (scroll_x / max_scroll_x) * (timeline_width - handle_width);
+    
+        ImGui::SetCursorScreenPos(ImVec2(handle_pos_x, timeline_end.y + 2));
+        ImGui::InvisibleButton("##scrollbar_handle", ImVec2(handle_width, scrollbar_height - 4));
+        
+        ImU32 handle_col = ImGui::IsItemActive() ? col_accent_active : (ImGui::IsItemHovered() ? col_accent_hover : col_accent_muted);
+        draw_list->AddRectFilled(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), handle_col, 4.0f);
+    
+        if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+            float delta_x = ImGui::GetIO().MouseDelta.x;
+            float scroll_ratio = delta_x / (timeline_width - handle_width);
+            scroll_x += scroll_ratio * max_scroll_x;
+            scroll_x = std::clamp(scroll_x, 0.0f, max_scroll_x);
+        }
+    }
+
 
     // Need to advance cursor past the timeline for future components
     ImGui::SetCursorScreenPos(ImVec2(labels_start.x, labels_start.y + timeline_height + 5));
