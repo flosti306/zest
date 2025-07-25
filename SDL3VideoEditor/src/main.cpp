@@ -2715,8 +2715,8 @@ void DrawEffectUIForClip(Clip& clip, GLResources& gl_resources) {
                         ImGui::TextWrapped("Aspect ratio for radial. 1.0 attempts to use viewport aspect. Other values override.");
                     }
 
-                    ImGui::SliderFloat("Blend with Original##Gradient", &gradient_node->blend_with_original, 0.0f, 1.0f);
-                    DrawKeyframeTrackEditor("Blend##Gradient", gradient_node->blend_track);
+                    ImGui::SliderFloat("Intensity##Gradient", &gradient_node->intensity, 0.0f, 1.0f);
+                    DrawKeyframeTrackEditor("Intensity", gradient_node->intensity_track);
                 } else if (auto shadow_node = std::dynamic_pointer_cast<DropShadowEffectNode>(node)) {
                     ImGui::Text("Drop Shadow Properties:");
                     ImGui::DragFloat2("Offset##Shadow", &shadow_node->offset.x, 0.001f, -1.0f, 1.0f, "%.3f");

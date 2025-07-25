@@ -223,13 +223,13 @@ struct GradientEffectNode : public EffectNode {
     float radius_outer = 0.5f; // Normalized UV [0,1] (where end color is fully opaque)
     float aspect_ratio = 1.0f; // To make radial gradients circular if viewport is not square
 
-    float blend_with_original = 0.0f; // 0.0 = gradient only, 1.0 = original, 0.5 = mix
+    float intensity = 1.0f; // Default to 1.0 (fully visible overlay). 0.0 would be invisible.
 
     // Keyframe Tracks (optional)
     // Example for start color alpha, you can add for R,G,B, points, radii etc.
     KeyframeTrack<float> start_color_alpha_track;
     KeyframeTrack<float> end_color_alpha_track;
-    KeyframeTrack<float> blend_track;
+    KeyframeTrack<float> intensity_track;
     // Keyframes for vec2 (start_point, end_point, center_point) would require KeyframeTrack<glm::vec2>
     // or separate tracks for X and Y components. For simplicity, let's omit full keyframing for points/radii for now.
 

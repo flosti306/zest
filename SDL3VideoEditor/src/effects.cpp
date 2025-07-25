@@ -845,11 +845,11 @@ void GradientEffectNode::Process(const EffectContext& ctx) {
     // Evaluate Keyframes (example for alpha and blend)
     glm::vec4 eval_color_start = color_start;
     glm::vec4 eval_color_end = color_end;
-    float eval_blend = blend_with_original;
-
+    float eval_intensity = intensity;
+    
     if (!start_color_alpha_track.keyframes.empty()) eval_color_start.a = start_color_alpha_track.Evaluate(ctx.time);
     if (!end_color_alpha_track.keyframes.empty()) eval_color_end.a = end_color_alpha_track.Evaluate(ctx.time);
-    if (!blend_track.keyframes.empty()) eval_blend = blend_track.Evaluate(ctx.time);
+    if (!intensity_track.keyframes.empty()) eval_intensity = intensity_track.Evaluate(ctx.time);
     // Add more keyframe evaluations for colors, points, radii if implemented
 
 
@@ -868,7 +868,7 @@ void GradientEffectNode::Process(const EffectContext& ctx) {
         glUniform1f(glGetUniformLocation(program, "u_RadialAspectRatio"), aspect_ratio != 1.0f ? aspect_ratio : aspect); // Allow override or use viewport
     }
 
-    glUniform1f(glGetUniformLocation(program, "u_BlendWithOriginal"), eval_blend);
+    glUniform1f(glGetUniformLocation(program, "u_Intensity"), eval_intensity);
 
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, ctx.input_texture);

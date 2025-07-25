@@ -1,8 +1,9 @@
-// shaders/gradient.frag
+// gradient.frag
+
 #version 330 core
 out vec4 FragColor;
 
-in vec2 v_TexCoord; // Normalized UV [0,1], (0,0) is usually bottom-left
+in vec2 TexCoords; // CORRECTED: Was v_TexCoord
 
 uniform sampler2D u_OriginalTexture;
 uniform int u_GradientType; // 0 for Linear, 1 for Radial
@@ -20,7 +21,7 @@ uniform float u_RadialRadiusInner;  // Normalized
 uniform float u_RadialRadiusOuter;  // Normalized
 uniform float u_RadialAspectRatio;  // To correct for non-square viewports (width/height)
 
-uniform float u_BlendWithOriginal;
+uniform float u_Intensity; // CHANGED: Replaced u_BlendWithOriginal
 
 
 // Helper to project point P onto line segment AB, returns t [0,1]
@@ -34,14 +35,14 @@ float projectPointOnLineSegment(vec2 p, vec2 a, vec2 b) {
 }
 
 void main() {
-    vec4 original_color = texture(u_OriginalTexture, v_TexCoord);
+    vec4 original_color = texture(u_OriginalTexture, TexCoords);
     vec4 gradient_color;
 
     if (u_GradientType == 0) { // Linear
-        float t = projectPointOnLineSegment(v_TexCoord, u_LinearStartPoint, u_LinearEndPoint);
+        float t = projectPointOnLineSegment(TexCoords, u_LinearStartPoint, u_LinearEndPoint);
         gradient_color = mix(u_ColorStart, u_ColorEnd, t);
     } else if (u_GradientType == 1) { // Radial
-        vec2 uv = v_TexCoord;
+        vec2 uv = TexCoords;
         // Correct UVs for aspect ratio to make radial gradient circular
         uv.y = (uv.y - u_RadialCenterPoint.y) * u_RadialAspectRatio + u_RadialCenterPoint.y;
         
@@ -52,5 +53,10 @@ void main() {
         gradient_color = u_ColorStart; // Default or error
     }
 
-    FragColor = mix(gradient_color, original_color, u_BlendWithOriginal);
+    // NEW BLENDING LOGIC:
+    // Apply the intensity to the gradient's calculated alpha.
+    float final_gradient_alpha = gradient_color.a * u_Intensity;
+    
+    // Alpha-blend the gradient over the original color.
+    FragColor = mix(original_color, gradient_color, final_gradient_alpha);
 }

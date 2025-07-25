@@ -566,7 +566,7 @@ void render_frame(GLResources& res, float current_time,
 
     glBindFramebuffer(GL_FRAMEBUFFER, res.fbo);
     glViewport(0, 0, width, height);
-    glClearColor(0.1f, 0.1f, 0.1f, 1.0f); // Dark gray background
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f); // Clear with transparent black
     glClear(GL_COLOR_BUFFER_BIT); // No depth buffer needed for 2D compositing usually
 
     glEnable(GL_TEXTURE_2D);
@@ -642,8 +642,6 @@ void render_frame(GLResources& res, float current_time,
 
         evaluated_scale = std::max(0.0f, evaluated_scale);     // Never allow 0 scale
         evaluated_opacity = std::clamp(evaluated_opacity, 0.0f, 1.0f); // Clamp opacity
-
-        // (Optionally: evaluated_rotation if you add that too)
 
         GLuint tex_id = 0;
         bool is_video = is_video_file(clip.path);
