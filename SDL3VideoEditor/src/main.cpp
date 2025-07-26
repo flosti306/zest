@@ -1079,10 +1079,9 @@ int main(int argc, char* argv[]) {
     io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
 
     ImGui::StyleColorsDark();
-    io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 18.0f);
 
     ImGui_ImplSDL3_InitForOpenGL(window, gl_context);
-    ImGui_ImplOpenGL3_Init("#version 130"); // Or "#version 330 core" for modern GL
+    ImGui_ImplOpenGL3_Init("#version 330"); // Or "#version 330 core" for modern GL
 
     SetupImGuiStyle();
     std::string font_path = "C:\\Windows\\Fonts\\segoeui.ttf";

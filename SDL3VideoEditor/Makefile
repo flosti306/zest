@@ -73,7 +73,7 @@ $(RES): res/zest_icon.rc
 	windres $< -O coff -o $@
 
 %.o: %.cpp
-	g++ -c $< -o $@ $(INCLUDE_DIRS) -std=c++17 -Wall $(OPT_FLAGS) -Wno-deprecated-declarations
+	g++ -c $< -o $@ $(INCLUDE_DIRS) -std=c++23 -Wall $(OPT_FLAGS) -Wno-deprecated-declarations
 
 %.o: %.c
 	gcc -c $< -o $@ $(INCLUDE_DIRS) -Wall $(OPT_FLAGS)
