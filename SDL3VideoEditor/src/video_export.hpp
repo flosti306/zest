@@ -46,7 +46,7 @@ extern std::condition_variable worker_cv;
 extern std::atomic<bool> stop_thumbnail_worker_flag;
 
 extern std::thread decoder_thread;
-extern std::queue<DecodedFrameRequest> decoder_request_queue;
+extern std::deque<DecodedFrameRequest> decoder_request_queue;
 extern std::queue<DecodedFrameResult> decoder_result_queue;
 extern std::mutex decoder_request_mutex;
 extern std::mutex decoder_result_mutex;
@@ -119,7 +119,7 @@ struct VideoData {
     
     // Request throttling
     static constexpr double MIN_REQUEST_INTERVAL = 0.001; // Allow more frequent requests
-    static constexpr double CACHE_TOLERANCE = 1.0 / 1000.0; // 1 frame at 60fps
+    static constexpr double CACHE_TOLERANCE = 1.0 / 60.0; // 1 frame at 60fps
     static constexpr int MAX_PENDING_REQUESTS = 30;       // Allow more in-flight requests
     
     // Cache management
@@ -181,9 +181,15 @@ struct ThumbnailResult {
     std::string error_message;
 };
 
+enum class RequestPriority {
+    Normal = 0, // For playback prefetching
+    High = 1      // For scrubbing, pausing, and first frame
+};
+
 struct DecodedFrameRequest {
     std::string clip_path;
     double timestamp = 0.0f; // The media timestamp to decode
+    RequestPriority priority = RequestPriority::Normal;
 };
 
 struct DecodedFrameResult {
@@ -248,9 +254,9 @@ void ProcessThumbnailTasks(GLResources& res, int max_per_frame);
 void start_thumbnail_worker();
 void stop_thumbnail_worker();
 
-void update_video_previews(GLResources& res, const std::vector<Clip>& active_clips, float current_time);
+void update_video_previews(GLResources& res, const std::vector<Clip>& active_clips, float current_time, bool is_playing, bool is_scrubbing);
 bool update_texture_from_cache(VideoData& video, double target_time_seconds, bool strict);
-void update_playback_state(GLResources& res, float current_time, float last_time);
+void update_playback_state(GLResources& res, float current_time, float last_time, bool& is_playing_out, bool& is_scrubbing_out);
 bool should_request_frame(VideoData& video, double target_time);
 
 struct AudioPlaybackState {

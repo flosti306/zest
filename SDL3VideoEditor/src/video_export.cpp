@@ -40,7 +40,7 @@ std::condition_variable worker_cv;
 std::atomic<bool> stop_thumbnail_worker_flag = false;
 
 std::thread decoder_thread;
-std::queue<DecodedFrameRequest> decoder_request_queue;
+std::deque<DecodedFrameRequest> decoder_request_queue;
 std::queue<DecodedFrameResult> decoder_result_queue;
 std::mutex decoder_request_mutex;
 std::mutex decoder_result_mutex;
@@ -1533,11 +1533,11 @@ void decoder_worker_func() {
             while (decoder_request_queue.size() > 2) {
                 // NOTE: This can be a bit aggressive. If you find the preview stutters during
                 // fast scrubs, you might want to remove or adjust this block.
-                decoder_request_queue.pop();
+                decoder_request_queue.pop_back();
             }
             
             request = decoder_request_queue.front();
-            decoder_request_queue.pop();
+            decoder_request_queue.pop_front();
         }
 
         // Process the request
@@ -1566,6 +1566,17 @@ void decoder_worker_func() {
                 if (!codec) throw std::runtime_error("Unsupported codec");
                 
                 new_state->codec_ctx = avcodec_alloc_context3(codec);
+
+                // OPTIMIZATION: Enable multi-threaded decoding in FFmpeg
+                // Let FFmpeg decide the optimal number of threads based on core count.
+                if (codec->capabilities & AV_CODEC_CAP_FRAME_THREADS) {
+                    av_opt_set_int(new_state->codec_ctx, "thread_type", FF_THREAD_FRAME, 0);
+                }
+                 if (codec->capabilities & AV_CODEC_CAP_SLICE_THREADS) {
+                    av_opt_set_int(new_state->codec_ctx, "thread_type", FF_THREAD_SLICE, 0);
+                }
+                av_opt_set_int(new_state->codec_ctx, "thread_count", 0, 0);
+
                 if (!new_state->codec_ctx || 
                     avcodec_parameters_to_context(new_state->codec_ctx, codec_params) < 0 || 
                     avcodec_open2(new_state->codec_ctx, codec, nullptr) < 0)
@@ -1705,26 +1716,30 @@ cleanup_and_return:
     return frame_found_and_converted;
 }
 
-// Add this function to detect playback state
-void update_playback_state(GLResources& res, float current_time, float last_time) {
-    float time_delta = current_time - last_time;
-    bool is_playing = std::abs(time_delta) > 0.001f; // Playing if time is advancing
-    bool is_scrubbing = std::abs(time_delta) > 0.1f; // Large jumps indicate scrubbing
-    
+// OPTIMIZATION: Update playback state and clear cache on pause.
+void update_playback_state(GLResources& res, float current_time, float last_time, bool& is_playing_out, bool& is_scrubbing_out) {
+    float time_delta = std::abs(current_time - last_time);
+    is_playing_out = time_delta > 0.0001f && time_delta < 0.1f;
+    is_scrubbing_out = time_delta >= 0.1f;
+
     for (auto& [path, video] : res.video_cache) {
-        bool was_playing = video.is_actively_playing;
-        video.is_actively_playing = is_playing && !is_scrubbing;
-        
-        // If we just paused, clear the frame cache to prevent looping
-        if (was_playing && !video.is_actively_playing) {
+        bool was_actively_playing = video.is_actively_playing;
+        video.is_actively_playing = is_playing_out;
+
+        if (is_scrubbing_out) {
+            // OPTIMIZATION: Intelligent cache trimming instead of full clear
+            // Keep a 2-second buffer around the current playhead time during scrubs
+            const double trim_threshold = 2.0; 
+            video.frame_cache.erase(
+                std::remove_if(video.frame_cache.begin(), video.frame_cache.end(),
+                    [current_time, trim_threshold](const DecodedFrame& frame) {
+                        return std::abs(frame.pts - current_time) > trim_threshold;
+                    }),
+                video.frame_cache.end()
+            );
+        } else if (was_actively_playing && !video.is_actively_playing) {
+             // Paused: clear cache to save memory
             video.frame_cache.clear();
-            video.last_decoded_pts = -1.0;
-            video.is_seeking = false;
-        }
-        
-        // Reset consecutive hits if we're jumping around
-        if (is_scrubbing) {
-            video.consecutive_cache_hits = 0;
         }
     }
 }
@@ -1740,7 +1755,7 @@ void stop_decoder_worker() {
         stop_decoder_worker_flag = true;
         {
             std::lock_guard<std::mutex> lock(decoder_request_mutex);
-            std::queue<DecodedFrameRequest>().swap(decoder_request_queue);
+            std::deque<DecodedFrameRequest>().swap(decoder_request_queue);
         }
         decoder_worker_cv.notify_one();
         decoder_thread.join();
@@ -1752,14 +1767,24 @@ void stop_decoder_worker() {
     }
 }
 
-bool is_frame_available_in_cache(const VideoData& video, double target_time, double tolerance = VideoData::CACHE_TOLERANCE) {
+bool is_frame_available_in_cache(const VideoData& video, double target_time, double tolerance) {
     if (video.frame_cache.empty()) return false;
     
-    for (const auto& frame : video.frame_cache) {
-        if (std::abs(frame.pts - target_time) <= tolerance) {
-            return true;
-        }
+    // Check if the target time is within the range of the cached frames
+    if (target_time < video.frame_cache.front().pts - tolerance || target_time > video.frame_cache.back().pts + tolerance) {
+        return false;
     }
+
+    // Binary search would be faster here if the cache is always sorted, which it is.
+    auto it = std::lower_bound(video.frame_cache.begin(), video.frame_cache.end(), target_time - tolerance, 
+        [](const DecodedFrame& frame, double time) {
+        return frame.pts < time;
+    });
+
+    if (it != video.frame_cache.end() && std::abs(it->pts - target_time) <= tolerance) {
+        return true;
+    }
+    
     return false;
 }
 
@@ -1780,7 +1805,7 @@ bool should_request_frame(VideoData& video, double target_time) {
     }
     
     // Check if frame is already in cache with tolerance
-    if (is_frame_available_in_cache(video, target_time)) {
+    if (is_frame_available_in_cache(video, target_time, VideoData::CACHE_TOLERANCE)) {
         return false;
     }
     
@@ -1823,72 +1848,57 @@ void force_cache_refresh(GLResources& res, const std::string& clip_path) {
     }
 }
 
-void update_video_previews(GLResources& res, const std::vector<Clip>& active_clips, float current_time) {
-    static float last_time = 0.0f;
-    float delta = std::abs(current_time - last_time);
-    last_time = current_time;
-
-    bool is_paused = delta < 0.0001f;
-    bool is_small_jump = delta > 0.0005f && delta < 0.1f;
-    bool is_seek = delta >= 0.5f; // Large jump (slider, mouse, or big step)
-
+// OPTIMIZATION: New prefetching logic with request prioritization
+void update_video_previews(GLResources& res, const std::vector<Clip>& active_clips, float current_time, bool is_playing, bool is_scrubbing) {
+    
+    // On a new scrub action, clear out old, low-priority prefetch requests.
+    if (is_scrubbing) {
+        std::lock_guard<std::mutex> lock(decoder_request_mutex);
+        decoder_request_queue.erase(
+            std::remove_if(decoder_request_queue.begin(), decoder_request_queue.end(), 
+                [](const DecodedFrameRequest& req){
+                    return req.priority == RequestPriority::Normal;
+                }),
+            decoder_request_queue.end()
+        );
+    }
+    
     for (const auto& clip : active_clips) {
-        if (clip.type == ClipType::Video && is_video_file(clip.path)) {
-            auto it = res.video_cache.find(clip.path);
-            if (it == res.video_cache.end() || !it->second.is_initialized) continue;
+        if (clip.type != ClipType::Video || !is_video_file(clip.path)) continue;
 
-            VideoData& video = it->second;
-            float media_time = (current_time - clip.start_time) + clip.media_start;
-            if (media_time < 0) continue;
+        auto it = res.video_cache.find(clip.path);
+        if (it == res.video_cache.end() || !it->second.is_initialized) continue;
 
-            // --- Only flush cache on large seek, NOT on small jump/frame-step ---
-            if (is_seek) {
-                video.frame_cache.clear();
-                video.last_decoded_pts = -1.0;
-                video.is_seeking = false;
-            }
+        VideoData& video = it->second;
+        double media_time = (current_time - clip.start_time) + clip.media_start;
+        if (media_time < 0) continue;
 
-            bool have_exact = is_frame_available_in_cache(video, media_time, 0.05);
+        // --- Prioritized Request Logic ---
 
-            // Always request the exact frame if not in cache (paused, step, or seek)
-            if ((is_paused || is_small_jump || is_seek) && !have_exact && should_request_frame(video, media_time)) {
+        // 1. If scrubbing or paused, send a HIGH priority request for the exact frame.
+        if (is_scrubbing || !is_playing) {
+            if (should_request_frame(video, media_time)) {
                 std::lock_guard<std::mutex> lock(decoder_request_mutex);
-                DecodedFrameRequest req;
-                req.clip_path = clip.path;
-                req.timestamp = media_time;
-                decoder_request_queue.push(req);
+                // Push to the FRONT of the deque
+                decoder_request_queue.push_front({clip.path, media_time, RequestPriority::High});
                 decoder_worker_cv.notify_one();
             }
+        }
 
-            // Only prefetch ahead during smooth playback (not after seek/step)
-            if (!is_paused && !is_small_jump && !is_seek) {
-                int prefetch_count = 8;
-                float frame_duration = 1.0f / 30.0f; // Or use actual video FPS if known
-                for (int i = 0; i < prefetch_count; ++i) {
-                    double prefetch_time = media_time + i * frame_duration;
-                    if (should_request_frame(video, prefetch_time)) {
-                        std::lock_guard<std::mutex> lock(decoder_request_mutex);
-                        DecodedFrameRequest req;
-                        req.clip_path = clip.path;
-                        req.timestamp = prefetch_time;
-                        decoder_request_queue.push(req);
-                        decoder_worker_cv.notify_one();
-                    }
-                }
-            } else if (video.frame_cache.empty()) {
-                // Proactively prefetch first 4 frames for instant scrubbing/preview
-                int prefetch_count = 4;
-                float frame_duration = 1.0f / 30.0f; // Or use actual FPS
-                for (int i = 0; i < prefetch_count; ++i) {
-                    double prefetch_time = media_time + i * frame_duration;
-                    if (should_request_frame(video, prefetch_time)) {
-                        std::lock_guard<std::mutex> lock(decoder_request_mutex);
-                        DecodedFrameRequest req;
-                        req.clip_path = clip.path;
-                        req.timestamp = prefetch_time;
-                        decoder_request_queue.push(req);
-                        decoder_worker_cv.notify_one();
-                    }
+        // 2. During smooth playback, prefetch with NORMAL priority.
+        if (is_playing) {
+            const int prefetch_count = 20;
+            const float frame_duration = (video.time_base.den > 0) ? (1.0f / (float)av_q2d(video.format_ctx->streams[video.video_stream_idx]->r_frame_rate)) : (1.0f / 30.0f);
+
+            for (int i = 1; i <= prefetch_count; ++i) {
+                double prefetch_time = media_time + i * frame_duration;
+                if (prefetch_time > video.duration_sec) break;
+
+                if (decoder_request_queue.size() < VideoData::MAX_PENDING_REQUESTS && should_request_frame(video, prefetch_time)) {
+                     std::lock_guard<std::mutex> lock(decoder_request_mutex);
+                     // Push to the BACK of the deque
+                     decoder_request_queue.push_back({clip.path, prefetch_time, RequestPriority::Normal});
+                     decoder_worker_cv.notify_one();
                 }
             }
         }

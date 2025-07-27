@@ -430,7 +430,7 @@ void AddNewClip(std::vector<Clip>& clips, const std::string& input_path, float v
                 DecodedFrameRequest req;
                 req.clip_path = input_path;
                 req.timestamp = first_frame_time;
-                decoder_request_queue.push(req);
+                decoder_request_queue.push_back(req);
                 decoder_worker_cv.notify_one();
             }
         }
@@ -1343,26 +1343,49 @@ int main(int argc, char* argv[]) {
         }
         
         static float last_time = 0.0f;
-        std::vector<Clip> active_clips_for_preview;
         float current_time = playhead_time; 
 
-        for (const auto& clip : clips) {
-            float clip_start = clip.start_time;
-            float clip_end = clip.start_time + clip.duration;
-            // A clip is active if the playhead is between its start and end.
-            if (current_time >= clip_start && current_time < clip_end) {
-                active_clips_for_preview.push_back(clip);
+        // --- OPTIMIZATION: Centralized Preview Update Logic ---
+        
+        // 1. Determine active clips for the current frame
+    std::vector<Clip> active_clips_for_preview;
+    for (const auto& clip : clips) {
+        if (playhead_time >= clip.start_time && playhead_time < clip.start_time + clip.duration) {
+            active_clips_for_preview.push_back(clip);
+        }
+    }
+    
+    // 2. Determine playback state (playing, scrubbing, paused)
+    bool is_playing_live, is_scrubbing;
+    // Pass the master 'playing' atomic to correctly determine state
+    update_playback_state(gl_resources, playhead_time, last_time, is_playing_live, is_scrubbing);
+    last_time = playhead_time;
+    is_playing_live = is_playing_live && playing.load(); 
+
+    // 3. Queue decode requests based on state (prefetching with priority)
+    update_video_previews(gl_resources, active_clips_for_preview, playhead_time, is_playing_live, is_scrubbing);
+    
+    // 4. Process any completed frames from the decoder thread
+    process_decoded_frames(gl_resources, 30); // Process up to 30 frames per UI loop
+
+    // 5. Update textures from the cache using asynchronous PBO uploads
+    for (const auto& clip : active_clips_for_preview) {
+        if (is_video_file(clip.path)) {
+            auto it = gl_resources.video_cache.find(clip.path);
+            if (it != gl_resources.video_cache.end() && it->second.is_initialized) {
+                double media_time = (playhead_time - clip.start_time) + clip.media_start;
+                // Use 'strict' mode when not in smooth playback for frame-accuracy
+                update_texture_from_cache(it->second, media_time, !is_playing_live);
             }
         }
+    }
 
-        update_playback_state(gl_resources, current_time, last_time);
-        last_time = current_time;
+    // 6. Render the final composite frame to the FBO.
+    std::vector<Clip> sorted_clips = clips;
+    std::sort(sorted_clips.begin(), sorted_clips.end(), [](const Clip& a, const Clip& b) { return a.layer < b.layer; });
+    render_frame(gl_resources, playhead_time, sorted_clips, preview_width, preview_height);
 
-        // Update previews with improved logic
-        update_video_previews(gl_resources, active_clips_for_preview, current_time);
-        
-        // This function checks for completed frames from the decoder thread and adds them to the cache.
-        process_decoded_frames(gl_resources, 30);
+        // --- End of Centralized Preview Update Logic ---
 
         if(show_thumbs) ProcessThumbnailResults(gl_resources, 2);
 
@@ -1455,6 +1478,7 @@ int main(int argc, char* argv[]) {
         ImGui::End(); // End Controls
 
         DrawTimelineEditor(clips, playhead_time, max_duration, zoom_factor, layers_changed, selected_clip, gl_resources, last_playhead_time_for_velocity);
+        RenderPreviewWindow(gl_resources.render_tex, preview_width, preview_height);
 
         if (mask_editor_open) {
             DrawMaskEditorWindow(gl_resources); // Pass gl_resources if needed inside editor
@@ -1464,7 +1488,7 @@ int main(int argc, char* argv[]) {
             DrawSmartMaskEditorWindow(); // Call this similar to DrawMaskEditorWindow
         }
 
-        // --- The PREVIEW RENDERING LOGIC ---
+        /* // --- The PREVIEW RENDERING LOGIC ---
         // This logic is now simpler. We don't need fancy rate limiting because the main thread
         // is so fast. We just update the texture if the playhead moved.
        // This block runs every frame to keep the preview live.
@@ -1488,7 +1512,7 @@ int main(int argc, char* argv[]) {
         std::sort(sorted_clips.begin(), sorted_clips.end(), [](const Clip& a, const Clip& b) { return a.layer < b.layer; });
         render_frame(gl_resources, playhead_time, sorted_clips, preview_width, preview_height);
 
-        RenderPreviewWindow(gl_resources.render_tex, preview_width, preview_height);
+        RenderPreviewWindow(gl_resources.render_tex, preview_width, preview_height); */
 
         ImGui::Begin("Inspector"); ApplyWindowBackgroundGradients();
         if (selected_clip) {
