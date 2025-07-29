@@ -100,6 +100,10 @@ static SmartMaskEditTool smart_mask_current_tool = SmartMaskEditTool::ROI_RECT;
 static cv::Mat smart_mask_editor_scribble_hints_cv; // CV_8UC1, stores GC_BGD, GC_FGD, etc.
 static GLuint smart_mask_editor_scribble_display_tex = 0; // To visualize scribbles
 static float smart_mask_brush_size_px = 10.0f;
+static cv::Mat smart_mask_bgd_model;
+static cv::Mat smart_mask_fgd_model;
+static bool smart_mask_is_initialized = false;
+static cv::Mat last_grabcut_mask_cv;
 
 std::stack<std::string> undo_stack;
 std::stack<std::string> redo_stack;
@@ -2793,10 +2797,15 @@ void OpenSmartMaskEditor(MaskEffectNode* node, GLuint clip_texture_for_backgroun
         glDeleteTextures(1, &smart_mask_editor_scribble_display_tex);
         smart_mask_editor_scribble_display_tex = 0;
     }
-    smart_mask_editor_scribble_hints_cv.release(); // Clear OpenCV Mat
+    smart_mask_bgd_model.release();
+    smart_mask_fgd_model.release();
+    last_grabcut_mask_cv.release();
+    smart_mask_is_initialized = false;
+
+    /* smart_mask_editor_scribble_hints_cv.release(); // Clear OpenCV Mat
     smart_mask_current_tool = SmartMaskEditTool::ROI_RECT; // Default tool
     // Optionally, if the node already has a current_smart_mask_texture,
-    // you could load it into smart_mask_editor_overlay_tex here as a starting point.
+    // you could load it into smart_mask_editor_overlay_tex here as a starting point. */
 
     smart_mask_editor_open = true;
 }
@@ -2840,7 +2849,9 @@ void DrawSmartMaskEditorWindow() {
     ImGui::SetNextWindowSize(ImVec2(700, 800), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Smart Mask Editor (Interactive)", &smart_mask_editor_open)) {
         ImGui::Text("Editing Smart Mask for: %s", current_editing_smart_mask_node->name.c_str());
-        ImGui::Text("Draw a rectangle around the subject, then click 'Analyze Frame'.");
+        ImGui::Text("Paint inside the subject to add to the selection.");
+        ImGui::Text("Hold ALT and paint to remove from the selection.");
+        ImGui::Text("Hold CTRL and drag to resize the brush.");
         ImGui::Separator();
 
         // --- Display Area for Clip Frame and ROI drawing ---
@@ -2875,170 +2886,98 @@ void DrawSmartMaskEditorWindow() {
             ImGui::Text("Background frame unavailable");
         }
         
-        // Display GrabCut result overlay (semi-transparent)
-        if (smart_mask_editor_overlay_tex != 0) {
-            // This texture was created from OpenCV mask (likely top-left data).
-            // If GrabCutMaskToRGBTexture doesn't flip, and ImGui::Image needs top-left, UVs (0,0)-(1,1)
-            // If GrabCutMaskToRGBTexture *does* flip, and ImGui needs top-left, UVs (0,1)-(1,0)
-            // Assuming GrabCutMaskToRGBTexture outputs standard GL (bottom-left after potential flip):
-            draw_list->AddImage((ImTextureID)(intptr_t)smart_mask_editor_overlay_tex,
-                                 canvas_p0, canvas_p1,
-                                 ImVec2(0,0), ImVec2(1,1), // Flip Y for display
-                                 IM_COL32(255, 255, 255, 128)); // Semi-transparent white
+        // 2. OPTIMIZATION: Draw contour overlay instead of semi-transparent mask
+        if (!last_grabcut_mask_cv.empty()) {
+            std::vector<std::vector<cv::Point>> contours;
+            cv::Mat contour_input = last_grabcut_mask_cv.clone();
+            // Find contours on the binary mask (where pixel == 1 or 3)
+            cv::threshold(contour_input, contour_input, 2, 255, cv::THRESH_BINARY);
+            contour_input.convertTo(contour_input, CV_8U);
+            cv::findContours(contour_input, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+            for (const auto& contour : contours) {
+                for (size_t i = 0; i < contour.size(); ++i) {
+                    cv::Point p1 = contour[i];
+                    cv::Point p2 = contour[(i + 1) % contour.size()];
+
+                    // Convert CV points to ImGui screen coordinates
+                    ImVec2 im_p1 = ImVec2(
+                        canvas_p0.x + ((float)p1.x / smart_mask_current_decoded_frame.width) * display_size.x,
+                        canvas_p0.y + ((float)p1.y / smart_mask_current_decoded_frame.height) * display_size.y
+                    );
+                    ImVec2 im_p2 = ImVec2(
+                        canvas_p0.x + ((float)p2.x / smart_mask_current_decoded_frame.width) * display_size.x,
+                        canvas_p0.y + ((float)p2.y / smart_mask_current_decoded_frame.height) * display_size.y
+                    );
+                    draw_list->AddLine(im_p1, im_p2, IM_COL32(137, 255, 0, 255), 2.0f);
+                }
+            }
         }
 
-
-        // ROI Drawing Logic
+        ImGui::SetCursorScreenPos(canvas_p0);
         ImGui::InvisibleButton("##smart_mask_canvas", display_size);
         bool is_hovered = ImGui::IsItemHovered();
-        bool is_active = ImGui::IsItemActive();
 
-        if (is_hovered && ImGui::IsMouseDown(ImGuiMouseButton_Left)) { // Changed from IsMouseClicked
-            ImVec2 mouse_pos_on_canvas_px = ImVec2(ImGui::GetMousePos().x - canvas_p0.x, ImGui::GetMousePos().y - canvas_p0.y);
-            // Convert to image pixel coordinates (careful with aspect ratio of display vs image)
-            int img_px = static_cast<int>((mouse_pos_on_canvas_px.x / display_size.x) * smart_mask_current_decoded_frame.width);
-            int img_py = static_cast<int>((mouse_pos_on_canvas_px.y / display_size.y) * smart_mask_current_decoded_frame.height);
+        // --- Core Interactive Logic ---
+        if (is_hovered) {
+            bool is_alt_down = ImGui::IsKeyDown(ImGuiKey_LeftAlt) || ImGui::IsKeyDown(ImGuiKey_RightAlt);
+            bool is_ctrl_down = ImGui::IsKeyDown(ImGuiKey_LeftCtrl) || ImGui::IsKeyDown(ImGuiKey_RightCtrl);
+            ImVec2 mouse_pos = ImGui::GetMousePos();
 
-            if (img_px >= 0 && img_px < smart_mask_current_decoded_frame.width && img_py >= 0 && img_py < smart_mask_current_decoded_frame.height) {
-                if (smart_mask_current_tool == SmartMaskEditTool::ROI_RECT) {
-                    if (!smart_mask_drawing_roi) { // Start drawing ROI only if not already drawing
-                        smart_mask_drawing_roi = true;
-                        smart_mask_roi_start_pos = ImGui::GetMousePos(); // Screen coordinates for drawing feedback
-                    }
-                    smart_mask_roi_end_pos = ImGui::GetMousePos();
-                } else if (smart_mask_current_tool == SmartMaskEditTool::PAINT_FG || smart_mask_current_tool == SmartMaskEditTool::PAINT_BG) {
-                    // Initialize scribble_hints_cv if it's empty
+            // A. Brush resizing
+            if (is_ctrl_down && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                smart_mask_brush_size_px += ImGui::GetIO().MouseDelta.x;
+                smart_mask_brush_size_px = std::max(1.0f, std::min(500.0f, smart_mask_brush_size_px));
+            }
+            // B. Painting
+            else if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                ImVec2 mouse_pos_on_canvas = ImVec2(mouse_pos.x - canvas_p0.x, mouse_pos.y - canvas_p0.y);
+                int img_px = static_cast<int>((mouse_pos_on_canvas.x / display_size.x) * smart_mask_current_decoded_frame.width);
+                int img_py = static_cast<int>((mouse_pos_on_canvas.y / display_size.y) * smart_mask_current_decoded_frame.height);
+
+                if (img_px >= 0 && img_px < smart_mask_current_decoded_frame.width && img_py >= 0 && img_py < smart_mask_current_decoded_frame.height) {
                     if (smart_mask_editor_scribble_hints_cv.empty()) {
                         smart_mask_editor_scribble_hints_cv.create(smart_mask_current_decoded_frame.height, smart_mask_current_decoded_frame.width, CV_8UC1);
-                        // Initialize with GC_PR_BGD (or GC_PR_FGD if ROI is present defining "unknown")
-                        // If an ROI exists, pixels inside are PR_FGD, outside are BGD.
-                        // For pure scribble mode, maybe initialize all to PR_FGD or PR_BGD. Let's do PR_BGD.
-                        smart_mask_editor_scribble_hints_cv.setTo(cv::GC_PR_BGD);
+                        smart_mask_editor_scribble_hints_cv.setTo(cv::GC_BGD); // Probable background
                     }
-                    uchar paint_value = (smart_mask_current_tool == SmartMaskEditTool::PAINT_FG) ? cv::GC_FGD : cv::GC_BGD;
-                    // Paint a circle on smart_mask_editor_scribble_hints_cv at (img_px, img_py)
-                    cv::circle(smart_mask_editor_scribble_hints_cv, cv::Point(img_px, img_py), 
-                            static_cast<int>(smart_mask_brush_size_px / 2.0f), 
-                            cv::Scalar(paint_value), -1 /*filled*/);
-                    UpdateScribbleDisplayTexture(); // Update the GL texture for visualizing scribbles
+                    uchar paint_value = is_alt_down ? cv::GC_BGD : cv::GC_FGD; // Background or Foreground
+                    cv::circle(smart_mask_editor_scribble_hints_cv, cv::Point(img_px, img_py), static_cast<int>(smart_mask_brush_size_px / 2.0f), cv::Scalar(paint_value), -1);
                 }
             }
-        }
-        if (smart_mask_drawing_roi && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
-            smart_mask_roi_end_pos = ImGui::GetMousePos();
-            if (ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
-                smart_mask_drawing_roi = false;
-                // Optional: Clamp ROI_end_pos to canvas boundaries
-                smart_mask_roi_end_pos.x = std::max(canvas_p0.x, std::min(smart_mask_roi_end_pos.x, canvas_p1.x));
-                smart_mask_roi_end_pos.y = std::max(canvas_p0.y, std::min(smart_mask_roi_end_pos.y, canvas_p1.y));
+
+            // C. Run Analysis on Mouse Release
+            if (ImGui::IsMouseReleased(ImGuiMouseButton_Left) && !is_ctrl_down) {
+                if (!smart_mask_editor_scribble_hints_cv.empty()) {
+                    GLuint generated_tex_id = 0;
+                    if (!smart_mask_is_initialized) {
+                        // First stroke: initialize with a rect around the scribbles
+                        cv::Rect roi = cv::boundingRect(smart_mask_editor_scribble_hints_cv);
+                        generated_tex_id = current_editing_smart_mask_node->RunGrabCut(smart_mask_current_decoded_frame, MaskEffectNode::GrabCutInitMode::RECT, roi, cv::Mat(), smart_mask_bgd_model, smart_mask_fgd_model, false);
+                        smart_mask_is_initialized = true;
+                    } else {
+                        // Subsequent strokes: refine using the scribbles
+                        generated_tex_id = current_editing_smart_mask_node->RunGrabCut(smart_mask_current_decoded_frame, MaskEffectNode::GrabCutInitMode::MASK, cv::Rect(), smart_mask_editor_scribble_hints_cv, smart_mask_bgd_model, smart_mask_fgd_model, true);
+                    }
+                    
+                    // Update our overlay and clear scribbles for the next stroke
+                    if (smart_mask_editor_overlay_tex != 0) glDeleteTextures(1, &smart_mask_editor_overlay_tex);
+                    smart_mask_editor_overlay_tex = generated_tex_id;
+                    smart_mask_editor_scribble_hints_cv.setTo(cv::GC_PR_BGD); // Reset for next refinement
+                }
             }
-            // Draw the ROI rectangle being dragged
-            draw_list->AddRect(smart_mask_roi_start_pos, smart_mask_roi_end_pos, IM_COL32(255, 255, 0, 255), 0.0f, 0, 2.0f);
-        } else if (smart_mask_roi_start_pos.x >= 0) { // ROI has been defined
-            // Draw the finalized ROI
-             draw_list->AddRect(smart_mask_roi_start_pos, smart_mask_roi_end_pos, IM_COL32(0, 255, 0, 255), 0.0f, 0, 2.0f);
-        }
-        if (smart_mask_editor_scribble_display_tex != 0) {
-            draw_list->AddImage((ImTextureID)(intptr_t)smart_mask_editor_scribble_display_tex,
-                                canvas_p0, canvas_p1,
-                                ImVec2(0,0), ImVec2(1,1), // Assuming GL texture (bottom-left)
-                                IM_COL32(255,255,255,150)); // Semi-transparent
-        }
 
-
-        ImGui::SetCursorPosY(canvas_p0.y + display_size.y + 10); // Move cursor below canvas
-
-        // Tool selection UI
-        ImGui::Separator();
-        ImGui::Text("Tool:"); ImGui::SameLine();
-        if (ImGui::RadioButton("ROI Rect", smart_mask_current_tool == SmartMaskEditTool::ROI_RECT)) smart_mask_current_tool = SmartMaskEditTool::ROI_RECT;
-        ImGui::SameLine();
-        if (ImGui::RadioButton("Paint FG (Green)", smart_mask_current_tool == SmartMaskEditTool::PAINT_FG)) smart_mask_current_tool = SmartMaskEditTool::PAINT_FG;
-        ImGui::SameLine();
-        if (ImGui::RadioButton("Paint BG (Blue)", smart_mask_current_tool == SmartMaskEditTool::PAINT_BG)) smart_mask_current_tool = SmartMaskEditTool::PAINT_BG;
-        if (smart_mask_current_tool == SmartMaskEditTool::PAINT_FG || smart_mask_current_tool == SmartMaskEditTool::PAINT_BG) {
-            ImGui::SameLine(); ImGui::SetNextItemWidth(100);
-            ImGui::SliderFloat("Brush", &smart_mask_brush_size_px, 1.0f, 500.0f, "%.0f px");
-        }
-        ImGui::Separator();
-
-        // --- Buttons ---
-        if (ImGui::Button("Analyze Frame") && smart_mask_roi_start_pos.x >= 0 && !smart_mask_current_decoded_frame.pixels.empty()) {
-            // Convert screen-space ROI to normalized canvas UVs [0,1] (top-left origin)
-            ImVec2 roi_norm_tl, roi_norm_br;
-            roi_norm_tl.x = (smart_mask_roi_start_pos.x - canvas_p0.x) / display_size.x;
-            roi_norm_tl.y = (smart_mask_roi_start_pos.y - canvas_p0.y) / display_size.y;
-            roi_norm_br.x = (smart_mask_roi_end_pos.x - canvas_p0.x) / display_size.x;
-            roi_norm_br.y = (smart_mask_roi_end_pos.y - canvas_p0.y) / display_size.y;
-
-            // Ensure tl is actually top-left and br is bottom-right for RunGrabCut
-            ImVec2 final_tl(std::min(roi_norm_tl.x, roi_norm_br.x), std::min(roi_norm_tl.y, roi_norm_br.y));
-            ImVec2 final_br(std::max(roi_norm_tl.x, roi_norm_br.x), std::max(roi_norm_tl.y, roi_norm_br.y));
-            
-            GLuint generated_tex_id = 0;
-            if (!smart_mask_editor_scribble_hints_cv.empty() && 
-                (smart_mask_current_tool == SmartMaskEditTool::PAINT_FG || smart_mask_current_tool == SmartMaskEditTool::PAINT_BG ||
-                cv::countNonZero(smart_mask_editor_scribble_hints_cv != cv::GC_PR_BGD) > 0 ) // Check if any scribbles were made
-            ) { // Prioritize scribble mode if scribbles exist
-                // Construct a dummy ROI for the API if needed, or use actual if user also drew one
-                cv::Rect roi_px(0,0,smart_mask_current_decoded_frame.width, smart_mask_current_decoded_frame.height);
-                if(smart_mask_roi_start_pos.x >=0) { // If user also drew an ROI
-                    // Convert screen ROI to image pixel ROI for grabcut_roi_rect
-                    int x_px = static_cast<int>(((std::min(smart_mask_roi_start_pos.x, smart_mask_roi_end_pos.x) - canvas_p0.x) / display_size.x) * smart_mask_current_decoded_frame.width);
-                    int y_px = static_cast<int>(((std::min(smart_mask_roi_start_pos.y, smart_mask_roi_end_pos.y) - canvas_p0.y) / display_size.y) * smart_mask_current_decoded_frame.height);
-                    int w_px = static_cast<int>((std::abs(smart_mask_roi_end_pos.x - smart_mask_roi_start_pos.x) / display_size.x) * smart_mask_current_decoded_frame.width);
-                    int h_px = static_cast<int>((std::abs(smart_mask_roi_end_pos.y - smart_mask_roi_start_pos.y) / display_size.y) * smart_mask_current_decoded_frame.height);
-                    // Clamp and ensure valid
-                    x_px = std::max(0, std::min(x_px, smart_mask_current_decoded_frame.width - 1));
-                    y_px = std::max(0, std::min(y_px, smart_mask_current_decoded_frame.height - 1));
-                    w_px = std::min(w_px, smart_mask_current_decoded_frame.width - x_px);
-                    h_px = std::min(h_px, smart_mask_current_decoded_frame.height - y_px);
-                    if (w_px > 0 && h_px > 0) roi_px = cv::Rect(x_px, y_px, w_px, h_px);
-                }
-
-                generated_tex_id = current_editing_smart_mask_node->RunGrabCut(
-                    smart_mask_current_decoded_frame, 
-                    MaskEffectNode::GrabCutInitMode::MASK, // New enum
-                    roi_px, // ROI is still somewhat used by GC_INIT_WITH_MASK
-                    smart_mask_editor_scribble_hints_cv
-                );
-            } else if (smart_mask_roi_start_pos.x >= 0) { // Fallback to ROI rect mode
-                // Convert screen ROI to image pixel ROI for grabcut_roi_rect
-                int x_px = static_cast<int>(((std::min(smart_mask_roi_start_pos.x, smart_mask_roi_end_pos.x) - canvas_p0.x) / display_size.x) * smart_mask_current_decoded_frame.width);
-                int y_px = static_cast<int>(((std::min(smart_mask_roi_start_pos.y, smart_mask_roi_end_pos.y) - canvas_p0.y) / display_size.y) * smart_mask_current_decoded_frame.height);
-                int w_px = static_cast<int>((std::abs(smart_mask_roi_end_pos.x - smart_mask_roi_start_pos.x) / display_size.x) * smart_mask_current_decoded_frame.width);
-                int h_px = static_cast<int>((std::abs(smart_mask_roi_end_pos.y - smart_mask_roi_start_pos.y) / display_size.y) * smart_mask_current_decoded_frame.height);
-                // Clamp and ensure valid
-                x_px = std::max(0, std::min(x_px, smart_mask_current_decoded_frame.width - 1));
-                y_px = std::max(0, std::min(y_px, smart_mask_current_decoded_frame.height - 1));
-                w_px = std::min(w_px, smart_mask_current_decoded_frame.width - x_px);
-                h_px = std::min(h_px, smart_mask_current_decoded_frame.height - y_px);
-
-                if (w_px <=0 || h_px <=0) {
-                    tinyfd_messageBox("Error", "Invalid ROI for GrabCut.", "ok", "error", 1);
-                } else {
-                    cv::Rect roi_px_rect(x_px, y_px, w_px, h_px);
-                    generated_tex_id = current_editing_smart_mask_node->RunGrabCut(
-                        smart_mask_current_decoded_frame,
-                        MaskEffectNode::GrabCutInitMode::RECT,
-                        roi_px_rect,
-                        cv::Mat() // Empty mat for scribble mask
-                    );
-                }
+            // D. Draw Live Brush Cursor
+            draw_list->AddCircle(mouse_pos, smart_mask_brush_size_px / 2.0f, IM_COL32(255, 255, 255, 200), 0, 1.5f);
+            if (is_alt_down) {
+                draw_list->AddLine(ImVec2(mouse_pos.x - 5, mouse_pos.y), ImVec2(mouse_pos.x + 5, mouse_pos.y), IM_COL32(255, 255, 255, 255), 2.0f);
             } else {
-                tinyfd_messageBox("Info", "Please draw an ROI or paint FG/BG hints first.", "ok", "info", 1);
+                draw_list->AddLine(ImVec2(mouse_pos.x - 5, mouse_pos.y), ImVec2(mouse_pos.x + 5, mouse_pos.y), IM_COL32(255, 255, 255, 255), 2.0f);
+                draw_list->AddLine(ImVec2(mouse_pos.x, mouse_pos.y - 5), ImVec2(mouse_pos.x, mouse_pos.y + 5), IM_COL32(255, 255, 255, 255), 2.0f);
             }
-
-            if (smart_mask_editor_overlay_tex != 0) { // Delete old overlay
-                glDeleteTextures(1, &smart_mask_editor_overlay_tex);
-            }
-            smart_mask_editor_overlay_tex = generated_tex_id; // Store new overlay
-
-            if (smart_mask_editor_overlay_tex != 0) { /* ... success message ... */ }
-            else { /* ... error message ... */ }
         }
 
-        ImGui::SameLine();
+        // --- Buttons are now simpler ---
+        ImGui::SetCursorPosY(canvas_p1.y + 10);
         if (ImGui::Button("Apply Smart Mask")) {
             if (smart_mask_editor_overlay_tex != 0 && current_editing_smart_mask_node) {
                 // 1. Delete any existing smart_interactive_mask_texture on the node
@@ -3077,6 +3016,9 @@ void DrawSmartMaskEditorWindow() {
                 glDeleteTextures(1, &smart_mask_editor_overlay_tex);
                 smart_mask_editor_overlay_tex = 0;
             }
+            smart_mask_bgd_model.release();
+            smart_mask_fgd_model.release();
+            smart_mask_is_initialized = false;
         }
 
     }
@@ -3092,5 +3034,9 @@ void DrawSmartMaskEditorWindow() {
             smart_mask_editor_scribble_display_tex = 0;
         }
         smart_mask_editor_scribble_hints_cv.release();
+        smart_mask_bgd_model.release();
+        smart_mask_fgd_model.release();
+        last_grabcut_mask_cv.release();
+        smart_mask_is_initialized = false;
     }
 }

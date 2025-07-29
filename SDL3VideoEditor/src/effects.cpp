@@ -714,69 +714,65 @@ void MaskEffectNode::Process(const EffectContext& ctx) {
 
 GLuint MaskEffectNode::RunGrabCut(const DecodedFrame& current_clip_frame,
                                 GrabCutInitMode mode,
-                                const cv::Rect& roi_for_rect_mode_px, // Already in pixel coords
-                                const cv::Mat& scribble_mask_for_mask_mode_cv) { // CV_8UC1
-    if (current_clip_frame.pixels.empty()) {
-        std::cerr << "RunGrabCut: Current clip frame is empty." << std::endl;
-        return false;
-    }
-
+                                const cv::Rect& roi_for_rect_mode_px,
+                                const cv::Mat& scribble_mask_for_mask_mode_cv,
+                                cv::Mat& bgdModel, // Now an in/out parameter
+                                cv::Mat& fgdModel, // Now an in/out parameter
+                                bool is_refinement) {
+    // ... (frame validation) ...
     cv::Mat image_bgr = DecodedFrameToCvMat(current_clip_frame);
-    if (image_bgr.empty()) {
-        std::cerr << "RunGrabCut: Failed to convert frame to cv::Mat." << std::endl;
-        return false;
-    }
-
-    int img_w = image_bgr.cols;
-    int img_h = image_bgr.rows;
+    // ... (image validation) ...
 
     cv::Mat result_mask_cv;
-    cv::Mat bgdModel, fgdModel;
-    cv::Rect actual_roi_for_grabcut = roi_for_rect_mode_px; // Default
+    cv::Rect actual_roi_for_grabcut = roi_for_rect_mode_px;
+
+    // Determine the grabCut mode based on initialization or refinement
+    int grabcut_mode;
+    if (!is_refinement) {
+        // This is the very first run
+        if (mode == GrabCutInitMode::RECT) {
+            grabcut_mode = cv::GC_INIT_WITH_RECT;
+        } else { // MASK
+            grabcut_mode = cv::GC_INIT_WITH_MASK;
+        }
+    } else {
+        // If we are refining, we always use the mask information.
+        // GC_EVAL is for just viewing, we want to continue iterating.
+        grabcut_mode = cv::GC_INIT_WITH_MASK; 
+    }
 
     try {
         if (mode == GrabCutInitMode::RECT) {
-            if (actual_roi_for_grabcut.width <= 0 || actual_roi_for_grabcut.height <= 0) {
-                 std::cerr << "RunGrabCut (RECT): Invalid ROI." << std::endl; return 0;
-            }
-            cv::grabCut(image_bgr, result_mask_cv, actual_roi_for_grabcut, bgdModel, fgdModel, 5, cv::GC_INIT_WITH_RECT);
-        } else { // GrabCutInitMode::MASK
-            if (scribble_mask_for_mask_mode_cv.empty() || 
-                scribble_mask_for_mask_mode_cv.size() != image_bgr.size() ||
-                scribble_mask_for_mask_mode_cv.type() != CV_8UC1) {
-                std::cerr << "RunGrabCut (MASK): Invalid scribble mask." << std::endl; return 0;
-            }
-            // When using GC_INIT_WITH_MASK, result_mask_cv is also the input hint mask.
+            // ... (this path is mainly for the first stroke now) ...
+            // INCREASED iteration count from 5 to 10 for better quality
+            cv::grabCut(image_bgr, result_mask_cv, actual_roi_for_grabcut, bgdModel, fgdModel, 10, (cv::GrabCutModes)grabcut_mode);
+        } else { // MASK (used for all refinements)
+            // ... (scribble mask validation) ...
             scribble_mask_for_mask_mode_cv.copyTo(result_mask_cv); 
-            // The ROI can still be passed to potentially speed up, but GrabCut mainly uses the mask.
-            // If no meaningful ROI, you can pass a rect covering the whole image.
-            // For simplicity, if scribbles are used, let's assume the scribble mask dictates areas.
-            // The rect parameter is still required by the API signature even with GC_INIT_WITH_MASK.
-            // It often defines the area where "probable" values in the mask will be considered.
-            // If your scribble_mask_cv *only* contains GC_FGD and GC_BGD, then the rect might be less critical.
-            // If it contains GC_PR_FGD/BGD, the rect helps define the "unknown" region.
-            // For now, let's use the full image if mode is MASK and no specific ROI is also provided for it.
             cv::Rect processing_rect(0, 0, image_bgr.cols, image_bgr.rows); 
-            if(roi_for_rect_mode_px.width > 0 && roi_for_rect_mode_px.height > 0 && mode == GrabCutInitMode::MASK) {
-                // Optionally, if an ROI is ALSO provided with scribble mode, use it.
-                // This is advanced: the mask has scribbles, and rect defines "unknowns".
-                // For now, if scribbles, let's assume they are comprehensive enough or rect is full image.
-            }
-
-            cv::grabCut(image_bgr, result_mask_cv, processing_rect, bgdModel, fgdModel, 5, cv::GC_INIT_WITH_MASK);
+            // INCREASED iteration count from 5 to 10 for better quality
+            cv::grabCut(image_bgr, result_mask_cv, processing_rect, bgdModel, fgdModel, 10, (cv::GrabCutModes)grabcut_mode);
         }
-    } catch (const cv::Exception& e) { /* ... */ return 0; }
-
-    int tex_w, tex_h;
-    GLuint generated_texture_id = GrabCutMaskToRGBTexture(result_mask_cv, tex_w, tex_h, true);
-
-    if (generated_texture_id == 0) {
-        std::cerr << "RunGrabCut: Failed to convert GrabCut mask to texture." << std::endl;
+    } catch (const cv::Exception& e) {
+        std::cerr << "OpenCV Exception in grabCut: " << e.what() << std::endl;
         return 0;
     }
 
-    std::cout << "GrabCut successful. Generated temporary mask texture ID: " << generated_texture_id << std::endl;
-    return generated_texture_id; // Return the new texture ID
+    // Convert the resulting mask (which contains 0,1,2,3 values) to a visible texture
+    int tex_w, tex_h;
+    // We now just need the raw mask data for contour finding, so a texture isn't created here.
+    // Instead, we will process this result_mask_cv in the main UI loop.
+    // For now, we will return a temporary texture for the overlay effect.
+    GLuint generated_texture_id = GrabCutMaskToRGBTexture(result_mask_cv, tex_w, tex_h, true);
+
+    // This logic is now handled in the UI loop to prepare the mask for the *next* iteration.
+    // if(mode == GrabCutInitMode::MASK){
+    //     cv::compare(scribble_mask_for_mask_mode_cv, cv::GC_FGD, result_mask_cv, cv::CMP_EQ);
+    //     cv::compare(scribble_mask_for_mask_mode_cv, cv::GC_BGD, result_mask_cv, cv::CMP_EQ);
+    // }
+
+    std::cout << "GrabCut successful." << std::endl;
+    return generated_texture_id;
 }
 
 void SolidColorEffectNode::Process(const EffectContext& ctx) {

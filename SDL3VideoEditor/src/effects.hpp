@@ -177,10 +177,13 @@ struct MaskEffectNode : public EffectNode {
 
 
     enum class GrabCutInitMode { RECT, MASK };
-    GLuint RunGrabCut(const DecodedFrame& frame, 
-                    GrabCutInitMode mode, 
+    GLuint RunGrabCut(const DecodedFrame& frame,
+                    GrabCutInitMode mode,
                     const cv::Rect& roi_for_rect_mode, // Pixel coords
-                    const cv::Mat& scribble_mask_for_mask_mode); // CV_8UC1 with GC_ values
+                    const cv::Mat& scribble_mask_for_mask_mode, // CV_8UC1 with GC_ values
+                    cv::Mat& bgdModel, // Pass by reference to be stored
+                    cv::Mat& fgdModel, // Pass by reference to be stored
+                    bool is_refinement); // Flag to tell the function to refine instead of init
 };
 
 struct SolidColorEffectNode : public EffectNode {
