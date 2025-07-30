@@ -129,6 +129,7 @@ struct MaskEffectNode : public EffectNode {
     // Smart mask parameters
     GLuint smart_interactive_mask_texture = 0;
     cv::Rect grabcut_roi_rect; // OpenCV Rect (x, y, width, height) in *image pixel* coordinates
+    cv::Mat last_grabcut_mask_cv; // To hold the raw mask for UI feedback
     
     std::map<float, GLuint> smart_mask_sequence;
     float smart_mask_start_time = 0.0f;
@@ -177,10 +178,13 @@ struct MaskEffectNode : public EffectNode {
 
 
     enum class GrabCutInitMode { RECT, MASK };
-    GLuint RunGrabCut(const DecodedFrame& frame, 
-                    GrabCutInitMode mode, 
+    GLuint RunGrabCut(const DecodedFrame& frame,
+                    GrabCutInitMode mode,
                     const cv::Rect& roi_for_rect_mode, // Pixel coords
-                    const cv::Mat& scribble_mask_for_mask_mode); // CV_8UC1 with GC_ values
+                    const cv::Mat& scribble_mask_for_mask_mode, // CV_8UC1 with GC_ values
+                    cv::Mat& bgdModel, // Pass by reference to be stored
+                    cv::Mat& fgdModel, // Pass by reference to be stored
+                    bool is_refinement); // Flag to tell the function to refine instead of init
 };
 
 struct SolidColorEffectNode : public EffectNode {
