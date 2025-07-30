@@ -2962,6 +2962,9 @@ void DrawSmartMaskEditorWindow() {
                     // Update our overlay and clear scribbles for the next stroke
                     if (smart_mask_editor_overlay_tex != 0) glDeleteTextures(1, &smart_mask_editor_overlay_tex);
                     smart_mask_editor_overlay_tex = generated_tex_id;
+
+                    last_grabcut_mask_cv = current_editing_smart_mask_node->last_grabcut_mask_cv.clone();
+
                     smart_mask_editor_scribble_hints_cv.setTo(cv::GC_PR_BGD); // Reset for next refinement
                 }
             }

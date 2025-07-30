@@ -747,16 +747,28 @@ GLuint MaskEffectNode::RunGrabCut(const DecodedFrame& current_clip_frame,
             // INCREASED iteration count from 5 to 10 for better quality
             cv::grabCut(image_bgr, result_mask_cv, actual_roi_for_grabcut, bgdModel, fgdModel, 10, (cv::GrabCutModes)grabcut_mode);
         } else { // MASK (used for all refinements)
-            // ... (scribble mask validation) ...
-            scribble_mask_for_mask_mode_cv.copyTo(result_mask_cv); 
-            cv::Rect processing_rect(0, 0, image_bgr.cols, image_bgr.rows); 
-            // INCREASED iteration count from 5 to 10 for better quality
-            cv::grabCut(image_bgr, result_mask_cv, processing_rect, bgdModel, fgdModel, 10, (cv::GrabCutModes)grabcut_mode);
+            // This is the CRITICAL FIX.
+            // We must provide a mask that contains hints from the PREVIOUS iteration,
+            // plus the new user-painted scribbles. Using only the scribbles
+            // will fail if the user only paints one type (e.g., only background).
+
+            // Start with the result from the last iteration.
+            this->last_grabcut_mask_cv.copyTo(result_mask_cv);
+
+            // Overlay the new user hints.
+            result_mask_cv.setTo(cv::GC_FGD, scribble_mask_for_mask_mode_cv == cv::GC_FGD);
+            result_mask_cv.setTo(cv::GC_BGD, scribble_mask_for_mask_mode_cv == cv::GC_BGD);
+
+            cv::Rect processing_rect(0, 0, image_bgr.cols, image_bgr.rows);
+            // Refinement only needs a few iterations to converge.
+            cv::grabCut(image_bgr, result_mask_cv, processing_rect, bgdModel, fgdModel, 1, cv::GC_INIT_WITH_MASK);
         }
     } catch (const cv::Exception& e) {
         std::cerr << "OpenCV Exception in grabCut: " << e.what() << std::endl;
         return 0;
     }
+
+    result_mask_cv.copyTo(this->last_grabcut_mask_cv);
 
     // Convert the resulting mask (which contains 0,1,2,3 values) to a visible texture
     int tex_w, tex_h;
