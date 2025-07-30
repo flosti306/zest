@@ -104,6 +104,8 @@ static cv::Mat smart_mask_bgd_model;
 static cv::Mat smart_mask_fgd_model;
 static bool smart_mask_is_initialized = false;
 static cv::Mat last_grabcut_mask_cv;
+static GLuint smart_mask_visual_tex = 0;
+static GLuint smart_mask_final_raw_tex = 0; // NEW: Holds the final B&W mask texture from RunGrabCut
 
 std::stack<std::string> undo_stack;
 std::stack<std::string> redo_stack;
@@ -2836,12 +2838,65 @@ void UpdateScribbleDisplayTexture() {
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 
+// NEW HELPER FUNCTION to create the semi-transparent overlay
+void UpdateSmartMaskVisualTexture() {
+    // Ensure we have a valid mask result from GrabCut
+    if (last_grabcut_mask_cv.empty()) {
+        if (smart_mask_visual_tex != 0) {
+            glDeleteTextures(1, &smart_mask_visual_tex);
+            smart_mask_visual_tex = 0;
+        }
+        return;
+    }
+
+    // Ensure the texture exists
+    if (smart_mask_visual_tex == 0) {
+        glGenTextures(1, &smart_mask_visual_tex);
+    }
+
+    // Create a 4-channel BGRA matrix for the visualization
+    cv::Mat visual_mask_bgra(last_grabcut_mask_cv.rows, last_grabcut_mask_cv.cols, CV_8UC4);
+
+    // Define the "ruby overlay" color (semi-transparent red)
+    // OpenCV channel order is BGRA
+    const cv::Vec4b ruby_overlay_color(0, 0, 255, 100); // Blue, Green, Red, Alpha
+    const cv::Vec4b transparent_color(0, 0, 0, 0);
+
+    for (int r = 0; r < visual_mask_bgra.rows; ++r) {
+        for (int c = 0; c < visual_mask_bgra.cols; ++c) {
+            uchar mask_val = last_grabcut_mask_cv.at<uchar>(r, c);
+            // If pixel is background or probable background, apply the red overlay
+            if (mask_val == cv::GC_BGD || mask_val == cv::GC_PR_BGD) {
+                visual_mask_bgra.at<cv::Vec4b>(r, c) = ruby_overlay_color;
+            } else { // Otherwise (foreground), make it fully transparent
+                visual_mask_bgra.at<cv::Vec4b>(r, c) = transparent_color;
+            }
+        }
+    }
+
+    // Upload the BGRA data to the OpenGL texture
+    glBindTexture(GL_TEXTURE_2D, smart_mask_visual_tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, visual_mask_bgra.cols, visual_mask_bgra.rows, 0, GL_BGRA, GL_UNSIGNED_BYTE, visual_mask_bgra.data);
+    
+    // Set texture parameters for proper display
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    glBindTexture(GL_TEXTURE_2D, 0);
+}
+
 void DrawSmartMaskEditorWindow() {
     if (!smart_mask_editor_open || !current_editing_smart_mask_node) {
         smart_mask_editor_open = false; // Ensure it closes if node is bad
-        if (smart_mask_editor_overlay_tex != 0) { // Cleanup
-             glDeleteTextures(1, &smart_mask_editor_overlay_tex);
-             smart_mask_editor_overlay_tex = 0;
+        if (smart_mask_visual_tex != 0) {
+             glDeleteTextures(1, &smart_mask_visual_tex);
+             smart_mask_visual_tex = 0;
+        }
+        if (smart_mask_final_raw_tex != 0) {
+            glDeleteTextures(1, &smart_mask_final_raw_tex);
+            smart_mask_final_raw_tex = 0;
         }
         return;
     }
@@ -2854,14 +2909,12 @@ void DrawSmartMaskEditorWindow() {
         ImGui::Text("Hold CTRL and drag to resize the brush.");
         ImGui::Separator();
 
-        // --- Display Area for Clip Frame and ROI drawing ---
+        // --- Display Area ---
         ImVec2 canvas_avail_size = ImGui::GetContentRegionAvail();
-        canvas_avail_size.y -= (ImGui::GetTextLineHeightWithSpacing() * 3); // Space for buttons
-
+        canvas_avail_size.y -= (ImGui::GetTextLineHeightWithSpacing() * 3);
         float frame_aspect = (smart_mask_current_decoded_frame.width > 0 && smart_mask_current_decoded_frame.height > 0)
                              ? (float)smart_mask_current_decoded_frame.width / smart_mask_current_decoded_frame.height
                              : 16.0f / 9.0f;
-
         ImVec2 display_size = canvas_avail_size;
         if (canvas_avail_size.x / frame_aspect <= canvas_avail_size.y) {
             display_size.y = canvas_avail_size.x / frame_aspect;
@@ -2870,48 +2923,20 @@ void DrawSmartMaskEditorWindow() {
         }
         display_size.x = std::max(50.0f, display_size.x);
         display_size.y = std::max(50.0f, display_size.y);
-        
-        ImVec2 canvas_p0 = ImGui::GetCursorScreenPos(); // Top-left of the drawing area
+        ImVec2 canvas_p0 = ImGui::GetCursorScreenPos();
         ImVec2 canvas_p1 = ImVec2(canvas_p0.x + display_size.x, canvas_p0.y + display_size.y);
         ImDrawList* draw_list = ImGui::GetWindowDrawList();
 
-        // Display background clip frame
+        // Draw background and overlay
         if (smart_mask_editor_bg_clip_tex != 0) {
-            // UVs (0,0) to (1,1) for ImGui::Image usually assumes texture is top-left origin.
-            // If your video textures are standard GL (bottom-left), flip Y.
             draw_list->AddImage((ImTextureID)(intptr_t)smart_mask_editor_bg_clip_tex, canvas_p0, canvas_p1, ImVec2(0,0), ImVec2(1,1));
         } else {
             draw_list->AddRectFilled(canvas_p0, canvas_p1, IM_COL32(30,30,30,255));
             ImGui::SetCursorScreenPos(ImVec2(canvas_p0.x + 5, canvas_p0.y + 5));
             ImGui::Text("Background frame unavailable");
         }
-        
-        // 2. OPTIMIZATION: Draw contour overlay instead of semi-transparent mask
-        if (!last_grabcut_mask_cv.empty()) {
-            std::vector<std::vector<cv::Point>> contours;
-            cv::Mat contour_input = last_grabcut_mask_cv.clone();
-            // Find contours on the binary mask (where pixel == 1 or 3)
-            cv::threshold(contour_input, contour_input, 2, 255, cv::THRESH_BINARY);
-            contour_input.convertTo(contour_input, CV_8U);
-            cv::findContours(contour_input, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
-
-            for (const auto& contour : contours) {
-                for (size_t i = 0; i < contour.size(); ++i) {
-                    cv::Point p1 = contour[i];
-                    cv::Point p2 = contour[(i + 1) % contour.size()];
-
-                    // Convert CV points to ImGui screen coordinates
-                    ImVec2 im_p1 = ImVec2(
-                        canvas_p0.x + ((float)p1.x / smart_mask_current_decoded_frame.width) * display_size.x,
-                        canvas_p0.y + ((float)p1.y / smart_mask_current_decoded_frame.height) * display_size.y
-                    );
-                    ImVec2 im_p2 = ImVec2(
-                        canvas_p0.x + ((float)p2.x / smart_mask_current_decoded_frame.width) * display_size.x,
-                        canvas_p0.y + ((float)p2.y / smart_mask_current_decoded_frame.height) * display_size.y
-                    );
-                    draw_list->AddLine(im_p1, im_p2, IM_COL32(137, 255, 0, 255), 2.0f);
-                }
-            }
+        if (smart_mask_visual_tex != 0) {
+            draw_list->AddImage((ImTextureID)(intptr_t)smart_mask_visual_tex, canvas_p0, canvas_p1, ImVec2(0,0), ImVec2(1,1));
         }
 
         ImGui::SetCursorScreenPos(canvas_p0);
@@ -2924,12 +2949,12 @@ void DrawSmartMaskEditorWindow() {
             bool is_ctrl_down = ImGui::IsKeyDown(ImGuiKey_LeftCtrl) || ImGui::IsKeyDown(ImGuiKey_RightCtrl);
             ImVec2 mouse_pos = ImGui::GetMousePos();
 
-            // A. Brush resizing
+            // Brush resizing
             if (is_ctrl_down && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
                 smart_mask_brush_size_px += ImGui::GetIO().MouseDelta.x;
                 smart_mask_brush_size_px = std::max(1.0f, std::min(500.0f, smart_mask_brush_size_px));
             }
-            // B. Painting
+            // Painting
             else if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
                 ImVec2 mouse_pos_on_canvas = ImVec2(mouse_pos.x - canvas_p0.x, mouse_pos.y - canvas_p0.y);
                 int img_px = static_cast<int>((mouse_pos_on_canvas.x / display_size.x) * smart_mask_current_decoded_frame.width);
@@ -2938,38 +2963,41 @@ void DrawSmartMaskEditorWindow() {
                 if (img_px >= 0 && img_px < smart_mask_current_decoded_frame.width && img_py >= 0 && img_py < smart_mask_current_decoded_frame.height) {
                     if (smart_mask_editor_scribble_hints_cv.empty()) {
                         smart_mask_editor_scribble_hints_cv.create(smart_mask_current_decoded_frame.height, smart_mask_current_decoded_frame.width, CV_8UC1);
-                        smart_mask_editor_scribble_hints_cv.setTo(cv::GC_BGD); // Probable background
+                        smart_mask_editor_scribble_hints_cv.setTo(cv::GC_BGD);
                     }
-                    uchar paint_value = is_alt_down ? cv::GC_BGD : cv::GC_FGD; // Background or Foreground
+                    uchar paint_value = is_alt_down ? cv::GC_BGD : cv::GC_FGD;
                     cv::circle(smart_mask_editor_scribble_hints_cv, cv::Point(img_px, img_py), static_cast<int>(smart_mask_brush_size_px / 2.0f), cv::Scalar(paint_value), -1);
                 }
             }
 
-            // C. Run Analysis on Mouse Release
+            // Run Analysis on Mouse Release
             if (ImGui::IsMouseReleased(ImGuiMouseButton_Left) && !is_ctrl_down) {
                 if (!smart_mask_editor_scribble_hints_cv.empty()) {
+                    // This is where the texture is generated by the effect node's method
                     GLuint generated_tex_id = 0;
+
                     if (!smart_mask_is_initialized) {
-                        // First stroke: initialize with a rect around the scribbles
                         cv::Rect roi = cv::boundingRect(smart_mask_editor_scribble_hints_cv);
                         generated_tex_id = current_editing_smart_mask_node->RunGrabCut(smart_mask_current_decoded_frame, MaskEffectNode::GrabCutInitMode::RECT, roi, cv::Mat(), smart_mask_bgd_model, smart_mask_fgd_model, false);
                         smart_mask_is_initialized = true;
                     } else {
-                        // Subsequent strokes: refine using the scribbles
                         generated_tex_id = current_editing_smart_mask_node->RunGrabCut(smart_mask_current_decoded_frame, MaskEffectNode::GrabCutInitMode::MASK, cv::Rect(), smart_mask_editor_scribble_hints_cv, smart_mask_bgd_model, smart_mask_fgd_model, true);
                     }
                     
-                    // Update our overlay and clear scribbles for the next stroke
-                    if (smart_mask_editor_overlay_tex != 0) glDeleteTextures(1, &smart_mask_editor_overlay_tex);
-                    smart_mask_editor_overlay_tex = generated_tex_id;
+                    // Delete the old raw texture if it exists
+                    if (smart_mask_final_raw_tex != 0) {
+                        glDeleteTextures(1, &smart_mask_final_raw_tex);
+                    }
+                    // Store the newly generated raw mask texture
+                    smart_mask_final_raw_tex = generated_tex_id;
 
                     last_grabcut_mask_cv = current_editing_smart_mask_node->last_grabcut_mask_cv.clone();
-
-                    smart_mask_editor_scribble_hints_cv.setTo(cv::GC_PR_BGD); // Reset for next refinement
+                    UpdateSmartMaskVisualTexture();
+                    smart_mask_editor_scribble_hints_cv.setTo(cv::GC_PR_BGD);
                 }
             }
 
-            // D. Draw Live Brush Cursor
+            // Draw Live Brush Cursor
             draw_list->AddCircle(mouse_pos, smart_mask_brush_size_px / 2.0f, IM_COL32(255, 255, 255, 200), 0, 1.5f);
             if (is_alt_down) {
                 draw_list->AddLine(ImVec2(mouse_pos.x - 5, mouse_pos.y), ImVec2(mouse_pos.x + 5, mouse_pos.y), IM_COL32(255, 255, 255, 255), 2.0f);
@@ -2979,46 +3007,38 @@ void DrawSmartMaskEditorWindow() {
             }
         }
 
-        // --- Buttons are now simpler ---
+        // --- Buttons ---
         ImGui::SetCursorPosY(canvas_p1.y + 10);
         if (ImGui::Button("Apply Smart Mask")) {
-            if (smart_mask_editor_overlay_tex != 0 && current_editing_smart_mask_node) {
-                // 1. Delete any existing smart_interactive_mask_texture on the node
+            // REVERTED LOGIC: Use the stored raw texture.
+            if (smart_mask_final_raw_tex != 0 && current_editing_smart_mask_node) {
                 if (current_editing_smart_mask_node->smart_interactive_mask_texture != 0) {
                     glDeleteTextures(1, &current_editing_smart_mask_node->smart_interactive_mask_texture);
                 }
+                
+                // Transfer ownership of the texture from the editor to the node.
+                current_editing_smart_mask_node->smart_interactive_mask_texture = smart_mask_final_raw_tex;
+                smart_mask_final_raw_tex = 0; // Editor no longer owns it.
 
-                // 2. Transfer ownership of the texture from the editor's overlay to the node
-                current_editing_smart_mask_node->smart_interactive_mask_texture = smart_mask_editor_overlay_tex;
-                smart_mask_editor_overlay_tex = 0; // Editor no longer owns it
-
-                // 3. Set the mask type on the node
                 current_editing_smart_mask_node->mask_type = MaskEffectNode::MaskType::Smart_Interactive;
-                
-                // 4. Store the ROI used, if you want to recall it later (optional)
-                // current_editing_smart_mask_node->grabcut_roi_rect = ... (convert normalized back to node's frame pixels if needed)
 
-                // layers_changed = true; // Signal main preview to update
-                
                 tinyfd_messageBox("Success", "Smart mask applied to effect.", "ok", "info", 1);
-                smart_mask_editor_open = false; // Close editor on apply
+                smart_mask_editor_open = false;
             } else {
-                tinyfd_messageBox("Warning", "No smart mask generated/visible in overlay to apply. Analyze frame first.", "ok", "warning", 1);
+                tinyfd_messageBox("Warning", "No smart mask has been generated. Please analyze the frame first.", "ok", "warning", 1);
             }
         }
         ImGui::SameLine();
-        if (ImGui::Button("Clear Hints")) {
-            smart_mask_roi_start_pos = ImVec2(-1,-1);
-            smart_mask_drawing_roi = false;
-            smart_mask_editor_scribble_hints_cv.release();
-            if (smart_mask_editor_scribble_display_tex != 0) {
-                glDeleteTextures(1, &smart_mask_editor_scribble_display_tex);
-                smart_mask_editor_scribble_display_tex = 0;
+        if (ImGui::Button("Clear Mask")) {
+            last_grabcut_mask_cv.release();
+            UpdateSmartMaskVisualTexture();
+            
+            // Also delete the stored raw texture
+            if (smart_mask_final_raw_tex != 0) {
+                glDeleteTextures(1, &smart_mask_final_raw_tex);
+                smart_mask_final_raw_tex = 0;
             }
-            if (smart_mask_editor_overlay_tex != 0) { // Also clear analysis overlay
-                glDeleteTextures(1, &smart_mask_editor_overlay_tex);
-                smart_mask_editor_overlay_tex = 0;
-            }
+
             smart_mask_bgd_model.release();
             smart_mask_fgd_model.release();
             smart_mask_is_initialized = false;
@@ -3027,14 +3047,15 @@ void DrawSmartMaskEditorWindow() {
     }
     ImGui::End();
 
-    if (!smart_mask_editor_open) { // Cleanup if window was closed
-        if (smart_mask_editor_overlay_tex != 0) { // If editor closed with an unapplied overlay
-             glDeleteTextures(1, &smart_mask_editor_overlay_tex);
-             smart_mask_editor_overlay_tex = 0;
+    if (!smart_mask_editor_open) {
+        if (smart_mask_visual_tex != 0) {
+             glDeleteTextures(1, &smart_mask_visual_tex);
+             smart_mask_visual_tex = 0;
         }
-        if (smart_mask_editor_scribble_display_tex != 0) {
-            glDeleteTextures(1, &smart_mask_editor_scribble_display_tex);
-            smart_mask_editor_scribble_display_tex = 0;
+        // Clean up the raw texture too if the window is closed without applying
+        if (smart_mask_final_raw_tex != 0) {
+             glDeleteTextures(1, &smart_mask_final_raw_tex);
+             smart_mask_final_raw_tex = 0;
         }
         smart_mask_editor_scribble_hints_cv.release();
         smart_mask_bgd_model.release();
