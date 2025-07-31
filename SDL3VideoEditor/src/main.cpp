@@ -68,6 +68,8 @@ int render_width = 1920;
 int render_height = 1080;
 int export_fps = 30;
 
+const float DEFAULT_IMAGE_DURATION = 5.0f;
+
 Clip* selected_clip = nullptr; // Keep track of selected clip
 
 bool show_thumbs = false;
@@ -494,6 +496,46 @@ void AddNewClip(std::vector<Clip>& clips, const std::string& input_path, float v
             }
         }
     }
+}
+
+void AddNewImageClip(std::vector<Clip>& clips, const std::string& input_path, int layer, GLResources& res) {
+    // First, ensure the image is loaded as a texture.
+    // The existing load_resources_for_clip already handles this correctly.
+    load_resources_for_clip(res, Clip{ .path = input_path });
+
+    // Verify that the texture was actually loaded before adding the clip.
+    if (res.texture_cache.find(input_path) == res.texture_cache.end()) {
+        std::cerr << "Failed to load image texture for: " << input_path << ". Cannot add clip." << std::endl;
+        return;
+    }
+
+    clips.emplace_back();
+    Clip& image_clip = clips.back();
+
+    image_clip.name = std::filesystem::path(input_path).filename().string();
+    image_clip.path = input_path;
+    
+    // NOTE: We still use ClipType::Video for rendering purposes, as it has transform properties.
+    // The application distinguishes it as an image by its file extension via is_video_file().
+    image_clip.type = ClipType::Video;
+    image_clip.start_time = playhead_time; // Use the global playhead position
+    image_clip.duration = DEFAULT_IMAGE_DURATION;
+    image_clip.layer = layer;
+
+    // Set properties to indicate it's a static image with no audio
+    image_clip.media_start = 0.0f;
+    image_clip.is_audio_only = false;
+    image_clip.has_audio = false;
+    image_clip.linked_clip = nullptr;
+
+    // Set default transform properties
+    image_clip.opacity = 1.0f;
+    image_clip.scale = 1.0f;
+    image_clip.pos_x = 0.0f;
+    image_clip.pos_y = 0.0f;
+    image_clip.selected = false;
+
+    std::cout << "Added Image clip: " << image_clip.name << " with duration " << DEFAULT_IMAGE_DURATION << "s" << std::endl;
 }
 
 // --- Video Duration Helper ---
@@ -1391,21 +1433,31 @@ int main(int argc, char* argv[]) {
             std::string dropped_path_str = input_path;
             std::cout << "File dropped: " << dropped_path_str << std::endl;
             if (std::filesystem::exists(dropped_path_str)) {
-                float duration = get_video_duration(dropped_path_str);
-                if (duration >= 0) {
-                    PushUndo(clips, playhead_time, zoom_factor);
-                    AddNewClip(clips, dropped_path_str, duration, 0, gl_resources);
-                    layers_changed = true;
-                    process_message = "Added clip: " + std::filesystem::path(dropped_path_str).filename().string();
+                PushUndo(clips, playhead_time, zoom_factor); // Save state before adding new clip
+
+                // --- DIFFERENTIATE FILE TYPE ---
+                if (is_video_file(dropped_path_str)) {
+                    // --- VIDEO FILE LOGIC (Your existing code) ---
+                    float duration = get_video_duration(dropped_path_str);
+                    if (duration >= 0) {
+                        AddNewClip(clips, dropped_path_str, duration, 0, gl_resources);
+                        layers_changed = true;
+                        process_message = "Added video: " + std::filesystem::path(dropped_path_str).filename().string();
+                    } else {
+                        process_message = "Failed to get duration for: " + std::filesystem::path(dropped_path_str).filename().string();
+                        std::cerr << process_message << std::endl;
+                    }
                 } else {
-                    process_message = "Failed to get duration for: " + std::filesystem::path(dropped_path_str).filename().string();
-                    std::cerr << process_message << std::endl;
+                    // --- NEW IMAGE FILE LOGIC ---
+                    AddNewImageClip(clips, dropped_path_str, 0, gl_resources);
+                    layers_changed = true;
+                    process_message = "Added image: " + std::filesystem::path(dropped_path_str).filename().string();
                 }
             } else {
                 process_message = "Dropped file path does not exist: " + dropped_path_str;
                 std::cerr << process_message << std::endl;
             }
-            input_path[0] = '\0';
+            input_path[0] = '\0'; // Clear the input path buffer
         }
 
         if (playing) {
