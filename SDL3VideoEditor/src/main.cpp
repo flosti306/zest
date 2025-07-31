@@ -1353,6 +1353,11 @@ int main(int argc, char* argv[]) {
                 right_video_part.selected = false;
                 right_video_part.linked_clip = nullptr; // Links will be set later
 
+                // If the original clip had effects, perform a deep copy for the new clip.
+                if (right_video_part.effect_graph) {
+                    right_video_part.effect_graph = std::make_shared<EffectGraph>(*right_video_part.effect_graph);
+                }
+
                 // 5. Modify the original clips (the "left-hand" parts) using their safe indices.
                 clips[video_idx].duration = left_duration;
                 // Important: Unlink originals for now. We will relink them after vector modification.
@@ -1856,9 +1861,9 @@ void RenderPreviewWindow(GLResources& res, int preview_width, int preview_height
         ImGui::Image((ImTextureID)(intptr_t)preview_tex, display_size, ImVec2(0, 0), ImVec2(1, 1));
 
         if (eyedropper_active) {
-            if (eyedropper_cursor != nullptr) {
+            /* if (eyedropper_cursor != nullptr) {
                 SDL_SetCursor(eyedropper_cursor); // Use SDL's custom cursor
-            } else {
+            } else */ {
                 ImGui::SetMouseCursor(ImGuiMouseCursor_Hand); // Fallback to ImGui arrow
             }
             if (ImGui::IsItemHovered()) {

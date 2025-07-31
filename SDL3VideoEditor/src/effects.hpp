@@ -40,16 +40,36 @@ struct EffectNode {
 
     virtual ~EffectNode() = default;
     virtual void Process(const EffectContext& ctx) = 0;
+
+    virtual std::shared_ptr<EffectNode> clone() const = 0;
 };
 
 struct GaussianBlurNode : public EffectNode {
     float blur_amount = 5.0f;
 
     void Process(const EffectContext& ctx) override;
+
+    std::shared_ptr<EffectNode> clone() const override {
+        auto new_node = std::make_shared<GaussianBlurNode>();
+        *new_node = *this; // Member-wise copy is fine here
+        return new_node;
+    }
 };
 
 struct EffectGraph {
     std::vector<std::shared_ptr<EffectNode>> nodes;
+
+    // Default constructor
+    EffectGraph() = default;
+
+    // --- NEW: Deep copy constructor ---
+    EffectGraph(const EffectGraph& other) {
+        for (const auto& node : other.nodes) {
+            if (node) {
+                nodes.push_back(node->clone());
+            }
+        }
+    }
 
     void Process(GLuint input_tex, GLuint output_fbo, float time, glm::vec2 resolution);
 
@@ -69,6 +89,12 @@ struct ColorGradingNode : public EffectNode {
     }
     
     void Process(const EffectContext& ctx) override;
+
+    std::shared_ptr<EffectNode> clone() const override {
+        auto new_node = std::make_shared<ColorGradingNode>();
+        *new_node = *this;
+        return new_node;
+    }
 
     void applyWarmVintagePreset();
     void applyColdCinematicPreset();
@@ -96,6 +122,14 @@ struct LUTColorGradingNode : public EffectNode {
     bool loadLUT(const std::string& path);
     
     void Process(const EffectContext& ctx) override;
+
+    std::shared_ptr<EffectNode> clone() const override {
+        auto new_node = std::make_shared<LUTColorGradingNode>();
+        *new_node = *this;
+        // Note: The GLuint texture ID is copied, which is correct.
+        // Both nodes will share the texture, but can be changed independently.
+        return new_node;
+    }
 };
 
 struct MaskEffectNode : public EffectNode {
@@ -185,6 +219,12 @@ struct MaskEffectNode : public EffectNode {
                     cv::Mat& bgdModel, // Pass by reference to be stored
                     cv::Mat& fgdModel, // Pass by reference to be stored
                     bool is_refinement); // Flag to tell the function to refine instead of init
+
+    std::shared_ptr<EffectNode> clone() const override {
+        auto new_node = std::make_shared<MaskEffectNode>();
+        *new_node = *this;
+        return new_node;
+    }
 };
 
 struct SolidColorEffectNode : public EffectNode {
@@ -204,6 +244,12 @@ struct SolidColorEffectNode : public EffectNode {
     }
 
     void Process(const EffectContext& ctx) override;
+
+    std::shared_ptr<EffectNode> clone() const override {
+        auto new_node = std::make_shared<SolidColorEffectNode>();
+        *new_node = *this;
+        return new_node;
+    }
 };
 
 struct GradientEffectNode : public EffectNode {
@@ -242,6 +288,12 @@ struct GradientEffectNode : public EffectNode {
     }
 
     void Process(const EffectContext& ctx) override;
+
+    std::shared_ptr<EffectNode> clone() const override {
+        auto new_node = std::make_shared<GradientEffectNode>();
+        *new_node = *this;
+        return new_node;
+    }
 };
 
 struct DropShadowEffectNode : public EffectNode {
@@ -280,6 +332,16 @@ struct DropShadowEffectNode : public EffectNode {
     void EnsureTempResources(int width, int height);
 
     void Process(const EffectContext& ctx) override;
+
+    std::shared_ptr<EffectNode> clone() const override {
+        auto new_node = std::make_shared<DropShadowEffectNode>();
+        *new_node = *this;
+        // IMPORTANT: Do not share transient resources. The cloned node must create its own.
+        new_node->temp_fbo1 = 0;
+        new_node->temp_tex1_alpha_mask = 0;
+        new_node->temp_tex2_blurred_alpha = 0;
+        return new_node;
+    }
 };
 
 struct ChromaKeyNode : public EffectNode {
@@ -293,4 +355,10 @@ struct ChromaKeyNode : public EffectNode {
     }
 
     void Process(const EffectContext& ctx) override;
+
+    std::shared_ptr<EffectNode> clone() const override {
+        auto new_node = std::make_shared<ChromaKeyNode>();
+        *new_node = *this;
+        return new_node;
+    }
 };
