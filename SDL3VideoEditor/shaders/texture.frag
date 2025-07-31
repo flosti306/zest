@@ -1,13 +1,14 @@
 #version 330 core
 out vec4 FragColor;
 
-in vec2 TexCoords;
+// Input interpolated texture coordinate from the vertex shader
+in vec2 v_TexCoord;
 
+// The texture we want to sample from
 uniform sampler2D u_Texture;
-uniform float u_Opacity;
 
 void main()
 {
-    vec4 texColor = texture(u_Texture, TexCoords);
-    FragColor = vec4(texColor.rgb, texColor.a * u_Opacity);
+    // Sample the texture at the given coordinate and output its color
+    FragColor = texture(u_Texture, v_TexCoord);
 }

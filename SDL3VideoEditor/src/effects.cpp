@@ -77,9 +77,18 @@ GLuint create_temp_fbo(glm::vec2 resolution, GLuint& texture_out) {
     glGenTextures(1, &tex);
 
     glBindTexture(GL_TEXTURE_2D, tex);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, (int)resolution.x, (int)resolution.y, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
+    
+    // --- THIS IS THE FIX ---
+    // Use GL_RGBA to create a texture with an alpha channel.
+    // Using GL_RGBA8 is a good practice to specify the internal format explicitly.
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (int)resolution.x, (int)resolution.y, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    // --- END FIX ---
+
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    // Add clamp to edge to prevent artifacts from transforms
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
     glBindFramebuffer(GL_FRAMEBUFFER, fbo);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
@@ -211,6 +220,8 @@ void GaussianBlurNode::Process(const EffectContext& ctx) {
     
     glBindFramebuffer(GL_FRAMEBUFFER, horizontal_fbo);
     glViewport(0, 0, (int)ctx.resolution.x, (int)ctx.resolution.y);
+    // --- ADD CLEAR HERE FOR FIRST PASS ---
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
     glClear(GL_COLOR_BUFFER_BIT);
     
     glUseProgram(blur_shader_program);
@@ -231,6 +242,7 @@ void GaussianBlurNode::Process(const EffectContext& ctx) {
     
     // Second pass: vertical blur
     glBindFramebuffer(GL_FRAMEBUFFER, ctx.output_fbo);
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
     glViewport(0, 0, (int)ctx.resolution.x, (int)ctx.resolution.y);
     glClear(GL_COLOR_BUFFER_BIT);
     
@@ -350,68 +362,89 @@ void ColorGradingNode::applyFadedFilmPreset() {
 
 
 void EffectGraph::Process(GLuint input_tex, GLuint output_fbo, float time, glm::vec2 resolution) {
-    // If no effects or all are disabled, just copy the input to output
-    if (nodes.empty() || std::none_of(nodes.begin(), nodes.end(), [](auto& n){ return n->enabled; })) {
-        // Create a simple passthrough shader program
-        GLuint copy_shader = LoadShaderProgram("shaders/passthrough.vert", "shaders/texture.frag");
+    // Count how many nodes are actually enabled
+    int enabled_nodes_count = 0;
+    for (const auto& node : nodes) {
+        if (node && node->enabled) { // Added null check for safety
+            enabled_nodes_count++;
+        }
+    }
+
+    // If no effects are enabled, just do a simple passthrough of the input texture to the output
+    if (enabled_nodes_count == 0) {
+        static GLuint copy_shader = 0;
+        if (copy_shader == 0) copy_shader = LoadShaderProgram("shaders/passthrough.vert", "shaders/texture.frag");
         if (copy_shader == 0) return;
-        
+
         glBindFramebuffer(GL_FRAMEBUFFER, output_fbo);
         glViewport(0, 0, (int)resolution.x, (int)resolution.y);
-        
+        glClear(GL_COLOR_BUFFER_BIT); // Clear destination before passthrough
+
         glUseProgram(copy_shader);
-        
-        // Set uniforms for the passthrough shader
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, input_tex);
         glUniform1i(glGetUniformLocation(copy_shader, "u_Texture"), 0);
-        
-        // Draw fullscreen quad
+
         RenderFullscreenQuad();
-        
+
         glUseProgram(0);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         return;
     }
 
-    // We have effects to process in sequence
-    GLuint current_input = input_tex;
-    GLuint temp_tex = 0;
-    GLuint temp_fbo = 0;
-    
-    // We'll need ping-pong FBOs for multi-effect chains
-    if (nodes.size() > 1) {
-        temp_fbo = create_temp_fbo(resolution, temp_tex);
+    // We have effects to process. Setup ping-pong buffers if we have more than one.
+    GLuint temp_fbo_A = 0, temp_tex_A = 0;
+    GLuint temp_fbo_B = 0, temp_tex_B = 0;
+
+    if (enabled_nodes_count > 1) {
+        temp_fbo_A = create_temp_fbo(resolution, temp_tex_A);
+        temp_fbo_B = create_temp_fbo(resolution, temp_tex_B);
     }
-    
-    for (size_t i = 0; i < nodes.size(); ++i) {
-        if (!nodes[i]->enabled) continue;
-        
-        // Determine target framebuffer
-        // For the last effect or single effect, render to the output FBO
-        // For intermediate effects, render to the temporary FBO
-        GLuint target_fbo = (i == nodes.size() - 1 || nodes.size() == 1) ? output_fbo : temp_fbo;
-        
-        // Set up context for the effect
+
+    GLuint current_input_texture = input_tex;
+    int processed_count = 0;
+
+    for (const auto& node : nodes) {
+        if (!node || !node->enabled) continue;
+
+        processed_count++;
+
+        // Determine the target FBO for this effect pass
+        GLuint target_fbo;
+        if (processed_count == enabled_nodes_count) {
+            // This is the last active effect, so it renders to the final output_fbo
+            target_fbo = output_fbo;
+        } else {
+            // This is an intermediate effect, render to a temporary ping-pong FBO.
+            // Odd-numbered effects (1st, 3rd, ..) write to A. Even-numbered (2nd, 4th, ..) write to B.
+            target_fbo = (processed_count % 2 == 1) ? temp_fbo_A : temp_fbo_B;
+        }
+
+        // Setup context for the current effect
         EffectContext ctx{
-            .input_texture = current_input,
+            .input_texture = current_input_texture,
             .output_fbo = target_fbo,
             .time = time,
             .resolution = resolution
         };
-        
+
         // Process the effect
-        nodes[i]->Process(ctx);
-        
-        // Update current_input for the next effect
-        if (i < nodes.size() - 1) {
-            current_input = temp_tex;
+        node->Process(ctx);
+
+        // Update the input texture for the *next* effect in the chain
+        if (target_fbo == temp_fbo_A) {
+            current_input_texture = temp_tex_A;
+        } else if (target_fbo == temp_fbo_B) {
+            current_input_texture = temp_tex_B;
         }
     }
-    
-    // Clean up temporary resources
-    if (temp_fbo != 0) {
-        destroy_temp_fbo(temp_fbo, temp_tex);
+
+    // Clean up temporary ping-pong resources
+    if (temp_fbo_A != 0) {
+        destroy_temp_fbo(temp_fbo_A, temp_tex_A);
+    }
+    if (temp_fbo_B != 0) {
+        destroy_temp_fbo(temp_fbo_B, temp_tex_B);
     }
 }
 
@@ -1081,30 +1114,44 @@ void DropShadowEffectNode::Process(const EffectContext& ctx) {
     glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, 0);
 }
 
-// Helper to get FBO containing a texture (simplified, assumes texture is ATTACHMENT0)
-// This is a HACK. A robust solution would involve tracking FBO-texture relationships
-// or passing FBOs directly. For now, if input_texture is from another FBO,
-// we'd need that FBO's ID. If it's just a texture, we can't directly get its source FBO.
-// This highlights a potential design issue if effects need to read from arbitrary source FBOs.
-// For blitting, if ctx.input_texture is the color attachment of some FBO (say, `src_fbo`), then:
-// GLuint get_fbo_containing_texture(GLuint texture_id) { /* ... complex ... */ return 0; }
-// For the fallback, let's assume input_texture is directly usable for drawing.
-// If blitting is needed, the source FBO of ctx.input_texture would be required.
-// Since RenderFullscreenQuad directly samples input_texture, the fallback might be:
-// just call RenderFullscreenQuad(ctx.input_texture) into ctx.output_fbo with a passthrough shader.
-// For simplicity in the error path of Process:
-// (Inside DropShadowEffectNode::Process, error handling)
-// ...
-// Fallback: copy input to output using a passthrough shader
-// static GLuint passthrough_prog = 0;
-// if(passthrough_prog == 0) passthrough_prog = LoadShaderProgram("shaders/passthrough.vert", "shaders/texture.frag");
-// if(passthrough_prog != 0) {
-//     glBindFramebuffer(GL_FRAMEBUFFER, ctx.output_fbo);
-//     glUseProgram(passthrough_prog);
-//     glActiveTexture(GL_TEXTURE0);
-//     glBindTexture(GL_TEXTURE_2D, ctx.input_texture);
-//     glUniform1i(glGetUniformLocation(passthrough_prog, "u_Texture"),0);
-//     RenderFullscreenQuad();
-//     glBindFramebuffer(GL_FRAMEBUFFER,0);
-// }
-// return;
+void ChromaKeyNode::Process(const EffectContext& ctx) {
+    if (!enabled || ctx.input_texture == 0) {
+        return;
+    }
+
+    // Load shader program (consider caching this for performance)
+    GLuint chroma_key_program = LoadShaderProgram("shaders/passthrough.vert", "shaders/chroma_key.frag");
+    if (chroma_key_program == 0) {
+        return;
+    }
+
+    // Setup render state
+    glBindFramebuffer(GL_FRAMEBUFFER, ctx.output_fbo);
+    glViewport(0, 0, (int)ctx.resolution.x, (int)ctx.resolution.y);
+
+    // --- THIS IS THE CRITICAL FIX ---
+    // Clear the destination framebuffer to transparent black before drawing.
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    // --- END FIX ---
+
+    glUseProgram(chroma_key_program);
+
+    // Set uniforms for the chroma key effect
+    glUniform3f(glGetUniformLocation(chroma_key_program, "u_KeyColor"), key_color.r, key_color.g, key_color.b);
+    glUniform1f(glGetUniformLocation(chroma_key_program, "u_Similarity"), similarity);
+    glUniform1f(glGetUniformLocation(chroma_key_program, "u_Blend"), blend);
+    glUniform1f(glGetUniformLocation(chroma_key_program, "u_Spill"), spill);
+
+    // Bind the input texture to texture unit 0
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, ctx.input_texture);
+    glUniform1i(glGetUniformLocation(chroma_key_program, "u_Texture"), 0);
+
+    // Draw a fullscreen quad to apply the effect
+    RenderFullscreenQuad();
+
+    // Cleanup
+    glUseProgram(0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}

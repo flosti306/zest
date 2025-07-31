@@ -281,3 +281,16 @@ struct DropShadowEffectNode : public EffectNode {
 
     void Process(const EffectContext& ctx) override;
 };
+
+struct ChromaKeyNode : public EffectNode {
+    glm::vec3 key_color = glm::vec3(0.0f, 1.0f, 0.0f); // Default to green
+    float similarity = 0.4f;  // Range [0.0, 1.0] - how similar colors must be to be keyed
+    float blend = 0.1f;       // Range [0.0, 1.0] - softness of the edge
+    float spill = 0.2f;       // Range [0.0, 1.0] - amount of color spill suppression
+
+    ChromaKeyNode() {
+        name = "Chroma Key";
+    }
+
+    void Process(const EffectContext& ctx) override;
+};

@@ -2536,6 +2536,10 @@ void DrawEffectUIForClip(Clip& clip, GLResources& gl_resources) {
             // Default values are in constructor
             clip.effect_graph->nodes.push_back(shadow_fx);
         }
+        if (ImGui::Button("Add Chroma Key")) {
+            auto keyer = std::make_shared<ChromaKeyNode>();
+            clip.effect_graph->nodes.push_back(keyer);
+        }
 
         for (size_t i = 0; i < clip.effect_graph->nodes.size(); ++i) {
             bool effect_changed = false;
@@ -2759,6 +2763,12 @@ void DrawEffectUIForClip(Clip& clip, GLResources& gl_resources) {
 
                     ImGui::SliderFloat("Blur Amount##Shadow", &shadow_node->blur_amount, 0.0f, 50.0f);
                     DrawKeyframeTrackEditor("Blur Amount##Shadow", shadow_node->blur_amount_track);
+                } else if (auto keyer = std::dynamic_pointer_cast<ChromaKeyNode>(node)) {
+                    ImGui::Text("Chroma Key Properties:");
+                    ImGui::ColorEdit3("Key Color", &keyer->key_color.x);
+                    ImGui::SliderFloat("Similarity", &keyer->similarity, 0.0f, 1.0f, "%.3f");
+                    ImGui::SliderFloat("Blend", &keyer->blend, 0.0f, 1.0f, "%.3f");
+                    ImGui::SliderFloat("Spill Suppression", &keyer->spill, 0.0f, 1.0f, "%.3f");
                 }
 
                 // Render common UI elements

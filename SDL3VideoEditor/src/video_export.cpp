@@ -661,43 +661,73 @@ void render_frame(GLResources& res, float current_time,
 
         if (tex_id != 0) {
             // If the clip has effects, we need to handle them differently
-            if (clip.has_effects) {
-                // Create a temporary FBO to capture the clip with transforms applied
+            if (clip.has_effects && clip.effect_graph) {
+                // --- BEST PRACTICE: Disable blending when rendering into temp FBOs ---
+                glDisable(GL_BLEND);
+                // ---
+
+                // --- STAGE 1: Bake transforms into a temporary texture ---
                 GLuint transformed_tex;
                 GLuint transformed_fbo = create_temp_fbo(glm::vec2(width, height), transformed_tex);
-                
-                // Render the clip with transforms to the temporary FBO
+
                 glBindFramebuffer(GL_FRAMEBUFFER, transformed_fbo);
                 glViewport(0, 0, width, height);
-                
-                // Bind the clip's texture
+                glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+                glClear(GL_COLOR_BUFFER_BIT);
+
                 glBindTexture(GL_TEXTURE_2D, tex_id);
-                
                 glPushMatrix();
-                // Apply transforms
                 glTranslatef(evaluated_pos_x * width, evaluated_pos_y * height, 0.0f);
                 glRotatef(evaluated_rotation, 0.0f, 0.0f, 1.0f);
                 glScalef(evaluated_scale, evaluated_scale, 1.0f);
-                glColor4f(1.0f, 1.0f, 1.0f, evaluated_opacity);
-                
-                // Draw the texture with transforms applied
+                glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+
                 glBegin(GL_QUADS);
                     glTexCoord2f(0.0f, 0.0f); glVertex2f(-1.0f * width, -1.0f * height);
                     glTexCoord2f(1.0f, 0.0f); glVertex2f(1.0f * width, -1.0f * height);
                     glTexCoord2f(1.0f, 1.0f); glVertex2f(1.0f * width, 1.0f * height);
                     glTexCoord2f(0.0f, 1.0f); glVertex2f(-1.0f * width, 1.0f * height);
                 glEnd();
-                
                 glPopMatrix();
+
+                // --- STAGE 2: Process the effect chain ---
+                GLuint final_effect_tex;
+                GLuint final_effect_fbo = create_temp_fbo(glm::vec2(width, height), final_effect_tex);
+                clip.effect_graph->Process(transformed_tex, final_effect_fbo, current_time, glm::vec2(width, height));
+
+                // --- STAGE 3: Composite the result onto the main FBO ---
                 
-                // Process the effects using the transformed texture
-                glBindFramebuffer(GL_FRAMEBUFFER, res.fbo); // Back to main FBO
-                clip.effect_graph->Process(transformed_tex, res.fbo, current_time, glm::vec2(width, height));
-                
-                // Clean up
+                // --- BEST PRACTICE: Re-enable blending for the final composite ---
+                glEnable(GL_BLEND);
+                // Set the correct blend function for compositing
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                // ---
+
+                glBindFramebuffer(GL_FRAMEBUFFER, res.fbo);
+                glViewport(0, 0, width, height);
+                glBindTexture(GL_TEXTURE_2D, final_effect_tex);
+                glColor4f(1.0f, 1.0f, 1.0f, evaluated_opacity);
+
+                glPushMatrix();
+                glLoadIdentity();
+                glBegin(GL_QUADS);
+                    glTexCoord2f(0.0f, 0.0f); glVertex2f(-1.0f * width, -1.0f * height);
+                    glTexCoord2f(1.0f, 0.0f); glVertex2f(1.0f * width, -1.0f * height);
+                    glTexCoord2f(1.0f, 1.0f); glVertex2f(1.0f * width, 1.0f * height);
+                    glTexCoord2f(0.0f, 1.0f); glVertex2f(-1.0f * width, 1.0f * height);
+                glEnd();
+                glPopMatrix();
+
+                // --- STAGE 4: Clean up temporary resources ---
                 destroy_temp_fbo(transformed_fbo, transformed_tex);
+                destroy_temp_fbo(final_effect_fbo, final_effect_tex);
+
             } else {
-                // Normal rendering (no effects)
+                // Original rendering path for clips with NO effects
+                // Make sure blending is enabled for normal clips too
+                glEnable(GL_BLEND);
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
                 glBindTexture(GL_TEXTURE_2D, tex_id);
                 glPushMatrix();
                 
