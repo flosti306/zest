@@ -107,6 +107,14 @@ static cv::Mat last_grabcut_mask_cv;
 static GLuint smart_mask_visual_tex = 0;
 static GLuint smart_mask_final_raw_tex = 0; // NEW: Holds the final B&W mask texture from RunGrabCut
 
+static bool eyedropper_active = false;
+static ChromaKeyNode* target_chroma_key_node = nullptr; // Pointer to the node we're editing
+
+static GLuint eyedropper_icon_tex_id = 0;
+static int eyedropper_icon_width = 0;
+static int eyedropper_icon_height = 0;
+static SDL_Cursor* eyedropper_cursor = nullptr;
+
 std::stack<std::string> undo_stack;
 std::stack<std::string> redo_stack;
 
@@ -311,6 +319,51 @@ void ApplyWindowBackgroundGradients() {
     ImVec2 window_size = ImGui::GetWindowSize();
     ImTextureID tex_id = (ImTextureID)(intptr_t)gradient_texture;
     draw_list->AddImage(tex_id, window_pos, ImVec2(window_pos.x + window_size.x, window_pos.y + window_size.y), ImVec2(0, 0), ImVec2(1, 1), IM_COL32_WHITE);
+}
+
+bool LoadTextureFromFile(const char* filename, GLuint* out_texture_id, int* out_width, int* out_height, SDL_Surface** out_surface = nullptr)
+{
+    SDL_Surface* loaded_surface = IMG_Load(filename);
+    if (loaded_surface == nullptr) {
+        std::cerr << "Failed to load image: " << filename << " - " << SDL_GetError() << std::endl;
+        return false;
+    }
+
+    // Convert surface to a standard format (RGBA32) for consistency with OpenGL
+    SDL_Surface* formatted_surface = SDL_ConvertSurface(loaded_surface, SDL_PIXELFORMAT_RGBA32);
+    if (formatted_surface == nullptr) {
+        std::cerr << "Failed to convert surface: " << filename << " - " << SDL_GetError() << std::endl;
+        SDL_DestroySurface(loaded_surface);
+        return false;
+    }
+
+    // Generate OpenGL texture
+    GLuint texture_id;
+    glGenTextures(1, &texture_id);
+    glBindTexture(GL_TEXTURE_2D, texture_id);
+
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, formatted_surface->w, formatted_surface->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, formatted_surface->pixels);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    // Return the results
+    *out_texture_id = texture_id;
+    *out_width = formatted_surface->w;
+    *out_height = formatted_surface->h;
+
+    // If the caller wants the SDL_Surface (for cursor creation), give it to them.
+    // Otherwise, we free it immediately as it's no longer needed after texture upload.
+    if (out_surface) {
+        *out_surface = formatted_surface;
+    } else {
+        SDL_DestroySurface(formatted_surface);
+    }
+
+    SDL_DestroySurface(loaded_surface); // Free the original loaded surface
+
+    return true;
 }
 
 // --- Docking Setup ---
@@ -1027,7 +1080,7 @@ template<typename T>
 void DrawKeyframeTrackEditor(const std::string& label, KeyframeTrack<T>& track);
 void DrawTimelineEditor(std::vector<Clip>& clips, float& playhead_time, float& max_duration, float& zoom_factor, std::atomic<bool>& layers_changed, Clip*& selected_clip, GLResources& res, float& last_playhead_time_for_velocity);
 void UpdatePreview(GLResources& res, const std::vector<Clip>& sorted_clips, int width, int height, float playhead_time, bool force_update);
-void RenderPreviewWindow(GLuint preview_tex, int preview_width, int preview_height);
+void RenderPreviewWindow(GLResources& res, int preview_width, int preview_height);
 void DrawEffectUIForClip(Clip& clip, GLResources& gl_resources);
 void OpenSmartMaskEditor(MaskEffectNode* node, GLuint clip_texture_for_background, const DecodedFrame& decoded_frame_for_cv);
 void DrawSmartMaskEditorWindow();
@@ -1118,6 +1171,19 @@ int main(int argc, char* argv[]) {
         SDL_GL_DestroyContext(gl_context);
         SDL_DestroyWindow(window); SDL_Quit();
         return 1;
+    }
+
+    SDL_Surface* cursor_surface = IMG_Load("assets/eye-dropper.svg");
+    if (cursor_surface) {
+        // Create the cursor from the loaded surface.
+        // The "hotspot" is the tip of the dropper. For a top-left dropper, this is (0,0).
+        // Adjust these values if the tip is elsewhere in your icon.
+        int hot_x = 0;
+        int hot_y = 0;
+        eyedropper_cursor = SDL_CreateColorCursor(cursor_surface, hot_x, hot_y);
+        SDL_DestroySurface(cursor_surface); // We're done with the surface
+    } else {
+        std::cerr << "Warning: Could not load 'assets/eye-dropper.svg'. Eyedropper will use a text button." << std::endl;
     }
 
     SetupMaskEditorPreviewResources();
@@ -1484,7 +1550,7 @@ int main(int argc, char* argv[]) {
         ImGui::End(); // End Controls
 
         DrawTimelineEditor(clips, playhead_time, max_duration, zoom_factor, layers_changed, selected_clip, gl_resources, last_playhead_time_for_velocity);
-        RenderPreviewWindow(gl_resources.render_tex, preview_width, preview_height);
+        RenderPreviewWindow(gl_resources, preview_width, preview_height);
 
         if (mask_editor_open) {
             DrawMaskEditorWindow(gl_resources); // Pass gl_resources if needed inside editor
@@ -1655,6 +1721,13 @@ int main(int argc, char* argv[]) {
 
     std::cout << "Cleaning up resources..." << std::endl;
 
+    if (eyedropper_icon_tex_id != 0) {
+        glDeleteTextures(1, &eyedropper_icon_tex_id);
+    }
+    if (eyedropper_cursor != nullptr) {
+        SDL_DestroyCursor(eyedropper_cursor);
+    }
+
     stop_thumbnail_worker();
     stop_decoder_worker();
 
@@ -1700,21 +1773,91 @@ void RenderFullscreenQuad(float width, float height) {
 }
 
 // --- RenderPreviewWindow ---
-void RenderPreviewWindow(GLuint preview_tex, int preview_width, int preview_height) {
-    ImGui::Begin("Video Preview"); ApplyWindowBackgroundGradients();
+void RenderPreviewWindow(GLResources& res, int preview_width, int preview_height) {
+    ImGui::Begin("Video Preview");
+    ApplyWindowBackgroundGradients();
     ImVec2 available_size = ImGui::GetContentRegionAvail();
-    available_size.x = std::max(available_size.x, 1.0f); available_size.y = std::max(available_size.y, 1.0f);
+    available_size.x = std::max(available_size.x, 1.0f);
+    available_size.y = std::max(available_size.y, 1.0f);
     ImVec2 render_size = ImVec2((float)preview_width, (float)preview_height);
-    if (render_size.x <= 0 || render_size.y <= 0) { ImGui::Text("Invalid preview dimensions."); ImGui::End(); return; }
+
+    if (render_size.x <= 0 || render_size.y <= 0) {
+        ImGui::Text("Invalid preview dimensions.");
+        ImGui::End();
+        return;
+    }
+
     float aspect_ratio = render_size.x / render_size.y;
     ImVec2 display_size = available_size;
+
     if (available_size.x / aspect_ratio <= available_size.y) display_size.y = available_size.x / aspect_ratio;
     else display_size.x = available_size.y * aspect_ratio;
+
     display_size.x = std::max(display_size.x, 1.0f); display_size.y = std::max(display_size.y, 1.0f);
     ImVec2 cursor_pos = ImGui::GetCursorPos();
     ImVec2 centered_pos = ImVec2(cursor_pos.x + (available_size.x - display_size.x) * 0.5f, cursor_pos.y + (available_size.y - display_size.y) * 0.5f);
     ImGui::SetCursorPos(centered_pos);
-    if (preview_tex != 0) ImGui::Image((ImTextureID)(intptr_t)preview_tex, display_size, ImVec2(0, 0), ImVec2(1, 1));
+
+    GLuint preview_tex = res.render_tex;
+
+    if (preview_tex != 0) {
+        ImGui::Image((ImTextureID)(intptr_t)preview_tex, display_size, ImVec2(0, 0), ImVec2(1, 1));
+
+        if (eyedropper_active) {
+            if (eyedropper_cursor != nullptr) {
+                SDL_SetCursor(eyedropper_cursor); // Use SDL's custom cursor
+            } else {
+                ImGui::SetMouseCursor(ImGuiMouseCursor_Hand); // Fallback to ImGui arrow
+            }
+            if (ImGui::IsItemHovered()) {
+                if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                    if (target_chroma_key_node) {
+                        ImVec2 mouse_pos = ImGui::GetMousePos();
+                        ImVec2 rect_min = ImGui::GetItemRectMin();
+                        ImVec2 rect_size = ImGui::GetItemRectSize();
+
+                        // Calculate UV coordinates [0, 1] on the image
+                        float u = (mouse_pos.x - rect_min.x) / rect_size.x;
+                        float v = (mouse_pos.y - rect_min.y) / rect_size.y;
+
+                        // Convert UV to pixel coordinates on the source texture
+                        int tex_x = static_cast<int>(u * preview_width);
+                        int tex_y = static_cast<int>(v * preview_height);
+
+                        // Clamp coordinates to be safe
+                        tex_x = std::max(0, std::min(preview_width - 1, tex_x));
+                        tex_y = std::max(0, std::min(preview_height - 1, tex_y));
+
+                        // Prepare to read the pixel from the framebuffer
+                        unsigned char pixel_data[4] = {0};
+                        
+                        // Bind the FBO that contains the preview texture
+                        glBindFramebuffer(GL_FRAMEBUFFER, res.fbo);
+                        glReadBuffer(GL_COLOR_ATTACHMENT0);
+
+                        // Read the single pixel. NOTE: glReadPixels' y-coord is bottom-up.
+                        glReadPixels(tex_x, (preview_height - 1 - tex_y), 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel_data);
+                        
+                        // Unbind the FBO to be clean
+                        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+                        // Update the chroma key node's color (converting 0-255 to 0.0-1.0)
+                        target_chroma_key_node->key_color.r = pixel_data[0] / 255.0f;
+                        target_chroma_key_node->key_color.g = pixel_data[1] / 255.0f;
+                        target_chroma_key_node->key_color.b = pixel_data[2] / 255.0f;
+                    }
+                    // Deactivate eyedropper mode
+                    eyedropper_active = false;
+                    target_chroma_key_node = nullptr;
+                }
+            }
+            // Allow canceling with right-click
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+                eyedropper_active = false;
+                target_chroma_key_node = nullptr;
+            }
+        }
+    }
     else {
         ImGui::Dummy(display_size); ImU32 placeholder_col = IM_COL32(40, 40, 45, 255);
         ImVec2 rect_min = ImGui::GetItemRectMin(); ImVec2 rect_max = ImGui::GetItemRectMax();
@@ -2766,6 +2909,27 @@ void DrawEffectUIForClip(Clip& clip, GLResources& gl_resources) {
                 } else if (auto keyer = std::dynamic_pointer_cast<ChromaKeyNode>(node)) {
                     ImGui::Text("Chroma Key Properties:");
                     ImGui::ColorEdit3("Key Color", &keyer->key_color.x);
+                    ImGui::SameLine();
+                    if (eyedropper_icon_tex_id != 0) {
+                        // Use the loaded icon as a button
+                        if (ImGui::ImageButton("##eyedropper", (ImTextureID)(intptr_t)eyedropper_icon_tex_id, ImVec2(16, 16))) {
+                            eyedropper_active = true;
+                            target_chroma_key_node = keyer.get();
+                        }
+                    } else {
+                        // Fallback to a text button if the icon failed to load
+                        if (ImGui::Button("...")) { // Shorter text
+                            eyedropper_active = true;
+                            target_chroma_key_node = keyer.get();
+                        }
+                    }
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Pick color from preview");
+                    }
+                    if (eyedropper_active && target_chroma_key_node == keyer.get()) {
+                        ImGui::SameLine();
+                        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "Picking...");
+                    }
                     ImGui::SliderFloat("Similarity", &keyer->similarity, 0.0f, 1.0f, "%.3f");
                     ImGui::SliderFloat("Blend", &keyer->blend, 0.0f, 1.0f, "%.3f");
                     ImGui::SliderFloat("Spill Suppression", &keyer->spill, 0.0f, 1.0f, "%.3f");
