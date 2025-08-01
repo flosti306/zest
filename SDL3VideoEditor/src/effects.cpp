@@ -178,6 +178,35 @@ void EffectGraph::evaluate_node(int node_id, const EffectContext& base_ctx) {
         return; // Already processed this node, its result is ready.
     }
 
+    // --- NEW: Passthrough logic for disabled nodes ---
+    if (!node->enabled) {
+        // A disabled node's result is simply the result of its first input.
+        // This makes it act like a straight wire.
+
+        // We still need to evaluate the upstream node to get its texture.
+        // This logic assumes a simple chain (one input). For multi-input nodes,
+        // you might pass through the primary input (e.g., input_pins[0]).
+        GLuint passthrough_texture = 0;
+        if (!node->input_pins.empty()) {
+            // Find the link connected to this node's first input pin.
+            for (const auto& link : links) {
+                if (link.to_pin_id == node->input_pins[0].id) {
+                    // Recursively evaluate the node that feeds into this disabled one.
+                    evaluate_node(link.from_node_id, base_ctx);
+                    
+                    // The result we pass through is the result from that upstream node.
+                    passthrough_texture = nodes.at(link.from_node_id)->result_texture;
+                    break;
+                }
+            }
+        }
+
+        // Set this disabled node's result to be its input's result.
+        node->result_texture = passthrough_texture;
+        node->is_evaluated_this_frame = true;
+        return; // CRITICAL: Skip the rest of the function.
+    }
+
     // 1. Gather the textures from all incoming connections.
     std::vector<GLuint> input_textures;
     for (const auto& input_pin : node->input_pins) {
