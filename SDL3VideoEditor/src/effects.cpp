@@ -360,6 +360,59 @@ void ColorGradingNode::applyFadedFilmPreset() {
     ColorGradingNode::gamma = 1.0f;
 }
 
+void EffectGraph::rebuild_links_from_order() {
+    // 1. Clear all existing links. We are rebuilding from scratch.
+    links.clear();
+    static int next_link_id = 1; // Reset link IDs each time for simplicity
+
+    // 2. Handle the case where there are no user effects.
+    if (node_order.empty()) {
+        // Connect Source Clip directly to Final Output.
+        auto& input_node = nodes.at(input_node_id);
+        auto& output_node = nodes.at(output_node_id);
+        links.push_back({
+            next_link_id++,
+            input_node_id, output_node_id,
+            input_node->output_pins[0].id, output_node->input_pins[0].id
+        });
+        return;
+    }
+
+    // 3. Handle the case where there are one or more user effects.
+    // First, connect the Source Clip to the VERY FIRST effect in the list.
+    int first_effect_id = node_order.front();
+    auto& source_node = nodes.at(input_node_id);
+    auto& first_effect_node = nodes.at(first_effect_id);
+    links.push_back({
+        next_link_id++,
+        input_node_id, first_effect_id,
+        source_node->output_pins[0].id, first_effect_node->input_pins[0].id
+    });
+
+    // 4. Loop through the effects and connect them to each other in sequence.
+    for (size_t i = 0; i < node_order.size() - 1; ++i) {
+        int from_node_id = node_order[i];
+        int to_node_id = node_order[i + 1];
+        auto& from_node = nodes.at(from_node_id);
+        auto& to_node = nodes.at(to_node_id);
+        links.push_back({
+            next_link_id++,
+            from_node_id, to_node_id,
+            from_node->output_pins[0].id, to_node->input_pins[0].id
+        });
+    }
+
+    // 5. Finally, connect the VERY LAST effect in the list to the Final Output.
+    int last_effect_id = node_order.back();
+    auto& last_effect_node = nodes.at(last_effect_id);
+    auto& output_node = nodes.at(output_node_id);
+    links.push_back({
+        next_link_id++,
+        last_effect_id, output_node_id,
+        last_effect_node->output_pins[0].id, output_node->input_pins[0].id
+    });
+}
+
 void EffectGraph::ProcessSimpleList(GLuint source_clip_texture, GLuint final_output_fbo, float time, glm::vec2 resolution) {
     if (node_order.empty()) {
         // If there are no user effects, explicitly copy the source texture to the final output FBO.

@@ -143,6 +143,8 @@ struct EffectGraph {
             input_node->output_pins[0].id, output_node->input_pins[0].id
         });
     }
+
+    void rebuild_links_from_order();
     
     // ... (deep copy constructor and processing methods)
     void ProcessSimpleList(GLuint source_clip_texture, GLuint final_output_fbo, float time, glm::vec2 resolution);

@@ -2689,6 +2689,7 @@ void DrawEffectUIForClip(Clip& clip, GLResources& gl_resources) {
             blur->blur_amount = 5.0f;
             graph.nodes[new_id] = blur;         // Add to the map
             graph.node_order.push_back(new_id); // Add ID to the order vector
+            graph.rebuild_links_from_order();
         }
         if (ImGui::Button("Add Color Grading")) {
             auto color_grade = std::make_shared<ColorGradingNode>();
@@ -2703,6 +2704,7 @@ void DrawEffectUIForClip(Clip& clip, GLResources& gl_resources) {
             color_grade->gamma = 1.0f;
             graph.nodes[new_id] = color_grade;
             graph.node_order.push_back(new_id);
+            graph.rebuild_links_from_order();
         }
         if (ImGui::Button("Add LUT")) {
             auto lut = std::make_shared<LUTColorGradingNode>();
@@ -2712,6 +2714,7 @@ void DrawEffectUIForClip(Clip& clip, GLResources& gl_resources) {
             lut->strength = 1.0f;
             graph.nodes[new_id] = lut;
             graph.node_order.push_back(new_id);
+            graph.rebuild_links_from_order();
         }
         if (ImGui::Button("Add Mask")) {
             auto mask = std::make_shared<MaskEffectNode>();
@@ -2720,6 +2723,7 @@ void DrawEffectUIForClip(Clip& clip, GLResources& gl_resources) {
             // Default settings are set in constructor
             graph.nodes[new_id] = mask;
             graph.node_order.push_back(new_id);
+            graph.rebuild_links_from_order();
         }
         if (ImGui::Button("Add Solid Color Overlay")) {
             auto solid_fx = std::make_shared<SolidColorEffectNode>();
@@ -2728,6 +2732,7 @@ void DrawEffectUIForClip(Clip& clip, GLResources& gl_resources) {
             // Default values are set in constructor
             graph.nodes[new_id] = solid_fx;
             graph.node_order.push_back(new_id);
+            graph.rebuild_links_from_order();
         }
         if (ImGui::Button("Add Gradient Overlay")) {
             auto grad_fx = std::make_shared<GradientEffectNode>();
@@ -2736,6 +2741,7 @@ void DrawEffectUIForClip(Clip& clip, GLResources& gl_resources) {
             // Default values are set in constructor
             graph.nodes[new_id] = grad_fx;
             graph.node_order.push_back(new_id);
+            graph.rebuild_links_from_order();
         }
         if (ImGui::Button("Add Drop Shadow")) {
             auto shadow_fx = std::make_shared<DropShadowEffectNode>();
@@ -2744,6 +2750,7 @@ void DrawEffectUIForClip(Clip& clip, GLResources& gl_resources) {
             // Default values are in constructor
             graph.nodes[new_id] = shadow_fx;
             graph.node_order.push_back(new_id);
+            graph.rebuild_links_from_order();
         }
         if (ImGui::Button("Add Chroma Key")) {
             auto keyer = std::make_shared<ChromaKeyNode>();
@@ -2751,6 +2758,7 @@ void DrawEffectUIForClip(Clip& clip, GLResources& gl_resources) {
             keyer->id = new_id;
             graph.nodes[new_id] = keyer;
             graph.node_order.push_back(new_id);
+            graph.rebuild_links_from_order();
         }
 
         for (size_t i = 0; i < clip.effect_graph->node_order.size(); ++i) {
@@ -2782,6 +2790,8 @@ void DrawEffectUIForClip(Clip& clip, GLResources& gl_resources) {
                         int id_to_move = order_vec[source_index];
                         order_vec.erase(order_vec.begin() + source_index);
                         order_vec.insert(order_vec.begin() + target_index, id_to_move);
+
+                        graph.rebuild_links_from_order();
                         
                         ImGui::EndDragDropTarget();
                         ImGui::PopID();
@@ -3050,8 +3060,11 @@ void DrawEffectUIForClip(Clip& clip, GLResources& gl_resources) {
                     auto& graph = *clip.effect_graph;
                     graph.nodes.erase(node_id); // Remove from map by key
                     graph.node_order.erase(graph.node_order.begin() + i); // Remove from order vector by iterator
+                    graph.rebuild_links_from_order();
+
                     ImGui::TreePop();
                     ImGui::PopID();
+
                     break;
                 }
 
