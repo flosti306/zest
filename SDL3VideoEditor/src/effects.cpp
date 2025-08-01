@@ -361,56 +361,74 @@ void ColorGradingNode::applyFadedFilmPreset() {
 }
 
 void EffectGraph::rebuild_links_from_order() {
-    // 1. Clear all existing links. We are rebuilding from scratch.
+    // 1. Clear all existing links.
     links.clear();
-    static int next_link_id = 1; // Reset link IDs each time for simplicity
+    static int next_link_id = 1;
 
-    // 2. Handle the case where there are no user effects.
+    // --- NEW: Auto-layout logic ---
+    const float START_X = 50.0f;
+    const float START_Y = 100.0f;
+    const float HORIZONTAL_SPACING = 250.0f;
+    float current_x = START_X;
+    // --- END NEW ---
+
+    // 2. Position and connect the Source Clip node.
+    auto& source_node = nodes.at(input_node_id);
+    source_node->editor_pos = ImVec2(current_x, START_Y);
+    current_x += HORIZONTAL_SPACING;
+
+    // 3. Handle the main chain of effects.
     if (node_order.empty()) {
-        // Connect Source Clip directly to Final Output.
-        auto& input_node = nodes.at(input_node_id);
+        // If no effects, connect Source directly to Output.
         auto& output_node = nodes.at(output_node_id);
         links.push_back({
             next_link_id++,
             input_node_id, output_node_id,
-            input_node->output_pins[0].id, output_node->input_pins[0].id
+            source_node->output_pins[0].id, output_node->input_pins[0].id
         });
-        return;
-    }
-
-    // 3. Handle the case where there are one or more user effects.
-    // First, connect the Source Clip to the VERY FIRST effect in the list.
-    int first_effect_id = node_order.front();
-    auto& source_node = nodes.at(input_node_id);
-    auto& first_effect_node = nodes.at(first_effect_id);
-    links.push_back({
-        next_link_id++,
-        input_node_id, first_effect_id,
-        source_node->output_pins[0].id, first_effect_node->input_pins[0].id
-    });
-
-    // 4. Loop through the effects and connect them to each other in sequence.
-    for (size_t i = 0; i < node_order.size() - 1; ++i) {
-        int from_node_id = node_order[i];
-        int to_node_id = node_order[i + 1];
-        auto& from_node = nodes.at(from_node_id);
-        auto& to_node = nodes.at(to_node_id);
+    } else {
+        // Connect Source to the first effect.
+        int first_effect_id = node_order.front();
+        auto& first_effect_node = nodes.at(first_effect_id);
         links.push_back({
             next_link_id++,
-            from_node_id, to_node_id,
-            from_node->output_pins[0].id, to_node->input_pins[0].id
+            input_node_id, first_effect_id,
+            source_node->output_pins[0].id, first_effect_node->input_pins[0].id
+        });
+
+        // Loop through effects, positioning and linking them.
+        for (size_t i = 0; i < node_order.size(); ++i) {
+            int current_node_id = node_order[i];
+            auto& current_node = nodes.at(current_node_id);
+            current_node->editor_pos = ImVec2(current_x, START_Y);
+            current_x += HORIZONTAL_SPACING;
+
+            // If not the last node, link it to the next one.
+            if (i < node_order.size() - 1) {
+                int next_node_id = node_order[i + 1];
+                auto& next_node = nodes.at(next_node_id);
+                links.push_back({
+                    next_link_id++,
+                    current_node_id, next_node_id,
+                    current_node->output_pins[0].id, next_node->input_pins[0].id
+                });
+            }
+        }
+
+        // Connect the last effect to the Final Output.
+        int last_effect_id = node_order.back();
+        auto& last_effect_node = nodes.at(last_effect_id);
+        auto& output_node = nodes.at(output_node_id);
+        links.push_back({
+            next_link_id++,
+            last_effect_id, output_node_id,
+            last_effect_node->output_pins[0].id, output_node->input_pins[0].id
         });
     }
-
-    // 5. Finally, connect the VERY LAST effect in the list to the Final Output.
-    int last_effect_id = node_order.back();
-    auto& last_effect_node = nodes.at(last_effect_id);
+    
+    // 4. Position the Final Output node last.
     auto& output_node = nodes.at(output_node_id);
-    links.push_back({
-        next_link_id++,
-        last_effect_id, output_node_id,
-        last_effect_node->output_pins[0].id, output_node->input_pins[0].id
-    });
+    output_node->editor_pos = ImVec2(current_x, START_Y);
 }
 
 void EffectGraph::ProcessSimpleList(GLuint source_clip_texture, GLuint final_output_fbo, float time, glm::vec2 resolution) {

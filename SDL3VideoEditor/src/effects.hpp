@@ -87,6 +87,7 @@ struct SourceClipNode : public EffectNode {
     SourceClipNode() {
         name = "Source Clip";
         add_pin(false, "Source"); // Add one output pin
+        editor_pos = ImVec2(50.0f, 100.0f);
     }
 
     // This node doesn't process anything; it's just a starting point.
@@ -103,6 +104,7 @@ struct FinalOutputNode : public EffectNode {
     FinalOutputNode() {
         name = "Final Output";
         add_pin(true, "Final Image"); // Add one input pin
+        editor_pos = ImVec2(300.0f, 100.0f);
     }
 
     // This node is just a sink. The evaluation engine takes its input
@@ -129,11 +131,19 @@ struct EffectGraph {
         auto input_node = std::make_shared<SourceClipNode>();
         input_node_id = next_node_id++;
         input_node->id = input_node_id;
+
+        // Give the source node a starting position on the left.
+        input_node->editor_pos = ImVec2(50.0f, 100.0f);
+
         nodes[input_node_id] = input_node;
 
         auto output_node = std::make_shared<FinalOutputNode>();
         output_node_id = next_node_id++;
         output_node->id = output_node_id;
+
+        // Give the output node a starting position to the right of the source.
+        output_node->editor_pos = ImVec2(300.0f, 100.0f);
+
         nodes[output_node_id] = output_node;
 
         static int next_link_id = 1; // This could be a member variable if preferred

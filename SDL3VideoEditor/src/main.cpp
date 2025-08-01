@@ -3371,6 +3371,12 @@ void DrawNodeEditorWindow(Clip* clip) {
     if (ImGui::Begin("Node Editor")) {
         ImNodes::BeginNodeEditor();
 
+        // This is done once per node before it's drawn for the frame.
+        // imnodes will use this position unless the user has already moved the node.
+        for (auto const& [node_id, node_ptr] : graph->nodes) {
+            ImNodes::SetNodeEditorSpacePos(node_id, node_ptr->editor_pos);
+        }
+
         // --- Render Nodes and Pins ---
         for (auto const& [node_id, node_ptr] : graph->nodes) {
             ImNodes::BeginNode(node_id);
@@ -3400,6 +3406,12 @@ void DrawNodeEditorWindow(Clip* clip) {
         }
 
         ImNodes::EndNodeEditor();
+
+        // After the editor has been drawn and interacted with, we poll the
+        // positions of all nodes and update our internal storage.
+        for (auto const& [node_id, node_ptr] : graph->nodes) {
+            node_ptr->editor_pos = ImNodes::GetNodeEditorSpacePos(node_id);
+        }
 
         // --- NEW & CORRECTED Link Management for Intuitive UX ---
 
