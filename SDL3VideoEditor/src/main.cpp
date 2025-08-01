@@ -1440,6 +1440,12 @@ int main(int argc, char* argv[]) {
             }
         } // End SDL_PollEvent loop
 
+        for (auto& clip : clips) {
+            if (clip.effect_graph) {
+                clip.effect_graph->cleanup_transient_resources();
+            }
+        }
+
         if (file_dropped_this_frame) {
             std::string dropped_path_str = input_path;
             std::cout << "File dropped: " << dropped_path_str << std::endl;

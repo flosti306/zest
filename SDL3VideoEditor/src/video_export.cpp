@@ -693,7 +693,7 @@ void render_frame(GLResources& res, float current_time,
                 // --- STAGE 2: Process the effect chain ---
                 GLuint final_effect_tex;
                 GLuint final_effect_fbo = create_temp_fbo(glm::vec2(width, height), final_effect_tex);
-                clip.effect_graph->ProcessSimpleList(transformed_tex, final_effect_fbo, current_time, glm::vec2(width, height));
+                clip.effect_graph->ProcessNodeGraph(transformed_tex, final_effect_fbo, current_time, glm::vec2(width, height));
 
                 // --- STAGE 3: Composite the result onto the main FBO ---
                 

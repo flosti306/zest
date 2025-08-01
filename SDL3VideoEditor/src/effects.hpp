@@ -126,6 +126,8 @@ struct EffectGraph {
     int input_node_id = 0;
     int output_node_id = 0;
 
+    std::vector<GLuint> transient_textures;
+
     EffectGraph() {
         // Create instances of our new CONCRETE node types.
         auto input_node = std::make_shared<SourceClipNode>();
@@ -154,10 +156,10 @@ struct EffectGraph {
         });
     }
 
+    void cleanup_transient_resources();
     void rebuild_links_from_order();
     
     // ... (deep copy constructor and processing methods)
-    void ProcessSimpleList(GLuint source_clip_texture, GLuint final_output_fbo, float time, glm::vec2 resolution);
     void ProcessNodeGraph(GLuint source_clip_texture, GLuint final_output_fbo, float time, glm::vec2 resolution);
 private:
     void evaluate_node(int node_id, const EffectContext& base_ctx);

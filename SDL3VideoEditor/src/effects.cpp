@@ -162,6 +162,238 @@ void RenderFullscreenQuad() {
     glBindVertexArray(0);
 }
 
+void EffectGraph::cleanup_transient_resources() {
+    for (GLuint tex_id : transient_textures) {
+        if (tex_id != 0) { // Safety check
+            glDeleteTextures(1, &tex_id);
+        }
+    }
+    transient_textures.clear();
+}
+
+// Private helper function to recursively evaluate
+void EffectGraph::evaluate_node(int node_id, const EffectContext& base_ctx) {
+    auto& node = nodes.at(node_id);
+    if (node->is_evaluated_this_frame) {
+        return; // Already processed this node, its result is ready.
+    }
+
+    // 1. Gather the textures from all incoming connections.
+    std::vector<GLuint> input_textures;
+    for (const auto& input_pin : node->input_pins) {
+        for (const auto& link : links) {
+            if (link.to_pin_id == input_pin.id) {
+                // This link connects to our input pin.
+                // We must recursively evaluate the node that FEEDS this link.
+                evaluate_node(link.from_node_id, base_ctx);
+                
+                // Now that the source node is evaluated, get its result texture.
+                input_textures.push_back(nodes.at(link.from_node_id)->result_texture);
+                break; // Move to the next input pin
+            }
+        }
+    }
+
+    // 2. Process this node.
+    GLuint output_tex_for_this_node = 0;
+    GLuint temp_fbo = create_temp_fbo(base_ctx.resolution, output_tex_for_this_node);
+    
+    // Add the newly created texture to our list for cleanup at the end of the frame.
+    transient_textures.push_back(output_tex_for_this_node);
+    
+    EffectContext node_ctx = base_ctx;
+    node_ctx.output_fbo = temp_fbo;
+    
+    node->Process(input_textures, node_ctx);
+
+    // 3. Store the result and mark the node as finished for this frame.
+    node->result_texture = output_tex_for_this_node;
+    node->is_evaluated_this_frame = true;
+    
+    glDeleteFramebuffers(1, &temp_fbo); // The FBO is no longer needed, but the texture is.
+}
+
+
+void EffectGraph::rebuild_links_from_order() {
+    // 1. Clear all existing links.
+    links.clear();
+    static int next_link_id = 1;
+
+    // --- NEW: Auto-layout logic ---
+    const float START_X = 50.0f;
+    const float START_Y = 100.0f;
+    const float HORIZONTAL_SPACING = 250.0f;
+    float current_x = START_X;
+    // --- END NEW ---
+
+    // 2. Position and connect the Source Clip node.
+    auto& source_node = nodes.at(input_node_id);
+    source_node->editor_pos = ImVec2(current_x, START_Y);
+    current_x += HORIZONTAL_SPACING;
+
+    // 3. Handle the main chain of effects.
+    if (node_order.empty()) {
+        // If no effects, connect Source directly to Output.
+        auto& output_node = nodes.at(output_node_id);
+        links.push_back({
+            next_link_id++,
+            input_node_id, output_node_id,
+            source_node->output_pins[0].id, output_node->input_pins[0].id
+        });
+    } else {
+        // Connect Source to the first effect.
+        int first_effect_id = node_order.front();
+        auto& first_effect_node = nodes.at(first_effect_id);
+        links.push_back({
+            next_link_id++,
+            input_node_id, first_effect_id,
+            source_node->output_pins[0].id, first_effect_node->input_pins[0].id
+        });
+
+        // Loop through effects, positioning and linking them.
+        for (size_t i = 0; i < node_order.size(); ++i) {
+            int current_node_id = node_order[i];
+            auto& current_node = nodes.at(current_node_id);
+            current_node->editor_pos = ImVec2(current_x, START_Y);
+            current_x += HORIZONTAL_SPACING;
+
+            // If not the last node, link it to the next one.
+            if (i < node_order.size() - 1) {
+                int next_node_id = node_order[i + 1];
+                auto& next_node = nodes.at(next_node_id);
+                links.push_back({
+                    next_link_id++,
+                    current_node_id, next_node_id,
+                    current_node->output_pins[0].id, next_node->input_pins[0].id
+                });
+            }
+        }
+
+        // Connect the last effect to the Final Output.
+        int last_effect_id = node_order.back();
+        auto& last_effect_node = nodes.at(last_effect_id);
+        auto& output_node = nodes.at(output_node_id);
+        links.push_back({
+            next_link_id++,
+            last_effect_id, output_node_id,
+            last_effect_node->output_pins[0].id, output_node->input_pins[0].id
+        });
+    }
+    
+    // 4. Position the Final Output node last.
+    auto& output_node = nodes.at(output_node_id);
+    output_node->editor_pos = ImVec2(current_x, START_Y);
+}
+
+void EffectGraph::ProcessNodeGraph(GLuint source_clip_texture, GLuint final_output_fbo, float time, glm::vec2 resolution) {
+    if (nodes.empty() || output_node_id == 0) return;
+
+    // --- Step 2 becomes Step 1: Reset the evaluation state for the CURRENT frame ---
+    for (auto& [id, node] : nodes) {
+        node->is_evaluated_this_frame = false;
+        node->result_texture = 0;
+    }
+    
+    // --- Step 3 becomes Step 2: Set the starting condition ---
+    nodes.at(input_node_id)->result_texture = source_clip_texture;
+    nodes.at(input_node_id)->is_evaluated_this_frame = true;
+
+    // --- Step 4 becomes Step 3: Start the recursive evaluation ---
+    EffectContext base_ctx = { 0, 0, time, resolution };
+    evaluate_node(output_node_id, base_ctx);
+
+    // --- 5. Copy the final result to the destination FBO ---
+    // After evaluation, the final image is stored in the output node's input's source.
+    GLuint final_texture = 0;
+    for (const auto& link : links) {
+        if (link.to_node_id == output_node_id) {
+            final_texture = nodes.at(link.from_node_id)->result_texture;
+            break;
+        }
+    }
+
+    if (final_texture != 0) {
+        // Use a simple passthrough shader to copy the final texture to the output FBO.
+        static GLuint copy_shader = 0;
+        if (copy_shader == 0) copy_shader = LoadShaderProgram("shaders/passthrough.vert", "shaders/texture.frag");
+        if (copy_shader == 0) return;
+
+        glBindFramebuffer(GL_FRAMEBUFFER, final_output_fbo);
+        glViewport(0, 0, (int)resolution.x, (int)resolution.y);
+        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+
+        glUseProgram(copy_shader);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, final_texture);
+        glUniform1i(glGetUniformLocation(copy_shader, "u_Texture"), 0);
+
+        RenderFullscreenQuad();
+
+        glUseProgram(0);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    } else {
+        // Handle case where output node is not connected
+    }
+}
+
+// Load a LUT from file (supports common 3D LUT formats)
+bool LUTColorGradingNode::loadLUT(const std::string& path) {
+    // If we already have a texture, delete it
+    if (lut_texture != 0) {
+        glDeleteTextures(1, &lut_texture);
+        lut_texture = 0;
+    }
+    
+    // Load the image using a library like stb_image
+    int width, height, channels;
+    SDL_Surface* surface = SDL_LoadBMP(path.c_str());
+    if (!surface) {
+        std::cerr << "Failed to load LUT image: " << path << " - " << SDL_GetError() << std::endl;
+        return false;
+    }
+
+    // Ensure the surface is in the correct format (RGBA)
+    SDL_Surface* converted_surface = SDL_ConvertSurface(surface, SDL_PIXELFORMAT_RGBA32);
+    SDL_DestroySurface(surface);
+
+    if (!converted_surface) {
+        std::cerr << "Failed to convert LUT image to RGBA format: " << SDL_GetError() << std::endl;
+        return false;
+    }
+
+    unsigned char* data = static_cast<unsigned char*>(converted_surface->pixels);
+    width = converted_surface->w;
+    height = converted_surface->h;
+    channels = 4; // RGBA
+
+    // Free the surface after extracting the data
+    SDL_DestroySurface(converted_surface);
+    
+    if (!data) {
+        std::cerr << "Failed to load LUT image: " << path << std::endl;
+        return false;
+    }
+    
+    // Create the texture
+    glGenTextures(1, &lut_texture);
+    glBindTexture(GL_TEXTURE_2D, lut_texture);
+    
+    // Set texture parameters
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    
+    // Upload the texture data
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
+    
+    // Save the path
+    lut_path = path;
+    
+    return true;
+}
+
 void GaussianBlurNode::Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) {
     if (!enabled || inputs.empty() || inputs[0] == 0) return;
         
@@ -358,257 +590,6 @@ void ColorGradingNode::applyFadedFilmPreset() {
     ColorGradingNode::tint = 0.0f;
     ColorGradingNode::color_filter = glm::vec3(0.95f, 0.95f, 0.9f); // Yellowish
     ColorGradingNode::gamma = 1.0f;
-}
-
-void EffectGraph::rebuild_links_from_order() {
-    // 1. Clear all existing links.
-    links.clear();
-    static int next_link_id = 1;
-
-    // --- NEW: Auto-layout logic ---
-    const float START_X = 50.0f;
-    const float START_Y = 100.0f;
-    const float HORIZONTAL_SPACING = 250.0f;
-    float current_x = START_X;
-    // --- END NEW ---
-
-    // 2. Position and connect the Source Clip node.
-    auto& source_node = nodes.at(input_node_id);
-    source_node->editor_pos = ImVec2(current_x, START_Y);
-    current_x += HORIZONTAL_SPACING;
-
-    // 3. Handle the main chain of effects.
-    if (node_order.empty()) {
-        // If no effects, connect Source directly to Output.
-        auto& output_node = nodes.at(output_node_id);
-        links.push_back({
-            next_link_id++,
-            input_node_id, output_node_id,
-            source_node->output_pins[0].id, output_node->input_pins[0].id
-        });
-    } else {
-        // Connect Source to the first effect.
-        int first_effect_id = node_order.front();
-        auto& first_effect_node = nodes.at(first_effect_id);
-        links.push_back({
-            next_link_id++,
-            input_node_id, first_effect_id,
-            source_node->output_pins[0].id, first_effect_node->input_pins[0].id
-        });
-
-        // Loop through effects, positioning and linking them.
-        for (size_t i = 0; i < node_order.size(); ++i) {
-            int current_node_id = node_order[i];
-            auto& current_node = nodes.at(current_node_id);
-            current_node->editor_pos = ImVec2(current_x, START_Y);
-            current_x += HORIZONTAL_SPACING;
-
-            // If not the last node, link it to the next one.
-            if (i < node_order.size() - 1) {
-                int next_node_id = node_order[i + 1];
-                auto& next_node = nodes.at(next_node_id);
-                links.push_back({
-                    next_link_id++,
-                    current_node_id, next_node_id,
-                    current_node->output_pins[0].id, next_node->input_pins[0].id
-                });
-            }
-        }
-
-        // Connect the last effect to the Final Output.
-        int last_effect_id = node_order.back();
-        auto& last_effect_node = nodes.at(last_effect_id);
-        auto& output_node = nodes.at(output_node_id);
-        links.push_back({
-            next_link_id++,
-            last_effect_id, output_node_id,
-            last_effect_node->output_pins[0].id, output_node->input_pins[0].id
-        });
-    }
-    
-    // 4. Position the Final Output node last.
-    auto& output_node = nodes.at(output_node_id);
-    output_node->editor_pos = ImVec2(current_x, START_Y);
-}
-
-void EffectGraph::ProcessSimpleList(GLuint source_clip_texture, GLuint final_output_fbo, float time, glm::vec2 resolution) {
-    if (node_order.empty()) {
-        // If there are no user effects, explicitly copy the source texture to the final output FBO.
-        static GLuint copy_shader = 0;
-        if (copy_shader == 0) copy_shader = LoadShaderProgram("shaders/passthrough.vert", "shaders/texture.frag");
-        if (copy_shader == 0) return;
-
-        glBindFramebuffer(GL_FRAMEBUFFER, final_output_fbo);
-        glViewport(0, 0, (int)resolution.x, (int)resolution.y);
-        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
-
-        glUseProgram(copy_shader);
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, source_clip_texture);
-        glUniform1i(glGetUniformLocation(copy_shader, "u_Texture"), 0);
-
-        RenderFullscreenQuad();
-
-        glUseProgram(0);
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        return;
-    }
-
-    // Setup ping-pong buffers for chaining effects
-    GLuint temp_fbo_A = 0, temp_tex_A = 0;
-    GLuint temp_fbo_B = 0, temp_tex_B = 0;
-    temp_fbo_A = create_temp_fbo(resolution, temp_tex_A);
-    temp_fbo_B = create_temp_fbo(resolution, temp_tex_B);
-
-    GLuint current_input_texture = source_clip_texture;
-
-    for (size_t i = 0; i < node_order.size(); ++i) {
-        int node_id = node_order[i];
-        auto& node = nodes[node_id];
-
-        if (!node || !node->enabled) continue;
-
-        // Determine the output FBO for this pass
-        GLuint target_fbo = (i == node_order.size() - 1) ? final_output_fbo : ((i % 2 == 0) ? temp_fbo_A : temp_fbo_B);
-        
-        EffectContext ctx = { 0, target_fbo, time, resolution };
-        
-        // Call process with the single current input texture
-        node->Process({current_input_texture}, ctx);
-
-        // Update the input for the next iteration
-        current_input_texture = get_texture_from_fbo(target_fbo);
-    }
-
-    // Cleanup
-    destroy_temp_fbo(temp_fbo_A, temp_tex_A);
-    destroy_temp_fbo(temp_fbo_B, temp_tex_B);
-}
-
-void EffectGraph::ProcessNodeGraph(GLuint source_clip_texture, GLuint final_output_fbo, float time, glm::vec2 resolution) {
-    if (nodes.empty() || output_node_id == 0) return;
-
-    // Reset evaluation state for all nodes for this new frame
-    for (auto& [id, node] : nodes) {
-        node->is_evaluated_this_frame = false;
-        // We also need to manage node->result_texture lifetime (create/delete)
-    }
-    
-    // The "Source Clip" node's result is just the input texture
-    nodes[input_node_id]->result_texture = source_clip_texture;
-    nodes[input_node_id]->is_evaluated_this_frame = true;
-
-    EffectContext base_ctx = { 0, 0, time, resolution }; // Create a base context
-    
-    // Start the recursive evaluation from the final output node
-    evaluate_node(output_node_id, base_ctx);
-
-    // After evaluation, the result is in the output node's texture.
-    // We need to blit this to the final destination FBO.
-    // (This requires a simple passthrough shader draw call)
-}
-
-// Private helper function to recursively evaluate
-void EffectGraph::evaluate_node(int node_id, const EffectContext& base_ctx) {
-    auto& node = nodes[node_id];
-    if (node->is_evaluated_this_frame) {
-        return; // Already processed this node, do nothing
-    }
-
-    // --- 1. Gather Inputs ---
-    // This node's inputs come from the outputs of other nodes.
-    std::vector<GLuint> input_textures;
-    for (const auto& input_pin : node->input_pins) {
-        // Find the link connected to this pin
-        for (const auto& link : links) {
-            if (link.to_pin_id == input_pin.id) {
-                // We found the source node, we must evaluate it first.
-                evaluate_node(link.from_node_id, base_ctx); // RECURSIVE CALL
-                
-                // Get the result from the now-evaluated source node
-                input_textures.push_back(nodes[link.from_node_id]->result_texture);
-                break;
-            }
-        }
-    }
-
-    // --- 2. Process This Node ---
-    // We now have all the input textures needed.
-    // The node will process them and save the output in its own result_texture.
-    // This requires a temporary FBO.
-    GLuint output_tex_for_this_node;
-    GLuint temp_fbo = create_temp_fbo(base_ctx.resolution, output_tex_for_this_node);
-    
-    EffectContext node_ctx = base_ctx;
-    node_ctx.output_fbo = temp_fbo;
-    
-    node->Process(input_textures, node_ctx); // Call the node's own logic
-
-    // Store the result and mark as evaluated
-    node->result_texture = output_tex_for_this_node;
-    node->is_evaluated_this_frame = true;
-    
-    // The temp_fbo can be deleted, but the texture cannot, as other nodes need it.
-    // Managing the lifetime of these result_textures is a complex but important detail.
-    glDeleteFramebuffers(1, &temp_fbo);
-}
-
-// Load a LUT from file (supports common 3D LUT formats)
-bool LUTColorGradingNode::loadLUT(const std::string& path) {
-    // If we already have a texture, delete it
-    if (lut_texture != 0) {
-        glDeleteTextures(1, &lut_texture);
-        lut_texture = 0;
-    }
-    
-    // Load the image using a library like stb_image
-    int width, height, channels;
-    SDL_Surface* surface = SDL_LoadBMP(path.c_str());
-    if (!surface) {
-        std::cerr << "Failed to load LUT image: " << path << " - " << SDL_GetError() << std::endl;
-        return false;
-    }
-
-    // Ensure the surface is in the correct format (RGBA)
-    SDL_Surface* converted_surface = SDL_ConvertSurface(surface, SDL_PIXELFORMAT_RGBA32);
-    SDL_DestroySurface(surface);
-
-    if (!converted_surface) {
-        std::cerr << "Failed to convert LUT image to RGBA format: " << SDL_GetError() << std::endl;
-        return false;
-    }
-
-    unsigned char* data = static_cast<unsigned char*>(converted_surface->pixels);
-    width = converted_surface->w;
-    height = converted_surface->h;
-    channels = 4; // RGBA
-
-    // Free the surface after extracting the data
-    SDL_DestroySurface(converted_surface);
-    
-    if (!data) {
-        std::cerr << "Failed to load LUT image: " << path << std::endl;
-        return false;
-    }
-    
-    // Create the texture
-    glGenTextures(1, &lut_texture);
-    glBindTexture(GL_TEXTURE_2D, lut_texture);
-    
-    // Set texture parameters
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    
-    // Upload the texture data
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
-    
-    // Save the path
-    lut_path = path;
-    
-    return true;
 }
 
 void LUTColorGradingNode::Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) {
