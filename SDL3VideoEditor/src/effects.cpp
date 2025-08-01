@@ -162,14 +162,14 @@ void RenderFullscreenQuad() {
     glBindVertexArray(0);
 }
 
-void GaussianBlurNode::Process(const EffectContext& ctx) {
-    if (!enabled || ctx.input_texture == 0)
-        return;
+void GaussianBlurNode::Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) {
+    if (!enabled || inputs.empty() || inputs[0] == 0) return;
         
     // Load shader program (consider caching this instead of loading every frame)
     GLuint blur_shader_program = LoadShaderProgram("shaders/blur.vert", "shaders/blur.frag");
-    if (blur_shader_program == 0)
-        return;
+    if (blur_shader_program == 0) return;
+
+    GLuint input_texture = inputs[0];
         
     // Setup modern shader VAO/VBO for the fullscreen quad
     static GLuint quadVAO = 0;
@@ -233,7 +233,7 @@ void GaussianBlurNode::Process(const EffectContext& ctx) {
     
     // Bind input texture
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, ctx.input_texture);
+    glBindTexture(GL_TEXTURE_2D, input_texture);
     glUniform1i(glGetUniformLocation(blur_shader_program, "u_Texture"), 0);
     
     // Draw
@@ -265,14 +265,14 @@ void GaussianBlurNode::Process(const EffectContext& ctx) {
     destroy_temp_fbo(horizontal_fbo, horizontal_tex);
 }
 
-void ColorGradingNode::Process(const EffectContext& ctx) {
-    if (!enabled || ctx.input_texture == 0)
-        return;
+void ColorGradingNode::Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) {
+    if (!enabled || inputs.empty() || inputs[0] == 0) return;
+
+    GLuint input_texture = inputs[0];
     
     // Load shader program (consider caching this instead of loading every frame)
     GLuint color_grade_program = LoadShaderProgram("shaders/colorgrade.vert", "shaders/colorgrade.frag");
-    if (color_grade_program == 0)
-        return;
+    if (color_grade_program == 0) return;
     
     // Setup render state
     glBindFramebuffer(GL_FRAMEBUFFER, ctx.output_fbo);
@@ -292,7 +292,7 @@ void ColorGradingNode::Process(const EffectContext& ctx) {
     
     // Bind input texture
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, ctx.input_texture);
+    glBindTexture(GL_TEXTURE_2D, input_texture);
     glUniform1i(glGetUniformLocation(color_grade_program, "u_Texture"), 0);
     
     // Draw fullscreen quad using our improved RenderFullscreenQuad function
@@ -360,29 +360,21 @@ void ColorGradingNode::applyFadedFilmPreset() {
     ColorGradingNode::gamma = 1.0f;
 }
 
-
-void EffectGraph::Process(GLuint input_tex, GLuint output_fbo, float time, glm::vec2 resolution) {
-    // Count how many nodes are actually enabled
-    int enabled_nodes_count = 0;
-    for (const auto& node : nodes) {
-        if (node && node->enabled) { // Added null check for safety
-            enabled_nodes_count++;
-        }
-    }
-
-    // If no effects are enabled, just do a simple passthrough of the input texture to the output
-    if (enabled_nodes_count == 0) {
+void EffectGraph::ProcessSimpleList(GLuint source_clip_texture, GLuint final_output_fbo, float time, glm::vec2 resolution) {
+    if (node_order.empty()) {
+        // If there are no user effects, explicitly copy the source texture to the final output FBO.
         static GLuint copy_shader = 0;
         if (copy_shader == 0) copy_shader = LoadShaderProgram("shaders/passthrough.vert", "shaders/texture.frag");
         if (copy_shader == 0) return;
 
-        glBindFramebuffer(GL_FRAMEBUFFER, output_fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, final_output_fbo);
         glViewport(0, 0, (int)resolution.x, (int)resolution.y);
-        glClear(GL_COLOR_BUFFER_BIT); // Clear destination before passthrough
+        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
 
         glUseProgram(copy_shader);
         glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, input_tex);
+        glBindTexture(GL_TEXTURE_2D, source_clip_texture);
         glUniform1i(glGetUniformLocation(copy_shader, "u_Texture"), 0);
 
         RenderFullscreenQuad();
@@ -392,60 +384,103 @@ void EffectGraph::Process(GLuint input_tex, GLuint output_fbo, float time, glm::
         return;
     }
 
-    // We have effects to process. Setup ping-pong buffers if we have more than one.
+    // Setup ping-pong buffers for chaining effects
     GLuint temp_fbo_A = 0, temp_tex_A = 0;
     GLuint temp_fbo_B = 0, temp_tex_B = 0;
+    temp_fbo_A = create_temp_fbo(resolution, temp_tex_A);
+    temp_fbo_B = create_temp_fbo(resolution, temp_tex_B);
 
-    if (enabled_nodes_count > 1) {
-        temp_fbo_A = create_temp_fbo(resolution, temp_tex_A);
-        temp_fbo_B = create_temp_fbo(resolution, temp_tex_B);
-    }
+    GLuint current_input_texture = source_clip_texture;
 
-    GLuint current_input_texture = input_tex;
-    int processed_count = 0;
+    for (size_t i = 0; i < node_order.size(); ++i) {
+        int node_id = node_order[i];
+        auto& node = nodes[node_id];
 
-    for (const auto& node : nodes) {
         if (!node || !node->enabled) continue;
 
-        processed_count++;
+        // Determine the output FBO for this pass
+        GLuint target_fbo = (i == node_order.size() - 1) ? final_output_fbo : ((i % 2 == 0) ? temp_fbo_A : temp_fbo_B);
+        
+        EffectContext ctx = { 0, target_fbo, time, resolution };
+        
+        // Call process with the single current input texture
+        node->Process({current_input_texture}, ctx);
 
-        // Determine the target FBO for this effect pass
-        GLuint target_fbo;
-        if (processed_count == enabled_nodes_count) {
-            // This is the last active effect, so it renders to the final output_fbo
-            target_fbo = output_fbo;
-        } else {
-            // This is an intermediate effect, render to a temporary ping-pong FBO.
-            // Odd-numbered effects (1st, 3rd, ..) write to A. Even-numbered (2nd, 4th, ..) write to B.
-            target_fbo = (processed_count % 2 == 1) ? temp_fbo_A : temp_fbo_B;
+        // Update the input for the next iteration
+        current_input_texture = get_texture_from_fbo(target_fbo);
+    }
+
+    // Cleanup
+    destroy_temp_fbo(temp_fbo_A, temp_tex_A);
+    destroy_temp_fbo(temp_fbo_B, temp_tex_B);
+}
+
+void EffectGraph::ProcessNodeGraph(GLuint source_clip_texture, GLuint final_output_fbo, float time, glm::vec2 resolution) {
+    if (nodes.empty() || output_node_id == 0) return;
+
+    // Reset evaluation state for all nodes for this new frame
+    for (auto& [id, node] : nodes) {
+        node->is_evaluated_this_frame = false;
+        // We also need to manage node->result_texture lifetime (create/delete)
+    }
+    
+    // The "Source Clip" node's result is just the input texture
+    nodes[input_node_id]->result_texture = source_clip_texture;
+    nodes[input_node_id]->is_evaluated_this_frame = true;
+
+    EffectContext base_ctx = { 0, 0, time, resolution }; // Create a base context
+    
+    // Start the recursive evaluation from the final output node
+    evaluate_node(output_node_id, base_ctx);
+
+    // After evaluation, the result is in the output node's texture.
+    // We need to blit this to the final destination FBO.
+    // (This requires a simple passthrough shader draw call)
+}
+
+// Private helper function to recursively evaluate
+void EffectGraph::evaluate_node(int node_id, const EffectContext& base_ctx) {
+    auto& node = nodes[node_id];
+    if (node->is_evaluated_this_frame) {
+        return; // Already processed this node, do nothing
+    }
+
+    // --- 1. Gather Inputs ---
+    // This node's inputs come from the outputs of other nodes.
+    std::vector<GLuint> input_textures;
+    for (const auto& input_pin : node->input_pins) {
+        // Find the link connected to this pin
+        for (const auto& link : links) {
+            if (link.to_pin_id == input_pin.id) {
+                // We found the source node, we must evaluate it first.
+                evaluate_node(link.from_node_id, base_ctx); // RECURSIVE CALL
+                
+                // Get the result from the now-evaluated source node
+                input_textures.push_back(nodes[link.from_node_id]->result_texture);
+                break;
+            }
         }
-
-        // Setup context for the current effect
-        EffectContext ctx{
-            .input_texture = current_input_texture,
-            .output_fbo = target_fbo,
-            .time = time,
-            .resolution = resolution
-        };
-
-        // Process the effect
-        node->Process(ctx);
-
-        // Update the input texture for the *next* effect in the chain
-        if (target_fbo == temp_fbo_A) {
-            current_input_texture = temp_tex_A;
-        } else if (target_fbo == temp_fbo_B) {
-            current_input_texture = temp_tex_B;
-        }
     }
 
-    // Clean up temporary ping-pong resources
-    if (temp_fbo_A != 0) {
-        destroy_temp_fbo(temp_fbo_A, temp_tex_A);
-    }
-    if (temp_fbo_B != 0) {
-        destroy_temp_fbo(temp_fbo_B, temp_tex_B);
-    }
+    // --- 2. Process This Node ---
+    // We now have all the input textures needed.
+    // The node will process them and save the output in its own result_texture.
+    // This requires a temporary FBO.
+    GLuint output_tex_for_this_node;
+    GLuint temp_fbo = create_temp_fbo(base_ctx.resolution, output_tex_for_this_node);
+    
+    EffectContext node_ctx = base_ctx;
+    node_ctx.output_fbo = temp_fbo;
+    
+    node->Process(input_textures, node_ctx); // Call the node's own logic
+
+    // Store the result and mark as evaluated
+    node->result_texture = output_tex_for_this_node;
+    node->is_evaluated_this_frame = true;
+    
+    // The temp_fbo can be deleted, but the texture cannot, as other nodes need it.
+    // Managing the lifetime of these result_textures is a complex but important detail.
+    glDeleteFramebuffers(1, &temp_fbo);
 }
 
 // Load a LUT from file (supports common 3D LUT formats)
@@ -505,9 +540,10 @@ bool LUTColorGradingNode::loadLUT(const std::string& path) {
     return true;
 }
 
-void LUTColorGradingNode::Process(const EffectContext& ctx) {
-    if (!enabled || ctx.input_texture == 0 || lut_texture == 0)
-        return;
+void LUTColorGradingNode::Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) {
+    if (!enabled || inputs.empty() || inputs[0] == 0 || lut_texture == 0) return;
+
+    GLuint input_texture = inputs[0];
     
     // Load shader program (consider caching this instead of loading every frame)
     GLuint lut_program = LoadShaderProgram("shaders/lut.vert", "shaders/lut.frag");
@@ -525,7 +561,7 @@ void LUTColorGradingNode::Process(const EffectContext& ctx) {
     
     // Bind the input texture
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, ctx.input_texture);
+    glBindTexture(GL_TEXTURE_2D, input_texture);
     glUniform1i(glGetUniformLocation(lut_program, "u_Texture"), 0);
     
     // Bind the LUT texture
@@ -613,9 +649,10 @@ bool MaskEffectNode::loadMaskTexture(const std::string& path) {
 
 
 // NEW: Implementation for MaskEffectNode::Process
-void MaskEffectNode::Process(const EffectContext& ctx) {
-    if (!enabled || ctx.input_texture == 0 || mask_type == MaskType::None)
-        return; // Don't process if disabled, no input, or mask type is None
+void MaskEffectNode::Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) {
+    if (!enabled || inputs.empty() || inputs[0] == 0 || mask_type == MaskType::None) return;
+
+    GLuint input_texture = inputs[0];
 
     // Load shader program (consider caching)
     GLuint mask_program = LoadShaderProgram("shaders/mask.vert", "shaders/mask.frag");
@@ -731,7 +768,7 @@ void MaskEffectNode::Process(const EffectContext& ctx) {
     }
 
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, ctx.input_texture);
+    glBindTexture(GL_TEXTURE_2D, input_texture);
     glUniform1i(glGetUniformLocation(mask_program, "u_Texture"), 0);
 
     RenderFullscreenQuad(); 
@@ -820,15 +857,10 @@ GLuint MaskEffectNode::RunGrabCut(const DecodedFrame& current_clip_frame,
     return generated_texture_id;
 }
 
-void SolidColorEffectNode::Process(const EffectContext& ctx) {
-    if (!enabled || ctx.input_texture == 0) {
-        // If disabled, should we pass through or do nothing?
-        // For an effect chain, a disabled effect usually means pass-through.
-        // This needs to be handled by EffectGraph or by this node outputting input_texture.
-        // For now, assume EffectGraph handles passthrough if node is disabled.
-        // If called directly and disabled, it just returns, output_fbo isn't touched.
-        return;
-    }
+void SolidColorEffectNode::Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) {
+    if (!enabled || inputs.empty() || inputs[0] == 0) return;
+
+    GLuint input_texture = inputs[0];
 
     // Consider caching shader programs
     static GLuint program = 0;
@@ -858,7 +890,7 @@ void SolidColorEffectNode::Process(const EffectContext& ctx) {
     glUniform1f(glGetUniformLocation(program, "u_BlendWithOriginal"), eval_blend);
 
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, ctx.input_texture);
+    glBindTexture(GL_TEXTURE_2D, input_texture);
     glUniform1i(glGetUniformLocation(program, "u_OriginalTexture"), 0);
 
     RenderFullscreenQuad(); // Your existing utility
@@ -867,10 +899,10 @@ void SolidColorEffectNode::Process(const EffectContext& ctx) {
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }
 
-void GradientEffectNode::Process(const EffectContext& ctx) {
-    if (!enabled || ctx.input_texture == 0) {
-        return;
-    }
+void GradientEffectNode::Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) {
+    if (!enabled || inputs.empty() || inputs[0] == 0) return;
+
+    GLuint input_texture = inputs[0];
 
     static GLuint program = 0;
     if (program == 0) {
@@ -912,7 +944,7 @@ void GradientEffectNode::Process(const EffectContext& ctx) {
     glUniform1f(glGetUniformLocation(program, "u_Intensity"), eval_intensity);
 
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, ctx.input_texture);
+    glBindTexture(GL_TEXTURE_2D, input_texture);
     glUniform1i(glGetUniformLocation(program, "u_OriginalTexture"), 0);
 
     RenderFullscreenQuad();
@@ -966,14 +998,10 @@ void DropShadowEffectNode::EnsureTempResources(int width, int height) {
 }
 
 
-void DropShadowEffectNode::Process(const EffectContext& ctx) {
-    if (!enabled || ctx.input_texture == 0) {
-        // If this node is disabled, the EffectGraph should ideally just pass
-        // ctx.input_texture to the next node or to the final output_fbo.
-        // If this Process is called directly, we might need to copy input to output here.
-        // For now, assume EffectGraph handles passthrough of disabled nodes correctly.
-        return;
-    }
+void DropShadowEffectNode::Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) {
+    if (!enabled || inputs.empty() || inputs[0] == 0) return;
+
+    GLuint input_texture = inputs[0];
 
     EnsureTempResources((int)ctx.resolution.x, (int)ctx.resolution.y);
     if (temp_fbo1 == 0) { // Resources couldn't be created
@@ -997,7 +1025,7 @@ void DropShadowEffectNode::Process(const EffectContext& ctx) {
             glUseProgram(passthrough_prog);
 
             glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, ctx.input_texture);
+            glBindTexture(GL_TEXTURE_2D, input_texture);
             glUniform1i(glGetUniformLocation(passthrough_prog, "u_Texture"), 0); // Ensure your texture.frag uses u_Texture
 
             RenderFullscreenQuad(); // Your existing utility
@@ -1039,7 +1067,7 @@ void DropShadowEffectNode::Process(const EffectContext& ctx) {
     
     glUseProgram(extract_alpha_prog);
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, ctx.input_texture); // Input is the result of previous effects (e.g. masking)
+    glBindTexture(GL_TEXTURE_2D, input_texture); // Input is the result of previous effects (e.g. masking)
     glUniform1i(glGetUniformLocation(extract_alpha_prog, "u_InputTexture"), 0);
     RenderFullscreenQuad();
 
@@ -1110,14 +1138,16 @@ void DropShadowEffectNode::Process(const EffectContext& ctx) {
     glUseProgram(0);
     glBindFramebuffer(GL_FRAMEBUFFER, last_fbo);
     glViewport(last_vp[0], last_vp[1], last_vp[2], last_vp[3]);
-    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, 0);
-    glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, 0);
+    glActiveTexture(GL_TEXTURE0); 
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glActiveTexture(GL_TEXTURE1); 
+    glBindTexture(GL_TEXTURE_2D, 0);
 }
 
-void ChromaKeyNode::Process(const EffectContext& ctx) {
-    if (!enabled || ctx.input_texture == 0) {
-        return;
-    }
+void ChromaKeyNode::Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) {
+    if (!enabled || inputs.empty() || inputs[0] == 0) return;
+
+    GLuint input_texture = inputs[0];
 
     // Load shader program (consider caching this for performance)
     GLuint chroma_key_program = LoadShaderProgram("shaders/passthrough.vert", "shaders/chroma_key.frag");
@@ -1145,7 +1175,7 @@ void ChromaKeyNode::Process(const EffectContext& ctx) {
 
     // Bind the input texture to texture unit 0
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, ctx.input_texture);
+    glBindTexture(GL_TEXTURE_2D, input_texture);
     glUniform1i(glGetUniformLocation(chroma_key_program, "u_Texture"), 0);
 
     // Draw a fullscreen quad to apply the effect

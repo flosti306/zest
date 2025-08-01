@@ -6,6 +6,7 @@
 #include <ostream>
 #include <iostream>
 #include <sstream>
+#include <map>
 #include <glm/glm.hpp>
 #include <glad/glad.h> // Include glad for OpenGL function loading
 #include <SDL3/SDL.h>
@@ -26,6 +27,14 @@ void RenderFullscreenQuad(float width, float height);
 
 GLuint LoadShaderProgram(const std::string& vert_path, const std::string& frag_path);
 
+struct EffectNode;
+
+// Represents an input or output "pin" on a node
+struct Pin {
+    int id;
+    EffectNode* node; // The node this pin belongs to
+    std::string name;
+};
 
 struct EffectContext {
     GLuint input_texture = 0; // Texture to process
@@ -35,44 +44,129 @@ struct EffectContext {
 };
 
 struct EffectNode {
+    int id; // Every node now needs a unique ID
     std::string name = "Unnamed Effect";
     bool enabled = true;
+    ImVec2 editor_pos; // Store position in the node editor
+
+    // Each node has a list of input and output pins
+    std::vector<Pin> input_pins;
+    std::vector<Pin> output_pins;
+
+    // Cache the result of this node's processing for one frame
+    GLuint result_texture = 0;
+    bool is_evaluated_this_frame = false;
 
     virtual ~EffectNode() = default;
-    virtual void Process(const EffectContext& ctx) = 0;
 
+    // Process is now given a list of its input textures
+    virtual void Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) = 0;
+    
     virtual std::shared_ptr<EffectNode> clone() const = 0;
+
+protected:
+    // Helper to create pins in constructors
+    void add_pin(bool is_input, const std::string& pin_name) {
+        static int next_pin_id = 1; // Global pin ID counter
+        if (is_input) {
+            input_pins.push_back({next_pin_id++, this, pin_name});
+        } else {
+            output_pins.push_back({next_pin_id++, this, pin_name});
+        }
+    }
+};
+
+// Represents a connection between two pins
+struct Link {
+    int id;
+    int from_node_id, to_node_id;
+    int from_pin_id, to_pin_id;
+};
+
+struct SourceClipNode : public EffectNode {
+    SourceClipNode() {
+        name = "Source Clip";
+        add_pin(false, "Source"); // Add one output pin
+    }
+
+    // This node doesn't process anything; it's just a starting point.
+    // The evaluation engine will assign its texture manually.
+    void Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) override {}
+
+    std::shared_ptr<EffectNode> clone() const override {
+        return std::make_shared<SourceClipNode>(*this);
+    }
+};
+
+// A concrete node representing the final output of the graph.
+struct FinalOutputNode : public EffectNode {
+    FinalOutputNode() {
+        name = "Final Output";
+        add_pin(true, "Final Image"); // Add one input pin
+    }
+
+    // This node is just a sink. The evaluation engine takes its input
+    // and blits it to the final framebuffer.
+    void Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) override {}
+
+    std::shared_ptr<EffectNode> clone() const override {
+        return std::make_shared<FinalOutputNode>(*this);
+    }
+};
+
+struct EffectGraph {
+    std::map<int, std::shared_ptr<EffectNode>> nodes;
+    std::vector<Link> links;
+    std::vector<int> node_order;
+    int next_node_id = 1;
+
+    // The start and end points of the graph
+    int input_node_id = 0;
+    int output_node_id = 0;
+
+    EffectGraph() {
+        // Create instances of our new CONCRETE node types.
+        auto input_node = std::make_shared<SourceClipNode>();
+        input_node_id = next_node_id++;
+        input_node->id = input_node_id;
+        nodes[input_node_id] = input_node;
+
+        auto output_node = std::make_shared<FinalOutputNode>();
+        output_node_id = next_node_id++;
+        output_node->id = output_node_id;
+        nodes[output_node_id] = output_node;
+
+        static int next_link_id = 1; // This could be a member variable if preferred
+        links.push_back({
+            next_link_id++, // Use a normal, positive, unique ID
+            input_node_id, output_node_id,
+            input_node->output_pins[0].id, output_node->input_pins[0].id
+        });
+    }
+    
+    // ... (deep copy constructor and processing methods)
+    void ProcessSimpleList(GLuint source_clip_texture, GLuint final_output_fbo, float time, glm::vec2 resolution);
+    void ProcessNodeGraph(GLuint source_clip_texture, GLuint final_output_fbo, float time, glm::vec2 resolution);
+private:
+    void evaluate_node(int node_id, const EffectContext& base_ctx);
 };
 
 struct GaussianBlurNode : public EffectNode {
     float blur_amount = 5.0f;
 
-    void Process(const EffectContext& ctx) override;
+    GaussianBlurNode() {
+        name = "Gaussian Blur";
+        add_pin(true, "Image");  // One input pin
+        add_pin(false, "Image"); // One output pin
+    }
+
+    void Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) override;
 
     std::shared_ptr<EffectNode> clone() const override {
         auto new_node = std::make_shared<GaussianBlurNode>();
         *new_node = *this; // Member-wise copy is fine here
         return new_node;
     }
-};
-
-struct EffectGraph {
-    std::vector<std::shared_ptr<EffectNode>> nodes;
-
-    // Default constructor
-    EffectGraph() = default;
-
-    // --- NEW: Deep copy constructor ---
-    EffectGraph(const EffectGraph& other) {
-        for (const auto& node : other.nodes) {
-            if (node) {
-                nodes.push_back(node->clone());
-            }
-        }
-    }
-
-    void Process(GLuint input_tex, GLuint output_fbo, float time, glm::vec2 resolution);
-
 };
 
 struct ColorGradingNode : public EffectNode {
@@ -86,9 +180,11 @@ struct ColorGradingNode : public EffectNode {
     
     ColorGradingNode() {
         name = "Color Grading";
+        add_pin(true, "Image");
+        add_pin(false, "Image");
     }
     
-    void Process(const EffectContext& ctx) override;
+    void Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) override;
 
     std::shared_ptr<EffectNode> clone() const override {
         auto new_node = std::make_shared<ColorGradingNode>();
@@ -110,6 +206,8 @@ struct LUTColorGradingNode : public EffectNode {
     
     LUTColorGradingNode() {
         name = "LUT Color Grading";
+        add_pin(true, "Image");
+        add_pin(false, "Image");
     }
     
     ~LUTColorGradingNode() {
@@ -121,7 +219,7 @@ struct LUTColorGradingNode : public EffectNode {
     // Load a LUT from file (supports common 3D LUT formats)
     bool loadLUT(const std::string& path);
     
-    void Process(const EffectContext& ctx) override;
+    void Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) override;
 
     std::shared_ptr<EffectNode> clone() const override {
         auto new_node = std::make_shared<LUTColorGradingNode>();
@@ -185,6 +283,8 @@ struct MaskEffectNode : public EffectNode {
 
     MaskEffectNode() {
         name = "Mask";
+        add_pin(true, "Image");
+        add_pin(false, "Image");
     }
 
     ~MaskEffectNode() override {
@@ -208,7 +308,7 @@ struct MaskEffectNode : public EffectNode {
     // Function to load a texture mask
     bool loadMaskTexture(const std::string& path);
 
-    void Process(const EffectContext& ctx) override;
+    void Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) override;
 
 
     enum class GrabCutInitMode { RECT, MASK };
@@ -241,9 +341,11 @@ struct SolidColorEffectNode : public EffectNode {
 
     SolidColorEffectNode() {
         name = "Solid Color Overlay";
+        add_pin(true, "Image");
+        add_pin(false, "Image");
     }
 
-    void Process(const EffectContext& ctx) override;
+    void Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) override;
 
     std::shared_ptr<EffectNode> clone() const override {
         auto new_node = std::make_shared<SolidColorEffectNode>();
@@ -285,9 +387,11 @@ struct GradientEffectNode : public EffectNode {
 
     GradientEffectNode() {
         name = "Gradient Overlay";
+        add_pin(true, "Image");
+        add_pin(false, "Image");
     }
 
-    void Process(const EffectContext& ctx) override;
+    void Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) override;
 
     std::shared_ptr<EffectNode> clone() const override {
         auto new_node = std::make_shared<GradientEffectNode>();
@@ -320,6 +424,8 @@ struct DropShadowEffectNode : public EffectNode {
 
     DropShadowEffectNode() {
         name = "Drop Shadow";
+        add_pin(true, "Image");
+        add_pin(false, "Image");
     }
 
     ~DropShadowEffectNode() override {
@@ -331,7 +437,7 @@ struct DropShadowEffectNode : public EffectNode {
     // Helper to manage internal FBOs/textures
     void EnsureTempResources(int width, int height);
 
-    void Process(const EffectContext& ctx) override;
+    void Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) override;
 
     std::shared_ptr<EffectNode> clone() const override {
         auto new_node = std::make_shared<DropShadowEffectNode>();
@@ -352,9 +458,11 @@ struct ChromaKeyNode : public EffectNode {
 
     ChromaKeyNode() {
         name = "Chroma Key";
+        add_pin(true, "Image");
+        add_pin(false, "Image");
     }
 
-    void Process(const EffectContext& ctx) override;
+    void Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) override;
 
     std::shared_ptr<EffectNode> clone() const override {
         auto new_node = std::make_shared<ChromaKeyNode>();

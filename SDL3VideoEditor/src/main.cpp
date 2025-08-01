@@ -38,6 +38,7 @@ extern "C" {
 #include <imgui.h>
 #include <imgui_impl_sdl3.h>
 #include <imgui_impl_opengl3.h>
+#include <imnodes.h>
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_video.h>
 #include <SDL3/SDL_image.h> // Use SDL_image for SDL3
@@ -1126,6 +1127,7 @@ void RenderPreviewWindow(GLResources& res, int preview_width, int preview_height
 void DrawEffectUIForClip(Clip& clip, GLResources& gl_resources);
 void OpenSmartMaskEditor(MaskEffectNode* node, GLuint clip_texture_for_background, const DecodedFrame& decoded_frame_for_cv);
 void DrawSmartMaskEditorWindow();
+void DrawNodeEditorWindow(Clip* clip);
 
 // --- Main Application ---
 int main(int argc, char* argv[]) {
@@ -1174,7 +1176,9 @@ int main(int argc, char* argv[]) {
     // === ImGui Setup ===
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
-    ImGuiIO& io = ImGui::GetIO(); (void)io;
+    ImNodes::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    (void)io;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
     io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
@@ -1208,8 +1212,10 @@ int main(int argc, char* argv[]) {
     GLResources gl_resources;
     if (!setup_gl_resources(gl_resources, preview_width, preview_height)) {
         std::cerr << "Failed to initialize initial GL resources!" << std::endl;
-        ImGui_ImplOpenGL3_Shutdown(); ImGui_ImplSDL3_Shutdown(); ImGui::DestroyContext();
-        // Use SDL_GL_DestroyContext (Fix 1)
+        ImNodes::DestroyContext();
+        ImGui_ImplOpenGL3_Shutdown();
+        ImGui_ImplSDL3_Shutdown();
+        ImGui::DestroyContext();
         SDL_GL_DestroyContext(gl_context);
         SDL_DestroyWindow(window); SDL_Quit();
         return 1;
@@ -1608,6 +1614,7 @@ int main(int argc, char* argv[]) {
 
         DrawTimelineEditor(clips, playhead_time, max_duration, zoom_factor, layers_changed, selected_clip, gl_resources, last_playhead_time_for_velocity);
         RenderPreviewWindow(gl_resources, preview_width, preview_height);
+        DrawNodeEditorWindow(selected_clip); // Pass selected_clip if needed
 
         if (mask_editor_open) {
             DrawMaskEditorWindow(gl_resources); // Pass gl_resources if needed inside editor
@@ -1616,32 +1623,6 @@ int main(int argc, char* argv[]) {
         if (smart_mask_editor_open) {
             DrawSmartMaskEditorWindow(); // Call this similar to DrawMaskEditorWindow
         }
-
-        /* // --- The PREVIEW RENDERING LOGIC ---
-        // This logic is now simpler. We don't need fancy rate limiting because the main thread
-        // is so fast. We just update the texture if the playhead moved.
-       // This block runs every frame to keep the preview live.
-        
-        // 1. Update video textures from cache for any active video clips.
-        // This is a fast, non-blocking operation that just uploads the best-available frame.
-        for (const auto& clip : active_clips_for_preview) {
-            if (is_video_file(clip.path)) {
-                auto it = gl_resources.video_cache.find(clip.path);
-                if (it != gl_resources.video_cache.end() && it->second.is_initialized) {
-                    double media_time = (playhead_time - clip.start_time) + clip.media_start;
-                    // update_texture_from_cache is now robust enough to handle any media_time value.
-                    update_texture_from_cache(it->second, media_time, !playing);
-                }
-            }
-        }
-        
-        // 2. Render the final composite frame to the FBO using the now-updated textures.
-        // This is a fast GPU-only operation.
-        std::vector<Clip> sorted_clips = clips;
-        std::sort(sorted_clips.begin(), sorted_clips.end(), [](const Clip& a, const Clip& b) { return a.layer < b.layer; });
-        render_frame(gl_resources, playhead_time, sorted_clips, preview_width, preview_height);
-
-        RenderPreviewWindow(gl_resources.render_tex, preview_width, preview_height); */
 
         ImGui::Begin("Inspector"); ApplyWindowBackgroundGradients();
         if (selected_clip) {
@@ -1734,9 +1715,11 @@ int main(int argc, char* argv[]) {
         } else ImGui::Text("No clip selected.");
         ImGui::End(); // End Inspector
 
-        ImGui::Begin("Active Clips"); ApplyWindowBackgroundGradients();
+        ImGui::Begin("Active Clips");
+        ApplyWindowBackgroundGradients();
         ImGui::Text("Clip List (%zu clips):", clips.size()); ImGui::Separator();
-        ImGuiListClipper clipper; clipper.Begin(clips.size());
+        ImGuiListClipper clipper;
+        clipper.Begin(clips.size());
         while (clipper.Step()) {
             for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
                  Clip& clip = clips[i]; bool is_selected = (&clip == selected_clip); ImGui::PushID(i);
@@ -1789,9 +1772,12 @@ int main(int argc, char* argv[]) {
     stop_decoder_worker();
 
     if (ImGui::GetIO().UserData) { IM_DELETE((GradientData*)ImGui::GetIO().UserData); ImGui::GetIO().UserData = nullptr; }
-    cleanup_gl_resources(gl_resources); cleanup_video_resources(gl_resources);
-    ImGui_ImplOpenGL3_Shutdown(); ImGui_ImplSDL3_Shutdown(); ImGui::DestroyContext();
-    // Use SDL_GL_DestroyContext (Fix 1)
+    cleanup_gl_resources(gl_resources);
+    cleanup_video_resources(gl_resources);
+    ImNodes::DestroyContext();
+    ImGui_ImplOpenGL3_Shutdown();
+    ImGui_ImplSDL3_Shutdown();
+    ImGui::DestroyContext();
     SDL_GL_DestroyContext(gl_context);
     SDL_DestroyWindow(window); SDL_Quit(); avformat_network_deinit();
     std::cout << "Exiting application." << std::endl;
@@ -2693,14 +2679,21 @@ void DrawEffectUIForClip(Clip& clip, GLResources& gl_resources) {
         clip.effect_graph = std::make_shared<EffectGraph>();
 
     if (ImGui::CollapsingHeader("Effects")) {
+        auto& graph = *clip.effect_graph;
+
         if (ImGui::Button("Add Gaussian Blur")) {
             auto blur = std::make_shared<GaussianBlurNode>();
+            int new_id = graph.next_node_id++; // Get a new unique ID
+            blur->id = new_id;
             blur->name = "Blur";
             blur->blur_amount = 5.0f;
-            clip.effect_graph->nodes.push_back(blur);
+            graph.nodes[new_id] = blur;         // Add to the map
+            graph.node_order.push_back(new_id); // Add ID to the order vector
         }
         if (ImGui::Button("Add Color Grading")) {
             auto color_grade = std::make_shared<ColorGradingNode>();
+            int new_id = graph.next_node_id++;
+            color_grade->id = new_id;
             color_grade->name = "Color Grading";
             color_grade->brightness = 0.0f;
             color_grade->contrast = 1.0f;
@@ -2708,48 +2701,66 @@ void DrawEffectUIForClip(Clip& clip, GLResources& gl_resources) {
             color_grade->temperature = 0.0f;
             color_grade->tint = 0.0f;
             color_grade->gamma = 1.0f;
-            clip.effect_graph->nodes.push_back(color_grade);
+            graph.nodes[new_id] = color_grade;
+            graph.node_order.push_back(new_id);
         }
         if (ImGui::Button("Add LUT")) {
             auto lut = std::make_shared<LUTColorGradingNode>();
+            int new_id = graph.next_node_id++;
+            lut->id = new_id;
             lut->name = "LUT Color Grading";
             lut->strength = 1.0f;
-            clip.effect_graph->nodes.push_back(lut);
+            graph.nodes[new_id] = lut;
+            graph.node_order.push_back(new_id);
         }
         if (ImGui::Button("Add Mask")) {
             auto mask = std::make_shared<MaskEffectNode>();
+            int new_id = graph.next_node_id++;
+            mask->id = new_id;
             // Default settings are set in constructor
-            clip.effect_graph->nodes.push_back(mask);
+            graph.nodes[new_id] = mask;
+            graph.node_order.push_back(new_id);
         }
         if (ImGui::Button("Add Solid Color Overlay")) {
             auto solid_fx = std::make_shared<SolidColorEffectNode>();
+            int new_id = graph.next_node_id++;
+            solid_fx->id = new_id;
             // Default values are set in constructor
-            clip.effect_graph->nodes.push_back(solid_fx);
+            graph.nodes[new_id] = solid_fx;
+            graph.node_order.push_back(new_id);
         }
         if (ImGui::Button("Add Gradient Overlay")) {
             auto grad_fx = std::make_shared<GradientEffectNode>();
+            int new_id = graph.next_node_id++;
+            grad_fx->id = new_id;
             // Default values are set in constructor
-            clip.effect_graph->nodes.push_back(grad_fx);
+            graph.nodes[new_id] = grad_fx;
+            graph.node_order.push_back(new_id);
         }
         if (ImGui::Button("Add Drop Shadow")) {
             auto shadow_fx = std::make_shared<DropShadowEffectNode>();
+            int new_id = graph.next_node_id++;
+            shadow_fx->id = new_id;
             // Default values are in constructor
-            clip.effect_graph->nodes.push_back(shadow_fx);
+            graph.nodes[new_id] = shadow_fx;
+            graph.node_order.push_back(new_id);
         }
         if (ImGui::Button("Add Chroma Key")) {
             auto keyer = std::make_shared<ChromaKeyNode>();
-            clip.effect_graph->nodes.push_back(keyer);
+            int new_id = graph.next_node_id++;
+            keyer->id = new_id;
+            graph.nodes[new_id] = keyer;
+            graph.node_order.push_back(new_id);
         }
 
-        for (size_t i = 0; i < clip.effect_graph->nodes.size(); ++i) {
+        for (size_t i = 0; i < clip.effect_graph->node_order.size(); ++i) {
             bool effect_changed = false;
-            auto& node = clip.effect_graph->nodes[i];
-            ImGui::PushID(int(i));
+            int node_id = clip.effect_graph->node_order[i];
+            auto& node = clip.effect_graph->nodes[node_id];
 
-            // Store the node name in a local variable for convenience
+            ImGui::PushID(node_id); // Use the STABLE node ID for ImGui
+
             const char* node_name = node->name.c_str();
-
-            // Set the TreeNode to be open by default for better UX
             ImGui::SetNextItemOpen(true, ImGuiCond_Once);
 
             // --- DROP TARGET (Part 1) ---
@@ -2764,14 +2775,14 @@ void DrawEffectUIForClip(Clip& clip, GLResources& gl_resources) {
                     size_t target_index = i;
 
                     if (source_index != target_index) {
-                        // PushUndo(clips, playhead_time, zoom_factor); // Save state before reordering
+                        //PushUndo(clips, playhead_time, zoom_factor);
 
-                        // Reorder the vector
-                        auto item_to_move = clip.effect_graph->nodes[source_index];
-                        clip.effect_graph->nodes.erase(clip.effect_graph->nodes.begin() + source_index);
-                        clip.effect_graph->nodes.insert(clip.effect_graph->nodes.begin() + target_index, item_to_move);
+                        // --- REORDER THE node_order VECTOR ---
+                        auto& order_vec = clip.effect_graph->node_order;
+                        int id_to_move = order_vec[source_index];
+                        order_vec.erase(order_vec.begin() + source_index);
+                        order_vec.insert(order_vec.begin() + target_index, id_to_move);
                         
-                        // We modified the vector, so we should break the loop for this frame to avoid issues.
                         ImGui::EndDragDropTarget();
                         ImGui::PopID();
                         break; 
@@ -2780,18 +2791,11 @@ void DrawEffectUIForClip(Clip& clip, GLResources& gl_resources) {
                 ImGui::EndDragDropTarget();
             }
 
-            // The actual effect UI is inside a TreeNode
             if (ImGui::TreeNode(node_name)) {
-                
-                // --- DRAG SOURCE ---
-                // If we start dragging the TreeNode, it becomes the drag source.
+                // --- DRAG SOURCE LOGIC (Now sends the vector index 'i') ---
                 if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
-                    // Set the payload to be the index of the effect we are dragging.
                     ImGui::SetDragDropPayload("EFFECT_NODE_DND", &i, sizeof(size_t));
-
-                    // Display a preview of what's being dragged
                     ImGui::Text("Moving: %s", node_name);
-                    
                     ImGui::EndDragDropSource();
                 }
                 // Render type-specific UI
@@ -3043,7 +3047,9 @@ void DrawEffectUIForClip(Clip& clip, GLResources& gl_resources) {
                 // Render common UI elements
                 ImGui::Checkbox("Enabled", &node->enabled);
                 if (ImGui::Button("Remove")) {
-                    clip.effect_graph->nodes.erase(clip.effect_graph->nodes.begin() + i);
+                    auto& graph = *clip.effect_graph;
+                    graph.nodes.erase(node_id); // Remove from map by key
+                    graph.node_order.erase(graph.node_order.begin() + i); // Remove from order vector by iterator
                     ImGui::TreePop();
                     ImGui::PopID();
                     break;
@@ -3342,4 +3348,97 @@ void DrawSmartMaskEditorWindow() {
         last_grabcut_mask_cv.release();
         smart_mask_is_initialized = false;
     }
+}
+
+void DrawNodeEditorWindow(Clip* clip) {
+    if (!clip || !clip->effect_graph) return;
+    auto& graph = clip->effect_graph;
+
+    ImGui::SetNextWindowSize(ImVec2(800, 600), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Node Editor")) {
+        ImNodes::BeginNodeEditor();
+
+        // --- Render Nodes and Pins ---
+        for (auto const& [node_id, node_ptr] : graph->nodes) {
+            ImNodes::BeginNode(node_id);
+            
+            ImNodes::BeginNodeTitleBar();
+            ImGui::TextUnformatted(node_ptr->name.c_str());
+            ImNodes::EndNodeTitleBar();
+
+            for (const auto& pin : node_ptr->input_pins) {
+                ImNodes::BeginInputAttribute(pin.id);
+                ImGui::TextUnformatted(pin.name.c_str());
+                ImNodes::EndInputAttribute();
+            }
+
+            for (const auto& pin : node_ptr->output_pins) {
+                ImNodes::BeginOutputAttribute(pin.id);
+                ImGui::TextUnformatted(pin.name.c_str());
+                ImNodes::EndOutputAttribute();
+            }
+
+            ImNodes::EndNode();
+        }
+
+        // --- Render Links ---
+        for (const auto& link : graph->links) {
+            ImNodes::Link(link.id, link.from_pin_id, link.to_pin_id);
+        }
+
+        ImNodes::EndNodeEditor();
+
+        // --- NEW & CORRECTED Link Management for Intuitive UX ---
+
+        // 1. Handle CREATING new links (and replacing existing ones)
+        int start_pin_id, end_pin_id;
+        if (ImNodes::IsLinkCreated(&start_pin_id, &end_pin_id)) {
+            // Find which pin is the input and which is the output.
+            Pin* from_pin = nullptr;
+            Pin* to_pin = nullptr; // This will be the input pin
+            for (auto& [node_id, node] : graph->nodes) {
+                for (auto& pin : node->output_pins) if (pin.id == start_pin_id || pin.id == end_pin_id) from_pin = &pin;
+                for (auto& pin : node->input_pins) if (pin.id == start_pin_id || pin.id == end_pin_id) to_pin = &pin;
+            }
+
+            // Ensure the connection is valid (output to input on different nodes)
+            if (from_pin && to_pin && from_pin->node != to_pin->node) {
+                // Check if the target input pin already has a connection. If so, remove it.
+                // This creates the intuitive "replace" behavior.
+                auto& links_vec = graph->links;
+                links_vec.erase(
+                    std::remove_if(links_vec.begin(), links_vec.end(), [to_pin](const Link& link) {
+                        return link.to_pin_id == to_pin->id;
+                    }),
+                    links_vec.end()
+                );
+
+                // Add the new link
+                static int next_link_id = 100; // User-created links
+                graph->links.push_back({
+                    next_link_id++,
+                    from_pin->node->id, to_pin->node->id,
+                    from_pin->id, to_pin->id
+                });
+            }
+        }
+
+        // 2. Handle DELETING links by dragging them off a pin
+        int dropped_pin_id;
+        // The 'true' argument is crucial: it reports drops that started from an existing link.
+        if (ImNodes::IsLinkDropped(&dropped_pin_id, true)) {
+            // A drag started on a pin and was dropped in empty space.
+            // We need to find the link that was attached to this pin and delete it.
+            auto& links_vec = graph->links;
+            links_vec.erase(
+                std::remove_if(links_vec.begin(), links_vec.end(), [dropped_pin_id](const Link& link) {
+                    // Check if either end of the link matches the pin the drag started from.
+                    return link.from_pin_id == dropped_pin_id || link.to_pin_id == dropped_pin_id;
+                }),
+                links_vec.end()
+            );
+        }
+        // --- END NEW & CORRECTED LOGIC ---
+    }
+    ImGui::End();
 }
