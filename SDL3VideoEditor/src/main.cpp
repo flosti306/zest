@@ -2745,7 +2745,55 @@ void DrawEffectUIForClip(Clip& clip, GLResources& gl_resources) {
             bool effect_changed = false;
             auto& node = clip.effect_graph->nodes[i];
             ImGui::PushID(int(i));
-            if (ImGui::TreeNode(node->name.c_str())) {
+
+            // Store the node name in a local variable for convenience
+            const char* node_name = node->name.c_str();
+
+            // Set the TreeNode to be open by default for better UX
+            ImGui::SetNextItemOpen(true, ImGuiCond_Once);
+
+            // --- DROP TARGET (Part 1) ---
+            // We make the whole item a drop target.
+            // We draw a separator *before* the item to visualize the drop zone.
+            // When hovering, this separator will change color.
+            ImGui::Separator();
+
+            if (ImGui::BeginDragDropTarget()) {
+                if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("EFFECT_NODE_DND")) {
+                    size_t source_index = *(const size_t*)payload->Data;
+                    size_t target_index = i;
+
+                    if (source_index != target_index) {
+                        // PushUndo(clips, playhead_time, zoom_factor); // Save state before reordering
+
+                        // Reorder the vector
+                        auto item_to_move = clip.effect_graph->nodes[source_index];
+                        clip.effect_graph->nodes.erase(clip.effect_graph->nodes.begin() + source_index);
+                        clip.effect_graph->nodes.insert(clip.effect_graph->nodes.begin() + target_index, item_to_move);
+                        
+                        // We modified the vector, so we should break the loop for this frame to avoid issues.
+                        ImGui::EndDragDropTarget();
+                        ImGui::PopID();
+                        break; 
+                    }
+                }
+                ImGui::EndDragDropTarget();
+            }
+
+            // The actual effect UI is inside a TreeNode
+            if (ImGui::TreeNode(node_name)) {
+                
+                // --- DRAG SOURCE ---
+                // If we start dragging the TreeNode, it becomes the drag source.
+                if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
+                    // Set the payload to be the index of the effect we are dragging.
+                    ImGui::SetDragDropPayload("EFFECT_NODE_DND", &i, sizeof(size_t));
+
+                    // Display a preview of what's being dragged
+                    ImGui::Text("Moving: %s", node_name);
+                    
+                    ImGui::EndDragDropSource();
+                }
                 // Render type-specific UI
                 if (auto blur = std::dynamic_pointer_cast<GaussianBlurNode>(node)) {
                     ImGui::SliderFloat("Blur Amount", &blur->blur_amount, 0.0f, 50.0f);
