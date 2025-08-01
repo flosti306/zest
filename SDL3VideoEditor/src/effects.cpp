@@ -1035,193 +1035,108 @@ void GradientEffectNode::Process(const std::vector<GLuint>& inputs, const Effect
 }
 
 void DropShadowEffectNode::EnsureTempResources(int width, int height) {
-    bool recreate = false;
-    if (temp_fbo1 == 0) recreate = true;
-
-    // Check if texture sizes match current resolution (optional, but good for performance)
-    if (!recreate && temp_tex1_alpha_mask != 0) {
+    // This function now uses the create_temp_fbo helper for cleaner code.
+    // Check if resources exist and match the required size.
+    if (temp_fbo1 != 0 && temp_tex1 != 0) {
         GLint tex_w, tex_h;
-        glBindTexture(GL_TEXTURE_2D, temp_tex1_alpha_mask);
+        glBindTexture(GL_TEXTURE_2D, temp_tex1);
         glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &tex_w);
         glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &tex_h);
         glBindTexture(GL_TEXTURE_2D, 0);
-        if (tex_w != width || tex_h != height) recreate = true;
+        if (tex_w == width && tex_h == height) {
+            return; // Resources are already valid.
+        }
     }
 
-    if (recreate) {
-        if (temp_fbo1 != 0) glDeleteFramebuffers(1, &temp_fbo1);
-        if (temp_tex1_alpha_mask != 0) glDeleteTextures(1, &temp_tex1_alpha_mask);
-        if (temp_tex2_blurred_alpha != 0) glDeleteTextures(1, &temp_tex2_blurred_alpha);
+    // If we reached here, we need to (re)create everything.
+    if (temp_fbo1 != 0) destroy_temp_fbo(temp_fbo1, temp_tex1);
+    if (temp_fbo2 != 0) destroy_temp_fbo(temp_fbo2, temp_tex2);
 
-        glGenFramebuffers(1, &temp_fbo1);
+    temp_fbo1 = create_temp_fbo(glm::vec2(width, height), temp_tex1);
+    temp_fbo2 = create_temp_fbo(glm::vec2(width, height), temp_tex2);
 
-        // Texture for isolated alpha mask (single channel needed, but RGB often easier with FBOs)
-        glGenTextures(1, &temp_tex1_alpha_mask);
-        glBindTexture(GL_TEXTURE_2D, temp_tex1_alpha_mask);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-
-        // Texture for blurred alpha mask
-        glGenTextures(1, &temp_tex2_blurred_alpha);
-        glBindTexture(GL_TEXTURE_2D, temp_tex2_blurred_alpha);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-
-        glBindTexture(GL_TEXTURE_2D, 0);
-        std::cout << "DropShadowEffectNode: Recreated temp resources." << std::endl;
+    if (temp_fbo1 == 0 || temp_fbo2 == 0) {
+        std::cerr << "DropShadow: Failed to create temporary FBOs." << std::endl;
     }
 }
 
 
 void DropShadowEffectNode::Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) {
-    if (!enabled || inputs.empty() || inputs[0] == 0) return;
-
+    if (!enabled || inputs.empty() || inputs[0] == 0) {
+        // If disabled, we must do a passthrough to not break the chain.
+        // The evaluation engine's passthrough logic handles this.
+        return;
+    }
     GLuint input_texture = inputs[0];
 
     EnsureTempResources((int)ctx.resolution.x, (int)ctx.resolution.y);
-    if (temp_fbo1 == 0) { // Resources couldn't be created
-        std::cerr << "DropShadow: Failed to ensure temporary resources. Passing through input." << std::endl;
-        
-        // --- CORRECTED FALLBACK ---
-        // Render ctx.input_texture to ctx.output_fbo using a passthrough shader
-        static GLuint passthrough_prog = 0; // Cache this simple shader
-        if (passthrough_prog == 0) {
-            // Assuming you have a "texture.frag" that just samples u_Texture and outputs it
-            // and a "passthrough.vert"
-            passthrough_prog = LoadShaderProgram("shaders/passthrough.vert", "shaders/texture.frag");
-        }
+    if (temp_fbo1 == 0 || temp_fbo2 == 0) return; // Can't proceed without resources
 
-        if (passthrough_prog != 0) {
-            GLint last_fbo_fb; glGetIntegerv(GL_FRAMEBUFFER_BINDING, &last_fbo_fb); // Renamed to avoid conflict
-            GLint last_vp_fb[4]; glGetIntegerv(GL_VIEWPORT, last_vp_fb);
-
-            glBindFramebuffer(GL_FRAMEBUFFER, ctx.output_fbo);
-            glViewport(0, 0, (int)ctx.resolution.x, (int)ctx.resolution.y);
-            glUseProgram(passthrough_prog);
-
-            glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, input_texture);
-            glUniform1i(glGetUniformLocation(passthrough_prog, "u_Texture"), 0); // Ensure your texture.frag uses u_Texture
-
-            RenderFullscreenQuad(); // Your existing utility
-
-            glUseProgram(0);
-            glBindFramebuffer(GL_FRAMEBUFFER, last_fbo_fb);
-            glViewport(last_vp_fb[0], last_vp_fb[1], last_vp_fb[2], last_vp_fb[3]);
-        } else {
-            std::cerr << "DropShadow: Passthrough shader for fallback failed to load." << std::endl;
-            // If even passthrough fails, the output FBO will contain whatever was in it before.
-        }
-        return; // Exit Process method after fallback
-    }
-
-    // Shader Caching (basic)
+    // Shader Caching
     static GLuint extract_alpha_prog = 0;
-    static GLuint blur_prog = 0; // Assuming you have a blur shader program accessible
+    static GLuint blur_prog = 0;
     static GLuint composite_prog = 0;
+    if (extract_alpha_prog == 0) extract_alpha_prog = LoadShaderProgram("shaders/blur.vert", "shaders/extract_alpha.frag");
+    if (blur_prog == 0) blur_prog = LoadShaderProgram("shaders/blur.vert", "shaders/blur.frag");
+    if (composite_prog == 0) composite_prog = LoadShaderProgram("shaders/blur.vert", "shaders/apply_shadow_and_composite.frag");
+    if (!extract_alpha_prog || !blur_prog || !composite_prog) return;
 
-    if (extract_alpha_prog == 0) extract_alpha_prog = LoadShaderProgram("shaders/passthrough.vert", "shaders/extract_alpha.frag");
-    if (blur_prog == 0) blur_prog = LoadShaderProgram("shaders/blur.vert", "shaders/blur.frag"); // Your existing blur shader
-    if (composite_prog == 0) composite_prog = LoadShaderProgram("shaders/passthrough.vert", "shaders/apply_shadow_and_composite.frag");
-
-    if (extract_alpha_prog == 0 || blur_prog == 0 || composite_prog == 0) {
-        std::cerr << "DropShadow: Failed to load one or more shaders." << std::endl;
-        // Fallback: copy input to output
-        // (Same blit logic as above if temp_fbo1 creation failed)
-        return;
-    }
-
+    // Backup GL state
     GLint last_fbo; glGetIntegerv(GL_FRAMEBUFFER_BINDING, &last_fbo);
     GLint last_vp[4]; glGetIntegerv(GL_VIEWPORT, last_vp);
     glViewport(0, 0, (int)ctx.resolution.x, (int)ctx.resolution.y);
 
-    // --- Pass 1: Extract Alpha from (already masked) input ---
+    // --- Pass 1: Extract Alpha from input texture -> temp_fbo1 ---
     glBindFramebuffer(GL_FRAMEBUFFER, temp_fbo1);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, temp_tex1_alpha_mask, 0);
-    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) { /* handle error */ glBindFramebuffer(GL_FRAMEBUFFER, last_fbo); return; }
-    
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
     glUseProgram(extract_alpha_prog);
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, input_texture); // Input is the result of previous effects (e.g. masking)
+    glBindTexture(GL_TEXTURE_2D, input_texture);
     glUniform1i(glGetUniformLocation(extract_alpha_prog, "u_InputTexture"), 0);
     RenderFullscreenQuad();
 
-    // --- Pass 2: Horizontal Blur of the Alpha Mask ---
-    // (Using your existing GaussianBlurNode logic as a template, simplified here)
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, temp_tex2_blurred_alpha, 0); // Output to blurred_alpha
-    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) { /* handle error */ }
-
-    float eval_blur = blur_amount;
-    if(!blur_amount_track.keyframes.empty()) eval_blur = blur_amount_track.Evaluate(ctx.time);
-
-
+    // --- Pass 2: Horizontal Blur from temp_tex1 -> temp_fbo2 ---
+    glBindFramebuffer(GL_FRAMEBUFFER, temp_fbo2);
+    glClear(GL_COLOR_BUFFER_BIT); // No need for glClearColor again
     glUseProgram(blur_prog);
-    glUniform1f(glGetUniformLocation(blur_prog, "u_BlurAmount"), eval_blur);
-    glUniform2f(glGetUniformLocation(blur_prog, "u_Direction"), 1.0f / ctx.resolution.x, 0.0f); // Horizontal
+    glUniform1f(glGetUniformLocation(blur_prog, "u_BlurAmount"), blur_amount);
     glUniform2f(glGetUniformLocation(blur_prog, "u_Resolution"), ctx.resolution.x, ctx.resolution.y);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, temp_tex1_alpha_mask); // Input is the extracted alpha
+    glUniform2f(glGetUniformLocation(blur_prog, "u_Direction"), 1.0f, 0.0f);
+    glBindTexture(GL_TEXTURE_2D, temp_tex1); // Read from the result of Pass 1
     glUniform1i(glGetUniformLocation(blur_prog, "u_Texture"), 0);
     RenderFullscreenQuad();
 
-    // --- Pass 3: Vertical Blur of the Alpha Mask (result stored in temp_tex1_alpha_mask for reuse) ---
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, temp_tex1_alpha_mask, 0); // Output back to tex1 (ping-pong)
-    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) { /* handle error */ }
-
-    // glUseProgram(blur_prog); // Already active
-    glUniform2f(glGetUniformLocation(blur_prog, "u_Direction"), 0.0f, 1.0f / ctx.resolution.y); // Vertical
-    // u_BlurAmount and u_Resolution are still set
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, temp_tex2_blurred_alpha); // Input is H-blurred alpha
-    // u_Texture uniform still set to 0
+    // --- Pass 3: Vertical Blur from temp_tex2 -> temp_fbo1 ---
+    glBindFramebuffer(GL_FRAMEBUFFER, temp_fbo1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    // glUseProgram(blur_prog) is still active
+    glUniform2f(glGetUniformLocation(blur_prog, "u_Direction"), 0.0f, 1.0f);
+    glBindTexture(GL_TEXTURE_2D, temp_tex2); // Read from the result of Pass 2
     RenderFullscreenQuad();
-    // Now temp_tex1_alpha_mask contains the fully blurred shadow shape
+    // Now, temp_tex1 contains the final, fully blurred shadow mask.
 
-    // --- Pass 4: Composite shadow and original content to final output FBO ---
+    // --- Pass 4: Composite original and blurred mask -> final output_fbo ---
     glBindFramebuffer(GL_FRAMEBUFFER, ctx.output_fbo);
-    // glViewport is already set
-    
+    glClear(GL_COLOR_BUFFER_BIT);
     glUseProgram(composite_prog);
-
-    glm::vec2 eval_offset = offset;
-    if(!offset_x_track.keyframes.empty()) eval_offset.x = offset_x_track.Evaluate(ctx.time);
-    if(!offset_y_track.keyframes.empty()) eval_offset.y = offset_y_track.Evaluate(ctx.time);
-
-    glm::vec4 eval_shadow_color = shadow_color;
-    if(!shadow_r_track.keyframes.empty()) eval_shadow_color.r = shadow_r_track.Evaluate(ctx.time);
-    // ... evaluate G, B, A for shadow_color similarly ...
-
-
-    // Convert normalized UV offset to pixel offset for precise control if needed,
-    // or keep it normalized for resolution independence. The shader uses it as UV offset.
-    glUniform2f(glGetUniformLocation(composite_prog, "u_ShadowOffset"), eval_offset.x, eval_offset.y);
-    glUniform4f(glGetUniformLocation(composite_prog, "u_ShadowColor"), eval_shadow_color.r, eval_shadow_color.g, eval_shadow_color.b, eval_shadow_color.a);
-    glUniform2f(glGetUniformLocation(composite_prog, "u_PixelSize"), 1.0f/ctx.resolution.x, 1.0f/ctx.resolution.y);
-
-
+    glUniform2f(glGetUniformLocation(composite_prog, "u_ShadowOffset"), offset.x, offset.y);
+    glUniform4f(glGetUniformLocation(composite_prog, "u_ShadowColor"), shadow_color.r, shadow_color.g, shadow_color.b, shadow_color.a);
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, ctx.input_texture); // Original (masked) content
+    glBindTexture(GL_TEXTURE_2D, input_texture); // The original content
     glUniform1i(glGetUniformLocation(composite_prog, "u_OriginalContentTexture"), 0);
-
     glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, temp_tex1_alpha_mask); // Blurred shadow mask
+    glBindTexture(GL_TEXTURE_2D, temp_tex1); // The final blurred shadow mask
     glUniform1i(glGetUniformLocation(composite_prog, "u_BlurredShadowMaskTexture"), 1);
-
     RenderFullscreenQuad();
 
-    // Restore
-    glUseProgram(0);
+    // Restore GL state
     glBindFramebuffer(GL_FRAMEBUFFER, last_fbo);
     glViewport(last_vp[0], last_vp[1], last_vp[2], last_vp[3]);
-    glActiveTexture(GL_TEXTURE0); 
+    glUseProgram(0);
+    glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, 0);
-    glActiveTexture(GL_TEXTURE1); 
+    glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 

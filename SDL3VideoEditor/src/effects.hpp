@@ -431,10 +431,12 @@ struct DropShadowEffectNode : public EffectNode {
     KeyframeTrack<float> shadow_a_track;
     KeyframeTrack<float> blur_amount_track;
 
-    // Internal state for multipass rendering
+     // --- UPDATED: Internal state for multipass rendering ---
+    // We now use two FBOs for a more robust ping-pong.
     GLuint temp_fbo1 = 0;
-    GLuint temp_tex1_alpha_mask = 0; // Stores the isolated alpha of the masked input
-    GLuint temp_tex2_blurred_alpha = 0; // Stores the blurred alpha mask
+    GLuint temp_tex1 = 0; // Will be used for alpha mask, then final blurred alpha
+    GLuint temp_fbo2 = 0;
+    GLuint temp_tex2 = 0; // Will be used for the intermediate horizontal blur
 
     DropShadowEffectNode() {
         name = "Drop Shadow";
@@ -444,8 +446,9 @@ struct DropShadowEffectNode : public EffectNode {
 
     ~DropShadowEffectNode() override {
         if (temp_fbo1 != 0) glDeleteFramebuffers(1, &temp_fbo1);
-        if (temp_tex1_alpha_mask != 0) glDeleteTextures(1, &temp_tex1_alpha_mask);
-        if (temp_tex2_blurred_alpha != 0) glDeleteTextures(1, &temp_tex2_blurred_alpha);
+        if (temp_tex1 != 0) glDeleteTextures(1, &temp_tex1);
+        if (temp_fbo2 != 0) glDeleteFramebuffers(1, &temp_fbo2);
+        if (temp_tex2 != 0) glDeleteTextures(1, &temp_tex2);
     }
 
     // Helper to manage internal FBOs/textures
@@ -458,8 +461,9 @@ struct DropShadowEffectNode : public EffectNode {
         *new_node = *this;
         // IMPORTANT: Do not share transient resources. The cloned node must create its own.
         new_node->temp_fbo1 = 0;
-        new_node->temp_tex1_alpha_mask = 0;
-        new_node->temp_tex2_blurred_alpha = 0;
+        new_node->temp_tex1 = 0;
+        new_node->temp_fbo2 = 0;
+        new_node->temp_tex2 = 0;
         return new_node;
     }
 };

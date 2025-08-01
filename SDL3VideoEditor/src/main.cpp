@@ -3030,7 +3030,7 @@ void DrawEffectUIForClip(Clip& clip, GLResources& gl_resources) {
 
 
                     ImGui::SliderFloat("Blur Amount##Shadow", &shadow_node->blur_amount, 0.0f, 50.0f);
-                    DrawKeyframeTrackEditor("Blur Amount##Shadow", shadow_node->blur_amount_track);
+                    DrawKeyframeTrackEditor("Blur Amount", shadow_node->blur_amount_track);
                 } else if (auto keyer = std::dynamic_pointer_cast<ChromaKeyNode>(node)) {
                     ImGui::Text("Chroma Key Properties:");
                     ImGui::ColorEdit3("Key Color", &keyer->key_color.x);
