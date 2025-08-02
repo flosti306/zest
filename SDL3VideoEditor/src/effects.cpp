@@ -162,14 +162,275 @@ void RenderFullscreenQuad() {
     glBindVertexArray(0);
 }
 
-void GaussianBlurNode::Process(const EffectContext& ctx) {
-    if (!enabled || ctx.input_texture == 0)
-        return;
+void EffectGraph::cleanup_transient_resources() {
+    for (GLuint tex_id : transient_textures) {
+        if (tex_id != 0) { // Safety check
+            glDeleteTextures(1, &tex_id);
+        }
+    }
+    transient_textures.clear();
+}
+
+// Private helper function to recursively evaluate
+void EffectGraph::evaluate_node(int node_id, const EffectContext& base_ctx) {
+    auto& node = nodes.at(node_id);
+    if (node->is_evaluated_this_frame) {
+        return; // Already processed this node, its result is ready.
+    }
+
+    // --- NEW: Passthrough logic for disabled nodes ---
+    if (!node->enabled) {
+        // A disabled node's result is simply the result of its first input.
+        // This makes it act like a straight wire.
+
+        // We still need to evaluate the upstream node to get its texture.
+        // This logic assumes a simple chain (one input). For multi-input nodes,
+        // you might pass through the primary input (e.g., input_pins[0]).
+        GLuint passthrough_texture = 0;
+        if (!node->input_pins.empty()) {
+            // Find the link connected to this node's first input pin.
+            for (const auto& link : links) {
+                if (link.to_pin_id == node->input_pins[0].id) {
+                    // Recursively evaluate the node that feeds into this disabled one.
+                    evaluate_node(link.from_node_id, base_ctx);
+                    
+                    // The result we pass through is the result from that upstream node.
+                    passthrough_texture = nodes.at(link.from_node_id)->result_texture;
+                    break;
+                }
+            }
+        }
+
+        // Set this disabled node's result to be its input's result.
+        node->result_texture = passthrough_texture;
+        node->is_evaluated_this_frame = true;
+        return; // CRITICAL: Skip the rest of the function.
+    }
+
+    // 1. Gather the textures from all incoming connections.
+    std::vector<GLuint> input_textures;
+    for (const auto& input_pin : node->input_pins) {
+        for (const auto& link : links) {
+            if (link.to_pin_id == input_pin.id) {
+                // This link connects to our input pin.
+                // We must recursively evaluate the node that FEEDS this link.
+                evaluate_node(link.from_node_id, base_ctx);
+                
+                // Now that the source node is evaluated, get its result texture.
+                input_textures.push_back(nodes.at(link.from_node_id)->result_texture);
+                break; // Move to the next input pin
+            }
+        }
+    }
+
+    // 2. Process this node.
+    GLuint output_tex_for_this_node = 0;
+    GLuint temp_fbo = create_temp_fbo(base_ctx.resolution, output_tex_for_this_node);
+    
+    // Add the newly created texture to our list for cleanup at the end of the frame.
+    transient_textures.push_back(output_tex_for_this_node);
+    
+    EffectContext node_ctx = base_ctx;
+    node_ctx.output_fbo = temp_fbo;
+    
+    node->Process(input_textures, node_ctx);
+
+    // 3. Store the result and mark the node as finished for this frame.
+    node->result_texture = output_tex_for_this_node;
+    node->is_evaluated_this_frame = true;
+    
+    glDeleteFramebuffers(1, &temp_fbo); // The FBO is no longer needed, but the texture is.
+}
+
+
+void EffectGraph::rebuild_links_from_order() {
+    // 1. Clear all existing links.
+    links.clear();
+    static int next_link_id = 1;
+
+    // --- NEW: Auto-layout logic ---
+    const float START_X = 50.0f;
+    const float START_Y = 100.0f;
+    const float HORIZONTAL_SPACING = 250.0f;
+    float current_x = START_X;
+    // --- END NEW ---
+
+    // 2. Position and connect the Source Clip node.
+    auto& source_node = nodes.at(input_node_id);
+    source_node->editor_pos = ImVec2(current_x, START_Y);
+    current_x += HORIZONTAL_SPACING;
+
+    // 3. Handle the main chain of effects.
+    if (node_order.empty()) {
+        // If no effects, connect Source directly to Output.
+        auto& output_node = nodes.at(output_node_id);
+        links.push_back({
+            next_link_id++,
+            input_node_id, output_node_id,
+            source_node->output_pins[0].id, output_node->input_pins[0].id
+        });
+    } else {
+        // Connect Source to the first effect.
+        int first_effect_id = node_order.front();
+        auto& first_effect_node = nodes.at(first_effect_id);
+        links.push_back({
+            next_link_id++,
+            input_node_id, first_effect_id,
+            source_node->output_pins[0].id, first_effect_node->input_pins[0].id
+        });
+
+        // Loop through effects, positioning and linking them.
+        for (size_t i = 0; i < node_order.size(); ++i) {
+            int current_node_id = node_order[i];
+            auto& current_node = nodes.at(current_node_id);
+            current_node->editor_pos = ImVec2(current_x, START_Y);
+            current_x += HORIZONTAL_SPACING;
+
+            // If not the last node, link it to the next one.
+            if (i < node_order.size() - 1) {
+                int next_node_id = node_order[i + 1];
+                auto& next_node = nodes.at(next_node_id);
+                links.push_back({
+                    next_link_id++,
+                    current_node_id, next_node_id,
+                    current_node->output_pins[0].id, next_node->input_pins[0].id
+                });
+            }
+        }
+
+        // Connect the last effect to the Final Output.
+        int last_effect_id = node_order.back();
+        auto& last_effect_node = nodes.at(last_effect_id);
+        auto& output_node = nodes.at(output_node_id);
+        links.push_back({
+            next_link_id++,
+            last_effect_id, output_node_id,
+            last_effect_node->output_pins[0].id, output_node->input_pins[0].id
+        });
+    }
+    
+    // 4. Position the Final Output node last.
+    auto& output_node = nodes.at(output_node_id);
+    output_node->editor_pos = ImVec2(current_x, START_Y);
+}
+
+void EffectGraph::ProcessNodeGraph(GLuint source_clip_texture, GLuint final_output_fbo, float time, glm::vec2 resolution) {
+    if (nodes.empty() || output_node_id == 0) return;
+
+    // --- Step 2 becomes Step 1: Reset the evaluation state for the CURRENT frame ---
+    for (auto& [id, node] : nodes) {
+        node->is_evaluated_this_frame = false;
+        node->result_texture = 0;
+    }
+    
+    // --- Step 3 becomes Step 2: Set the starting condition ---
+    nodes.at(input_node_id)->result_texture = source_clip_texture;
+    nodes.at(input_node_id)->is_evaluated_this_frame = true;
+
+    // --- Step 4 becomes Step 3: Start the recursive evaluation ---
+    EffectContext base_ctx = { 0, 0, time, resolution };
+    evaluate_node(output_node_id, base_ctx);
+
+    // --- 5. Copy the final result to the destination FBO ---
+    // After evaluation, the final image is stored in the output node's input's source.
+    GLuint final_texture = 0;
+    for (const auto& link : links) {
+        if (link.to_node_id == output_node_id) {
+            final_texture = nodes.at(link.from_node_id)->result_texture;
+            break;
+        }
+    }
+
+    if (final_texture != 0) {
+        // Use a simple passthrough shader to copy the final texture to the output FBO.
+        static GLuint copy_shader = 0;
+        if (copy_shader == 0) copy_shader = LoadShaderProgram("shaders/passthrough.vert", "shaders/texture.frag");
+        if (copy_shader == 0) return;
+
+        glBindFramebuffer(GL_FRAMEBUFFER, final_output_fbo);
+        glViewport(0, 0, (int)resolution.x, (int)resolution.y);
+        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+
+        glUseProgram(copy_shader);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, final_texture);
+        glUniform1i(glGetUniformLocation(copy_shader, "u_Texture"), 0);
+
+        RenderFullscreenQuad();
+
+        glUseProgram(0);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    } else {
+        // Handle case where output node is not connected
+    }
+}
+
+// Load a LUT from file (supports common 3D LUT formats)
+bool LUTColorGradingNode::loadLUT(const std::string& path) {
+    // If we already have a texture, delete it
+    if (lut_texture != 0) {
+        glDeleteTextures(1, &lut_texture);
+        lut_texture = 0;
+    }
+    
+    // Load the image using a library like stb_image
+    int width, height, channels;
+    SDL_Surface* surface = SDL_LoadBMP(path.c_str());
+    if (!surface) {
+        std::cerr << "Failed to load LUT image: " << path << " - " << SDL_GetError() << std::endl;
+        return false;
+    }
+
+    // Ensure the surface is in the correct format (RGBA)
+    SDL_Surface* converted_surface = SDL_ConvertSurface(surface, SDL_PIXELFORMAT_RGBA32);
+    SDL_DestroySurface(surface);
+
+    if (!converted_surface) {
+        std::cerr << "Failed to convert LUT image to RGBA format: " << SDL_GetError() << std::endl;
+        return false;
+    }
+
+    unsigned char* data = static_cast<unsigned char*>(converted_surface->pixels);
+    width = converted_surface->w;
+    height = converted_surface->h;
+    channels = 4; // RGBA
+
+    // Free the surface after extracting the data
+    SDL_DestroySurface(converted_surface);
+    
+    if (!data) {
+        std::cerr << "Failed to load LUT image: " << path << std::endl;
+        return false;
+    }
+    
+    // Create the texture
+    glGenTextures(1, &lut_texture);
+    glBindTexture(GL_TEXTURE_2D, lut_texture);
+    
+    // Set texture parameters
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    
+    // Upload the texture data
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
+    
+    // Save the path
+    lut_path = path;
+    
+    return true;
+}
+
+void GaussianBlurNode::Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) {
+    if (!enabled || inputs.empty() || inputs[0] == 0) return;
         
     // Load shader program (consider caching this instead of loading every frame)
     GLuint blur_shader_program = LoadShaderProgram("shaders/blur.vert", "shaders/blur.frag");
-    if (blur_shader_program == 0)
-        return;
+    if (blur_shader_program == 0) return;
+
+    GLuint input_texture = inputs[0];
         
     // Setup modern shader VAO/VBO for the fullscreen quad
     static GLuint quadVAO = 0;
@@ -233,7 +494,7 @@ void GaussianBlurNode::Process(const EffectContext& ctx) {
     
     // Bind input texture
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, ctx.input_texture);
+    glBindTexture(GL_TEXTURE_2D, input_texture);
     glUniform1i(glGetUniformLocation(blur_shader_program, "u_Texture"), 0);
     
     // Draw
@@ -265,14 +526,14 @@ void GaussianBlurNode::Process(const EffectContext& ctx) {
     destroy_temp_fbo(horizontal_fbo, horizontal_tex);
 }
 
-void ColorGradingNode::Process(const EffectContext& ctx) {
-    if (!enabled || ctx.input_texture == 0)
-        return;
+void ColorGradingNode::Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) {
+    if (!enabled || inputs.empty() || inputs[0] == 0) return;
+
+    GLuint input_texture = inputs[0];
     
     // Load shader program (consider caching this instead of loading every frame)
     GLuint color_grade_program = LoadShaderProgram("shaders/colorgrade.vert", "shaders/colorgrade.frag");
-    if (color_grade_program == 0)
-        return;
+    if (color_grade_program == 0) return;
     
     // Setup render state
     glBindFramebuffer(GL_FRAMEBUFFER, ctx.output_fbo);
@@ -292,7 +553,7 @@ void ColorGradingNode::Process(const EffectContext& ctx) {
     
     // Bind input texture
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, ctx.input_texture);
+    glBindTexture(GL_TEXTURE_2D, input_texture);
     glUniform1i(glGetUniformLocation(color_grade_program, "u_Texture"), 0);
     
     // Draw fullscreen quad using our improved RenderFullscreenQuad function
@@ -360,154 +621,10 @@ void ColorGradingNode::applyFadedFilmPreset() {
     ColorGradingNode::gamma = 1.0f;
 }
 
+void LUTColorGradingNode::Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) {
+    if (!enabled || inputs.empty() || inputs[0] == 0 || lut_texture == 0) return;
 
-void EffectGraph::Process(GLuint input_tex, GLuint output_fbo, float time, glm::vec2 resolution) {
-    // Count how many nodes are actually enabled
-    int enabled_nodes_count = 0;
-    for (const auto& node : nodes) {
-        if (node && node->enabled) { // Added null check for safety
-            enabled_nodes_count++;
-        }
-    }
-
-    // If no effects are enabled, just do a simple passthrough of the input texture to the output
-    if (enabled_nodes_count == 0) {
-        static GLuint copy_shader = 0;
-        if (copy_shader == 0) copy_shader = LoadShaderProgram("shaders/passthrough.vert", "shaders/texture.frag");
-        if (copy_shader == 0) return;
-
-        glBindFramebuffer(GL_FRAMEBUFFER, output_fbo);
-        glViewport(0, 0, (int)resolution.x, (int)resolution.y);
-        glClear(GL_COLOR_BUFFER_BIT); // Clear destination before passthrough
-
-        glUseProgram(copy_shader);
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, input_tex);
-        glUniform1i(glGetUniformLocation(copy_shader, "u_Texture"), 0);
-
-        RenderFullscreenQuad();
-
-        glUseProgram(0);
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        return;
-    }
-
-    // We have effects to process. Setup ping-pong buffers if we have more than one.
-    GLuint temp_fbo_A = 0, temp_tex_A = 0;
-    GLuint temp_fbo_B = 0, temp_tex_B = 0;
-
-    if (enabled_nodes_count > 1) {
-        temp_fbo_A = create_temp_fbo(resolution, temp_tex_A);
-        temp_fbo_B = create_temp_fbo(resolution, temp_tex_B);
-    }
-
-    GLuint current_input_texture = input_tex;
-    int processed_count = 0;
-
-    for (const auto& node : nodes) {
-        if (!node || !node->enabled) continue;
-
-        processed_count++;
-
-        // Determine the target FBO for this effect pass
-        GLuint target_fbo;
-        if (processed_count == enabled_nodes_count) {
-            // This is the last active effect, so it renders to the final output_fbo
-            target_fbo = output_fbo;
-        } else {
-            // This is an intermediate effect, render to a temporary ping-pong FBO.
-            // Odd-numbered effects (1st, 3rd, ..) write to A. Even-numbered (2nd, 4th, ..) write to B.
-            target_fbo = (processed_count % 2 == 1) ? temp_fbo_A : temp_fbo_B;
-        }
-
-        // Setup context for the current effect
-        EffectContext ctx{
-            .input_texture = current_input_texture,
-            .output_fbo = target_fbo,
-            .time = time,
-            .resolution = resolution
-        };
-
-        // Process the effect
-        node->Process(ctx);
-
-        // Update the input texture for the *next* effect in the chain
-        if (target_fbo == temp_fbo_A) {
-            current_input_texture = temp_tex_A;
-        } else if (target_fbo == temp_fbo_B) {
-            current_input_texture = temp_tex_B;
-        }
-    }
-
-    // Clean up temporary ping-pong resources
-    if (temp_fbo_A != 0) {
-        destroy_temp_fbo(temp_fbo_A, temp_tex_A);
-    }
-    if (temp_fbo_B != 0) {
-        destroy_temp_fbo(temp_fbo_B, temp_tex_B);
-    }
-}
-
-// Load a LUT from file (supports common 3D LUT formats)
-bool LUTColorGradingNode::loadLUT(const std::string& path) {
-    // If we already have a texture, delete it
-    if (lut_texture != 0) {
-        glDeleteTextures(1, &lut_texture);
-        lut_texture = 0;
-    }
-    
-    // Load the image using a library like stb_image
-    int width, height, channels;
-    SDL_Surface* surface = SDL_LoadBMP(path.c_str());
-    if (!surface) {
-        std::cerr << "Failed to load LUT image: " << path << " - " << SDL_GetError() << std::endl;
-        return false;
-    }
-
-    // Ensure the surface is in the correct format (RGBA)
-    SDL_Surface* converted_surface = SDL_ConvertSurface(surface, SDL_PIXELFORMAT_RGBA32);
-    SDL_DestroySurface(surface);
-
-    if (!converted_surface) {
-        std::cerr << "Failed to convert LUT image to RGBA format: " << SDL_GetError() << std::endl;
-        return false;
-    }
-
-    unsigned char* data = static_cast<unsigned char*>(converted_surface->pixels);
-    width = converted_surface->w;
-    height = converted_surface->h;
-    channels = 4; // RGBA
-
-    // Free the surface after extracting the data
-    SDL_DestroySurface(converted_surface);
-    
-    if (!data) {
-        std::cerr << "Failed to load LUT image: " << path << std::endl;
-        return false;
-    }
-    
-    // Create the texture
-    glGenTextures(1, &lut_texture);
-    glBindTexture(GL_TEXTURE_2D, lut_texture);
-    
-    // Set texture parameters
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    
-    // Upload the texture data
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
-    
-    // Save the path
-    lut_path = path;
-    
-    return true;
-}
-
-void LUTColorGradingNode::Process(const EffectContext& ctx) {
-    if (!enabled || ctx.input_texture == 0 || lut_texture == 0)
-        return;
+    GLuint input_texture = inputs[0];
     
     // Load shader program (consider caching this instead of loading every frame)
     GLuint lut_program = LoadShaderProgram("shaders/lut.vert", "shaders/lut.frag");
@@ -525,7 +642,7 @@ void LUTColorGradingNode::Process(const EffectContext& ctx) {
     
     // Bind the input texture
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, ctx.input_texture);
+    glBindTexture(GL_TEXTURE_2D, input_texture);
     glUniform1i(glGetUniformLocation(lut_program, "u_Texture"), 0);
     
     // Bind the LUT texture
@@ -613,9 +730,10 @@ bool MaskEffectNode::loadMaskTexture(const std::string& path) {
 
 
 // NEW: Implementation for MaskEffectNode::Process
-void MaskEffectNode::Process(const EffectContext& ctx) {
-    if (!enabled || ctx.input_texture == 0 || mask_type == MaskType::None)
-        return; // Don't process if disabled, no input, or mask type is None
+void MaskEffectNode::Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) {
+    if (!enabled || inputs.empty() || inputs[0] == 0 || mask_type == MaskType::None) return;
+
+    GLuint input_texture = inputs[0];
 
     // Load shader program (consider caching)
     GLuint mask_program = LoadShaderProgram("shaders/mask.vert", "shaders/mask.frag");
@@ -731,7 +849,7 @@ void MaskEffectNode::Process(const EffectContext& ctx) {
     }
 
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, ctx.input_texture);
+    glBindTexture(GL_TEXTURE_2D, input_texture);
     glUniform1i(glGetUniformLocation(mask_program, "u_Texture"), 0);
 
     RenderFullscreenQuad(); 
@@ -820,15 +938,10 @@ GLuint MaskEffectNode::RunGrabCut(const DecodedFrame& current_clip_frame,
     return generated_texture_id;
 }
 
-void SolidColorEffectNode::Process(const EffectContext& ctx) {
-    if (!enabled || ctx.input_texture == 0) {
-        // If disabled, should we pass through or do nothing?
-        // For an effect chain, a disabled effect usually means pass-through.
-        // This needs to be handled by EffectGraph or by this node outputting input_texture.
-        // For now, assume EffectGraph handles passthrough if node is disabled.
-        // If called directly and disabled, it just returns, output_fbo isn't touched.
-        return;
-    }
+void SolidColorEffectNode::Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) {
+    if (!enabled || inputs.empty() || inputs[0] == 0) return;
+
+    GLuint input_texture = inputs[0];
 
     // Consider caching shader programs
     static GLuint program = 0;
@@ -858,7 +971,7 @@ void SolidColorEffectNode::Process(const EffectContext& ctx) {
     glUniform1f(glGetUniformLocation(program, "u_BlendWithOriginal"), eval_blend);
 
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, ctx.input_texture);
+    glBindTexture(GL_TEXTURE_2D, input_texture);
     glUniform1i(glGetUniformLocation(program, "u_OriginalTexture"), 0);
 
     RenderFullscreenQuad(); // Your existing utility
@@ -867,10 +980,10 @@ void SolidColorEffectNode::Process(const EffectContext& ctx) {
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }
 
-void GradientEffectNode::Process(const EffectContext& ctx) {
-    if (!enabled || ctx.input_texture == 0) {
-        return;
-    }
+void GradientEffectNode::Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) {
+    if (!enabled || inputs.empty() || inputs[0] == 0) return;
+
+    GLuint input_texture = inputs[0];
 
     static GLuint program = 0;
     if (program == 0) {
@@ -912,7 +1025,7 @@ void GradientEffectNode::Process(const EffectContext& ctx) {
     glUniform1f(glGetUniformLocation(program, "u_Intensity"), eval_intensity);
 
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, ctx.input_texture);
+    glBindTexture(GL_TEXTURE_2D, input_texture);
     glUniform1i(glGetUniformLocation(program, "u_OriginalTexture"), 0);
 
     RenderFullscreenQuad();
@@ -922,202 +1035,115 @@ void GradientEffectNode::Process(const EffectContext& ctx) {
 }
 
 void DropShadowEffectNode::EnsureTempResources(int width, int height) {
-    bool recreate = false;
-    if (temp_fbo1 == 0) recreate = true;
-
-    // Check if texture sizes match current resolution (optional, but good for performance)
-    if (!recreate && temp_tex1_alpha_mask != 0) {
+    // This function now uses the create_temp_fbo helper for cleaner code.
+    // Check if resources exist and match the required size.
+    if (temp_fbo1 != 0 && temp_tex1 != 0) {
         GLint tex_w, tex_h;
-        glBindTexture(GL_TEXTURE_2D, temp_tex1_alpha_mask);
+        glBindTexture(GL_TEXTURE_2D, temp_tex1);
         glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &tex_w);
         glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &tex_h);
         glBindTexture(GL_TEXTURE_2D, 0);
-        if (tex_w != width || tex_h != height) recreate = true;
+        if (tex_w == width && tex_h == height) {
+            return; // Resources are already valid.
+        }
     }
 
-    if (recreate) {
-        if (temp_fbo1 != 0) glDeleteFramebuffers(1, &temp_fbo1);
-        if (temp_tex1_alpha_mask != 0) glDeleteTextures(1, &temp_tex1_alpha_mask);
-        if (temp_tex2_blurred_alpha != 0) glDeleteTextures(1, &temp_tex2_blurred_alpha);
+    // If we reached here, we need to (re)create everything.
+    if (temp_fbo1 != 0) destroy_temp_fbo(temp_fbo1, temp_tex1);
+    if (temp_fbo2 != 0) destroy_temp_fbo(temp_fbo2, temp_tex2);
 
-        glGenFramebuffers(1, &temp_fbo1);
+    temp_fbo1 = create_temp_fbo(glm::vec2(width, height), temp_tex1);
+    temp_fbo2 = create_temp_fbo(glm::vec2(width, height), temp_tex2);
 
-        // Texture for isolated alpha mask (single channel needed, but RGB often easier with FBOs)
-        glGenTextures(1, &temp_tex1_alpha_mask);
-        glBindTexture(GL_TEXTURE_2D, temp_tex1_alpha_mask);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-
-        // Texture for blurred alpha mask
-        glGenTextures(1, &temp_tex2_blurred_alpha);
-        glBindTexture(GL_TEXTURE_2D, temp_tex2_blurred_alpha);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-
-        glBindTexture(GL_TEXTURE_2D, 0);
-        std::cout << "DropShadowEffectNode: Recreated temp resources." << std::endl;
+    if (temp_fbo1 == 0 || temp_fbo2 == 0) {
+        std::cerr << "DropShadow: Failed to create temporary FBOs." << std::endl;
     }
 }
 
 
-void DropShadowEffectNode::Process(const EffectContext& ctx) {
-    if (!enabled || ctx.input_texture == 0) {
-        // If this node is disabled, the EffectGraph should ideally just pass
-        // ctx.input_texture to the next node or to the final output_fbo.
-        // If this Process is called directly, we might need to copy input to output here.
-        // For now, assume EffectGraph handles passthrough of disabled nodes correctly.
+void DropShadowEffectNode::Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) {
+    if (!enabled || inputs.empty() || inputs[0] == 0) {
+        // If disabled, we must do a passthrough to not break the chain.
+        // The evaluation engine's passthrough logic handles this.
         return;
     }
+    GLuint input_texture = inputs[0];
 
     EnsureTempResources((int)ctx.resolution.x, (int)ctx.resolution.y);
-    if (temp_fbo1 == 0) { // Resources couldn't be created
-        std::cerr << "DropShadow: Failed to ensure temporary resources. Passing through input." << std::endl;
-        
-        // --- CORRECTED FALLBACK ---
-        // Render ctx.input_texture to ctx.output_fbo using a passthrough shader
-        static GLuint passthrough_prog = 0; // Cache this simple shader
-        if (passthrough_prog == 0) {
-            // Assuming you have a "texture.frag" that just samples u_Texture and outputs it
-            // and a "passthrough.vert"
-            passthrough_prog = LoadShaderProgram("shaders/passthrough.vert", "shaders/texture.frag");
-        }
+    if (temp_fbo1 == 0 || temp_fbo2 == 0) return; // Can't proceed without resources
 
-        if (passthrough_prog != 0) {
-            GLint last_fbo_fb; glGetIntegerv(GL_FRAMEBUFFER_BINDING, &last_fbo_fb); // Renamed to avoid conflict
-            GLint last_vp_fb[4]; glGetIntegerv(GL_VIEWPORT, last_vp_fb);
-
-            glBindFramebuffer(GL_FRAMEBUFFER, ctx.output_fbo);
-            glViewport(0, 0, (int)ctx.resolution.x, (int)ctx.resolution.y);
-            glUseProgram(passthrough_prog);
-
-            glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, ctx.input_texture);
-            glUniform1i(glGetUniformLocation(passthrough_prog, "u_Texture"), 0); // Ensure your texture.frag uses u_Texture
-
-            RenderFullscreenQuad(); // Your existing utility
-
-            glUseProgram(0);
-            glBindFramebuffer(GL_FRAMEBUFFER, last_fbo_fb);
-            glViewport(last_vp_fb[0], last_vp_fb[1], last_vp_fb[2], last_vp_fb[3]);
-        } else {
-            std::cerr << "DropShadow: Passthrough shader for fallback failed to load." << std::endl;
-            // If even passthrough fails, the output FBO will contain whatever was in it before.
-        }
-        return; // Exit Process method after fallback
-    }
-
-    // Shader Caching (basic)
+    // Shader Caching
     static GLuint extract_alpha_prog = 0;
-    static GLuint blur_prog = 0; // Assuming you have a blur shader program accessible
+    static GLuint blur_prog = 0;
     static GLuint composite_prog = 0;
+    if (extract_alpha_prog == 0) extract_alpha_prog = LoadShaderProgram("shaders/blur.vert", "shaders/extract_alpha.frag");
+    if (blur_prog == 0) blur_prog = LoadShaderProgram("shaders/blur.vert", "shaders/blur.frag");
+    if (composite_prog == 0) composite_prog = LoadShaderProgram("shaders/blur.vert", "shaders/apply_shadow_and_composite.frag");
+    if (!extract_alpha_prog || !blur_prog || !composite_prog) return;
 
-    if (extract_alpha_prog == 0) extract_alpha_prog = LoadShaderProgram("shaders/passthrough.vert", "shaders/extract_alpha.frag");
-    if (blur_prog == 0) blur_prog = LoadShaderProgram("shaders/blur.vert", "shaders/blur.frag"); // Your existing blur shader
-    if (composite_prog == 0) composite_prog = LoadShaderProgram("shaders/passthrough.vert", "shaders/apply_shadow_and_composite.frag");
-
-    if (extract_alpha_prog == 0 || blur_prog == 0 || composite_prog == 0) {
-        std::cerr << "DropShadow: Failed to load one or more shaders." << std::endl;
-        // Fallback: copy input to output
-        // (Same blit logic as above if temp_fbo1 creation failed)
-        return;
-    }
-
+    // Backup GL state
     GLint last_fbo; glGetIntegerv(GL_FRAMEBUFFER_BINDING, &last_fbo);
     GLint last_vp[4]; glGetIntegerv(GL_VIEWPORT, last_vp);
     glViewport(0, 0, (int)ctx.resolution.x, (int)ctx.resolution.y);
 
-    // --- Pass 1: Extract Alpha from (already masked) input ---
+    // --- Pass 1: Extract Alpha from input texture -> temp_fbo1 ---
     glBindFramebuffer(GL_FRAMEBUFFER, temp_fbo1);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, temp_tex1_alpha_mask, 0);
-    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) { /* handle error */ glBindFramebuffer(GL_FRAMEBUFFER, last_fbo); return; }
-    
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
     glUseProgram(extract_alpha_prog);
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, ctx.input_texture); // Input is the result of previous effects (e.g. masking)
+    glBindTexture(GL_TEXTURE_2D, input_texture);
     glUniform1i(glGetUniformLocation(extract_alpha_prog, "u_InputTexture"), 0);
     RenderFullscreenQuad();
 
-    // --- Pass 2: Horizontal Blur of the Alpha Mask ---
-    // (Using your existing GaussianBlurNode logic as a template, simplified here)
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, temp_tex2_blurred_alpha, 0); // Output to blurred_alpha
-    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) { /* handle error */ }
-
-    float eval_blur = blur_amount;
-    if(!blur_amount_track.keyframes.empty()) eval_blur = blur_amount_track.Evaluate(ctx.time);
-
-
+    // --- Pass 2: Horizontal Blur from temp_tex1 -> temp_fbo2 ---
+    glBindFramebuffer(GL_FRAMEBUFFER, temp_fbo2);
+    glClear(GL_COLOR_BUFFER_BIT); // No need for glClearColor again
     glUseProgram(blur_prog);
-    glUniform1f(glGetUniformLocation(blur_prog, "u_BlurAmount"), eval_blur);
-    glUniform2f(glGetUniformLocation(blur_prog, "u_Direction"), 1.0f / ctx.resolution.x, 0.0f); // Horizontal
+    glUniform1f(glGetUniformLocation(blur_prog, "u_BlurAmount"), blur_amount);
     glUniform2f(glGetUniformLocation(blur_prog, "u_Resolution"), ctx.resolution.x, ctx.resolution.y);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, temp_tex1_alpha_mask); // Input is the extracted alpha
+    glUniform2f(glGetUniformLocation(blur_prog, "u_Direction"), 1.0f, 0.0f);
+    glBindTexture(GL_TEXTURE_2D, temp_tex1); // Read from the result of Pass 1
     glUniform1i(glGetUniformLocation(blur_prog, "u_Texture"), 0);
     RenderFullscreenQuad();
 
-    // --- Pass 3: Vertical Blur of the Alpha Mask (result stored in temp_tex1_alpha_mask for reuse) ---
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, temp_tex1_alpha_mask, 0); // Output back to tex1 (ping-pong)
-    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) { /* handle error */ }
-
-    // glUseProgram(blur_prog); // Already active
-    glUniform2f(glGetUniformLocation(blur_prog, "u_Direction"), 0.0f, 1.0f / ctx.resolution.y); // Vertical
-    // u_BlurAmount and u_Resolution are still set
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, temp_tex2_blurred_alpha); // Input is H-blurred alpha
-    // u_Texture uniform still set to 0
+    // --- Pass 3: Vertical Blur from temp_tex2 -> temp_fbo1 ---
+    glBindFramebuffer(GL_FRAMEBUFFER, temp_fbo1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    // glUseProgram(blur_prog) is still active
+    glUniform2f(glGetUniformLocation(blur_prog, "u_Direction"), 0.0f, 1.0f);
+    glBindTexture(GL_TEXTURE_2D, temp_tex2); // Read from the result of Pass 2
     RenderFullscreenQuad();
-    // Now temp_tex1_alpha_mask contains the fully blurred shadow shape
+    // Now, temp_tex1 contains the final, fully blurred shadow mask.
 
-    // --- Pass 4: Composite shadow and original content to final output FBO ---
+    // --- Pass 4: Composite original and blurred mask -> final output_fbo ---
     glBindFramebuffer(GL_FRAMEBUFFER, ctx.output_fbo);
-    // glViewport is already set
-    
+    glClear(GL_COLOR_BUFFER_BIT);
     glUseProgram(composite_prog);
-
-    glm::vec2 eval_offset = offset;
-    if(!offset_x_track.keyframes.empty()) eval_offset.x = offset_x_track.Evaluate(ctx.time);
-    if(!offset_y_track.keyframes.empty()) eval_offset.y = offset_y_track.Evaluate(ctx.time);
-
-    glm::vec4 eval_shadow_color = shadow_color;
-    if(!shadow_r_track.keyframes.empty()) eval_shadow_color.r = shadow_r_track.Evaluate(ctx.time);
-    // ... evaluate G, B, A for shadow_color similarly ...
-
-
-    // Convert normalized UV offset to pixel offset for precise control if needed,
-    // or keep it normalized for resolution independence. The shader uses it as UV offset.
-    glUniform2f(glGetUniformLocation(composite_prog, "u_ShadowOffset"), eval_offset.x, eval_offset.y);
-    glUniform4f(glGetUniformLocation(composite_prog, "u_ShadowColor"), eval_shadow_color.r, eval_shadow_color.g, eval_shadow_color.b, eval_shadow_color.a);
-    glUniform2f(glGetUniformLocation(composite_prog, "u_PixelSize"), 1.0f/ctx.resolution.x, 1.0f/ctx.resolution.y);
-
-
+    glUniform2f(glGetUniformLocation(composite_prog, "u_ShadowOffset"), offset.x, offset.y);
+    glUniform4f(glGetUniformLocation(composite_prog, "u_ShadowColor"), shadow_color.r, shadow_color.g, shadow_color.b, shadow_color.a);
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, ctx.input_texture); // Original (masked) content
+    glBindTexture(GL_TEXTURE_2D, input_texture); // The original content
     glUniform1i(glGetUniformLocation(composite_prog, "u_OriginalContentTexture"), 0);
-
     glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, temp_tex1_alpha_mask); // Blurred shadow mask
+    glBindTexture(GL_TEXTURE_2D, temp_tex1); // The final blurred shadow mask
     glUniform1i(glGetUniformLocation(composite_prog, "u_BlurredShadowMaskTexture"), 1);
-
     RenderFullscreenQuad();
 
-    // Restore
-    glUseProgram(0);
+    // Restore GL state
     glBindFramebuffer(GL_FRAMEBUFFER, last_fbo);
     glViewport(last_vp[0], last_vp[1], last_vp[2], last_vp[3]);
-    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, 0);
-    glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, 0);
+    glUseProgram(0);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, 0);
 }
 
-void ChromaKeyNode::Process(const EffectContext& ctx) {
-    if (!enabled || ctx.input_texture == 0) {
-        return;
-    }
+void ChromaKeyNode::Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) {
+    if (!enabled || inputs.empty() || inputs[0] == 0) return;
+
+    GLuint input_texture = inputs[0];
 
     // Load shader program (consider caching this for performance)
     GLuint chroma_key_program = LoadShaderProgram("shaders/passthrough.vert", "shaders/chroma_key.frag");
@@ -1145,7 +1171,7 @@ void ChromaKeyNode::Process(const EffectContext& ctx) {
 
     // Bind the input texture to texture unit 0
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, ctx.input_texture);
+    glBindTexture(GL_TEXTURE_2D, input_texture);
     glUniform1i(glGetUniformLocation(chroma_key_program, "u_Texture"), 0);
 
     // Draw a fullscreen quad to apply the effect
