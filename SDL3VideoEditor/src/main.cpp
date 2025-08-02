@@ -2766,6 +2766,14 @@ void DrawEffectUIForClip(Clip& clip, GLResources& gl_resources) {
             graph.node_order.push_back(new_id);
             graph.rebuild_links_from_order();
         }
+        if (ImGui::Button("Add Text")) {
+            auto text_fx = std::make_shared<TextEffectNode>();
+            int new_id = graph.next_node_id++;
+            text_fx->id = new_id;
+            graph.nodes[new_id] = text_fx;
+            graph.node_order.push_back(new_id);
+            graph.rebuild_links_from_order();
+        }
 
         for (size_t i = 0; i < clip.effect_graph->node_order.size(); ++i) {
             bool effect_changed = false;
@@ -3058,6 +3066,43 @@ void DrawEffectUIForClip(Clip& clip, GLResources& gl_resources) {
                     ImGui::SliderFloat("Similarity", &keyer->similarity, 0.0f, 1.0f, "%.3f");
                     ImGui::SliderFloat("Blend", &keyer->blend, 0.0f, 1.0f, "%.3f");
                     ImGui::SliderFloat("Spill Suppression", &keyer->spill, 0.0f, 1.0f, "%.3f");
+                } else if (auto text_node = std::dynamic_pointer_cast<TextEffectNode>(node)) {
+                    char text_buffer[1024];
+                    strncpy(text_buffer, text_node->text_content.c_str(), sizeof(text_buffer));
+                    if (ImGui::InputTextMultiline("Text", text_buffer, sizeof(text_buffer))) {
+                        text_node->text_content = text_buffer;
+                    }
+
+                    char font_path_buffer[260];
+                    strncpy(font_path_buffer, text_node->font_path.c_str(), sizeof(font_path_buffer));
+                    if (ImGui::InputText("Font Path", font_path_buffer, sizeof(font_path_buffer))) {
+                        text_node->font_path = font_path_buffer;
+                        text_node->needs_rebake = true;
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("...")) {
+                        const char* filters[] = { "*.ttf" };
+                        const char* path = tinyfd_openFileDialog("Select Font", text_node->font_path.c_str(), 1, filters, "TrueType Fonts (*.ttf)", 0);
+                        if (path) {
+                            text_node->font_path = path;
+                            text_node->needs_rebake = true;
+                        }
+                    }
+                    
+                    if (ImGui::DragFloat("Font Size", &text_node->font_size, 1.0f, 8.0f, 256.0f)) {
+                        text_node->needs_rebake = true;
+                    }
+
+                    ImGui::ColorEdit4("Color", &text_node->text_color.x);
+                    ImGui::SliderFloat2("Position", &text_node->position.x, 0.0f, 1.0f);
+                    ImGui::SliderFloat("Rotation", &text_node->rotation, -180.0f, 180.0f);
+
+                    ImGui::Separator();
+                    ImGui::Checkbox("Show Background", &text_node->has_background);
+                    if (text_node->has_background) {
+                        ImGui::ColorEdit4("BG Color", &text_node->background_color.x);
+                        ImGui::DragFloat("BG Padding", &text_node->background_padding, 1.0f, 0.0f, 100.0f);
+                    }
                 }
 
                 // Render common UI elements

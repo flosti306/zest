@@ -2,10 +2,15 @@
 #include <memory>
 #include <string>
 #include <algorithm>
+#include <filesystem>
 #include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
 #include <glad/glad.h> // Include glad for OpenGL function loading
 #include "effects.hpp"
 #include "cv_utils.hpp"
+
+#define STB_TRUETYPE_IMPLEMENTATION
+#include "stb_truetype.h"
 
 
 GLuint LoadShaderProgram(const std::string& vertex_path, const std::string& fragment_path) {
@@ -1180,4 +1185,157 @@ void ChromaKeyNode::Process(const std::vector<GLuint>& inputs, const EffectConte
     // Cleanup
     glUseProgram(0);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+void TextEffectNode::RebakeFont() {
+    if (font_path.empty() || !std::filesystem::exists(font_path)) {
+        needs_rebake = false; // Cannot bake, don't try again
+        return;
+    }
+
+    // Read the entire TTF file into memory
+    std::ifstream file(font_path, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) return;
+    std::streamsize size = file.tellg();
+    file.seekg(0, std::ios::beg);
+    std::vector<char> font_buffer(size);
+    if (!file.read(font_buffer.data(), size)) return;
+
+    const int ATLAS_WIDTH = 512;
+    const int ATLAS_HEIGHT = 512;
+    unsigned char temp_bitmap[ATLAS_WIDTH * ATLAS_HEIGHT];
+
+    // "Bake" the font glyphs into a grayscale bitmap in memory
+    stbtt_BakeFontBitmap((const unsigned char*)font_buffer.data(), 0,
+                         font_size, temp_bitmap, ATLAS_WIDTH, ATLAS_HEIGHT,
+                         32, 96, cdata); // Bake ASCII characters 32-127
+
+    // Upload the grayscale bitmap to an OpenGL texture
+    if (font_atlas_tex != 0) glDeleteTextures(1, &font_atlas_tex);
+    glGenTextures(1, &font_atlas_tex);
+    glBindTexture(GL_TEXTURE_2D, font_atlas_tex);
+    // Use GL_RED for single-channel textures, which is efficient.
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RED, ATLAS_WIDTH, ATLAS_HEIGHT, 0, GL_RED, GL_UNSIGNED_BYTE, temp_bitmap);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    needs_rebake = false;
+    std::cout << "Re-baked font: " << font_path << " at size " << font_size << std::endl;
+}
+
+void TextEffectNode::Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) {
+    if (!enabled) return;
+    GLuint input_texture = inputs.empty() ? 0 : inputs[0];
+
+    if (needs_rebake) {
+        RebakeFont();
+    }
+
+    // --- 1. Draw the input video as the background ---
+    glBindFramebuffer(GL_FRAMEBUFFER, ctx.output_fbo);
+    glViewport(0, 0, (int)ctx.resolution.x, (int)ctx.resolution.y);
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    
+    static GLuint passthrough_shader = 0;
+    if(passthrough_shader == 0) passthrough_shader = LoadShaderProgram("shaders/passthrough.vert", "shaders/texture.frag");
+
+    if (input_texture != 0) {
+        glUseProgram(passthrough_shader);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, input_texture);
+        glUniform1i(glGetUniformLocation(passthrough_shader, "u_Texture"), 0);
+        RenderFullscreenQuad();
+    }
+
+    // --- 2. Render the text on top using modern OpenGL ---
+    if (font_atlas_tex == 0 || text_content.empty()) {
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        return;
+    }
+
+    // --- Shader and VBO/VAO setup (done once) ---
+    static GLuint font_shader = 0;
+    static GLuint vao = 0, vbo = 0;
+    if (font_shader == 0) {
+        font_shader = LoadShaderProgram("shaders/font.vert", "shaders/font.frag");
+        // Create a dynamic VBO for our text quads
+        glGenVertexArrays(1, &vao);
+        glGenBuffers(1, &vbo);
+        glBindVertexArray(vao);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        // Position attribute
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+        glEnableVertexAttribArray(0);
+        // Texture coordinate attribute
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+        glEnableVertexAttribArray(1);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        glBindVertexArray(0);
+    }
+
+    // --- Prepare rendering state ---
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    
+    glUseProgram(font_shader);
+
+    // Set projection matrix
+    glm::mat4 projection = glm::ortho(0.0f, (float)ctx.resolution.x, 0.0f, (float)ctx.resolution.y);
+    glUniformMatrix4fv(glGetUniformLocation(font_shader, "u_Projection"), 1, GL_FALSE, &projection[0][0]);
+
+    // Set texture and color uniforms
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, font_atlas_tex);
+    glUniform1i(glGetUniformLocation(font_shader, "u_FontTexture"), 0);
+    glUniform4f(glGetUniformLocation(font_shader, "u_TextColor"), text_color.r, text_color.g, text_color.b, text_color.a);
+
+    glBindVertexArray(vao);
+    
+    // --- Generate vertex data for the text string ---
+    std::vector<float> vertices;
+    float x = position.x * ctx.resolution.x;
+    float y = position.y * ctx.resolution.y;
+
+    // Note: This simple loop generates vertices for each character one by one.
+    // For extreme performance, you would generate a single buffer for the whole string.
+    for (const char* text_ptr = text_content.c_str(); *text_ptr; text_ptr++) {
+        if (*text_ptr >= 32 && *text_ptr < 128) {
+            stbtt_aligned_quad q;
+            stbtt_GetBakedQuad(cdata, 512, 512, *text_ptr - 32, &x, &y, &q, 1);
+            
+            // For now, we ignore rotation for simplicity with VBOs
+            // To add rotation, you would build a transformation matrix and apply it in the vertex shader
+
+            float quad_verts[] = {
+                // pos.x, pos.y, tex.u, tex.v
+                q.x0, q.y0, q.s0, q.t0,
+                q.x1, q.y0, q.s1, q.t0,
+                q.x1, q.y1, q.s1, q.t1,
+
+                q.x0, q.y0, q.s0, q.t0,
+                q.x1, q.y1, q.s1, q.t1,
+                q.x0, q.y1, q.s0, q.t1
+            };
+            
+            // Upload quad data to VBO and draw
+            glBindBuffer(GL_ARRAY_BUFFER, vbo);
+            glBufferData(GL_ARRAY_BUFFER, sizeof(quad_verts), quad_verts, GL_DYNAMIC_DRAW);
+            glDrawArrays(GL_TRIANGLES, 0, 6);
+        }
+    }
+
+    // --- Restore OpenGL state ---
+    glBindVertexArray(0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glUseProgram(0);
+    glDisable(GL_BLEND);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+std::shared_ptr<EffectNode> TextEffectNode::clone() const {
+    auto new_node = std::make_shared<TextEffectNode>(*this);
+    new_node->font_atlas_tex = 0; // The clone must re-bake its own texture
+    new_node->needs_rebake = true;
+    return new_node;
 }

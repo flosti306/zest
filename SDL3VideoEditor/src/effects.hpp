@@ -16,6 +16,7 @@
 #include <imgui.h>
 #include "video_export.hpp" // For DecodedFrame (or shared.hpp if it's there)
 #include "shared.hpp"
+#include "stb_truetype.h"
 
 GLuint create_temp_fbo(glm::vec2 resolution, GLuint& texture_out);
 
@@ -487,4 +488,42 @@ struct ChromaKeyNode : public EffectNode {
         *new_node = *this;
         return new_node;
     }
+};
+
+struct TextEffectNode : public EffectNode {
+    // --- Text Properties ---
+    std::string text_content = "Hello, World!";
+    std::string font_path = "C:/Windows/Fonts/arial.ttf"; // A sensible default
+    float font_size = 64.0f;
+    glm::vec2 position = {0.5f, 0.5f}; // Normalized screen coords [0,1]
+    glm::vec4 text_color = {1.0f, 1.0f, 1.0f, 1.0f}; // White
+    float rotation = 0.0f; // In degrees
+
+    // --- Style Properties ---
+    bool has_background = false;
+    glm::vec4 background_color = {0.0f, 0.0f, 0.0f, 0.5f};
+    float background_padding = 10.0f; // In pixels
+
+    // --- Internal Font Rendering State ---
+    bool needs_rebake = true; // Flag to re-generate the font texture
+    GLuint font_atlas_tex = 0;
+    stbtt_bakedchar cdata[96]; // Character data for ASCII 32-127
+
+    TextEffectNode() {
+        name = "Text";
+        add_pin(true, "Image");
+        add_pin(false, "Image");
+    }
+    
+    ~TextEffectNode() override {
+        if (font_atlas_tex != 0) {
+            glDeleteTextures(1, &font_atlas_tex);
+        }
+    }
+
+    // Public method to trigger a font re-bake
+    void RebakeFont();
+
+    void Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) override;
+    std::shared_ptr<EffectNode> clone() const override;
 };
