@@ -504,10 +504,15 @@ struct TextEffectNode : public EffectNode {
     glm::vec4 background_color = {0.0f, 0.0f, 0.0f, 0.5f};
     float background_padding = 10.0f; // In pixels
 
-    // --- Internal Font Rendering State ---
-    bool needs_rebake = true; // Flag to re-generate the font texture
+    bool has_outline = false;
+    float outline_thickness = 0.1f; // Relative to font size
+    glm::vec4 outline_color = {0.0f, 0.0f, 0.0f, 1.0f}; // Black
+
+    // --- UPDATED: Internal Font Rendering State ---
+    bool needs_rebake = true;
     GLuint font_atlas_tex = 0;
-    stbtt_bakedchar cdata[96]; // Character data for ASCII 32-127
+    // We no longer use stbtt_bakedchar. We use stbtt_packedchar for SDF.
+    stbtt_packedchar pdata[96]; // Packed character data for ASCII 32-127
 
     TextEffectNode() {
         name = "Text";

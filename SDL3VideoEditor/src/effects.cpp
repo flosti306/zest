@@ -9,8 +9,16 @@
 #include "effects.hpp"
 #include "cv_utils.hpp"
 
+// 1. Define this to enable advanced packing and SDF functions within stb_truetype.h
+#define STBTT_RASTERIZER_VERSION 2
+
+// 2. Define the implementation for stb_truetype itself.
 #define STB_TRUETYPE_IMPLEMENTATION
 #include "stb_truetype.h"
+
+// 3. The stb_image_write library is separate and does not conflict.
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
 
 
 GLuint LoadShaderProgram(const std::string& vertex_path, const std::string& fragment_path) {
@@ -1189,11 +1197,10 @@ void ChromaKeyNode::Process(const std::vector<GLuint>& inputs, const EffectConte
 
 void TextEffectNode::RebakeFont() {
     if (font_path.empty() || !std::filesystem::exists(font_path)) {
-        needs_rebake = false; // Cannot bake, don't try again
+        needs_rebake = false;
         return;
     }
 
-    // Read the entire TTF file into memory
     std::ifstream file(font_path, std::ios::binary | std::ios::ate);
     if (!file.is_open()) return;
     std::streamsize size = file.tellg();
@@ -1201,26 +1208,40 @@ void TextEffectNode::RebakeFont() {
     std::vector<char> font_buffer(size);
     if (!file.read(font_buffer.data(), size)) return;
 
-    const int ATLAS_WIDTH = 512;
-    const int ATLAS_HEIGHT = 512;
-    unsigned char temp_bitmap[ATLAS_WIDTH * ATLAS_HEIGHT];
+    const int ATLAS_WIDTH = 2048;
+    const int ATLAS_HEIGHT = 2048;
+    const int NUM_CHARS = 96;
 
-    // "Bake" the font glyphs into a grayscale bitmap in memory
-    stbtt_BakeFontBitmap((const unsigned char*)font_buffer.data(), 0,
-                         font_size, temp_bitmap, ATLAS_WIDTH, ATLAS_HEIGHT,
-                         32, 96, cdata); // Bake ASCII characters 32-127
+    // SDF Parameters
+    const int PADDING = 5;
+    const unsigned char ON_EDGE_VALUE = 128;
+    const float PIXEL_DIST_SCALE = 32.0f; // A lower value can sometimes be better
 
-    // Upload the grayscale bitmap to an OpenGL texture
+    unsigned char* sdf_atlas_data = new unsigned char[ATLAS_WIDTH * ATLAS_HEIGHT];
+    
+    stbtt_pack_context spc;
+    stbtt_PackBegin(&spc, sdf_atlas_data, ATLAS_WIDTH, ATLAS_HEIGHT, 0, 1, nullptr);
+    
+    // This is the correct 10-argument version of the function that generates SDFs
+    // and is exposed by stb_truetype when correctly configured.
+    stbtt_PackFontRange(&spc, (const unsigned char*)font_buffer.data(), 0,
+        font_size, 32, NUM_CHARS, pdata);
+    
+    stbtt_PackEnd(&spc);
+    
+    // (Optional) Save the atlas to disk to see what it looks like
+    // stbi_write_png("sdf_atlas.png", ATLAS_WIDTH, ATLAS_HEIGHT, 1, sdf_atlas_data, 0);
+
     if (font_atlas_tex != 0) glDeleteTextures(1, &font_atlas_tex);
     glGenTextures(1, &font_atlas_tex);
     glBindTexture(GL_TEXTURE_2D, font_atlas_tex);
-    // Use GL_RED for single-channel textures, which is efficient.
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RED, ATLAS_WIDTH, ATLAS_HEIGHT, 0, GL_RED, GL_UNSIGNED_BYTE, temp_bitmap);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RED, ATLAS_WIDTH, ATLAS_HEIGHT, 0, GL_RED, GL_UNSIGNED_BYTE, sdf_atlas_data);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 
+    delete[] sdf_atlas_data;
     needs_rebake = false;
-    std::cout << "Re-baked font: " << font_path << " at size " << font_size << std::endl;
+    std::cout << "Re-baked SDF font: " << font_path << " at size " << font_size << std::endl;
 }
 
 void TextEffectNode::Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) {
@@ -1290,6 +1311,12 @@ void TextEffectNode::Process(const std::vector<GLuint>& inputs, const EffectCont
     glUniform1i(glGetUniformLocation(font_shader, "u_FontTexture"), 0);
     glUniform4f(glGetUniformLocation(font_shader, "u_TextColor"), text_color.r, text_color.g, text_color.b, text_color.a);
 
+    glUniform1i(glGetUniformLocation(font_shader, "u_HasOutline"), has_outline);
+    if (has_outline) {
+        glUniform4f(glGetUniformLocation(font_shader, "u_OutlineColor"), outline_color.r, outline_color.g, outline_color.b, outline_color.a);
+        glUniform1f(glGetUniformLocation(font_shader, "u_OutlineThickness"), outline_thickness);
+    }
+
     glBindVertexArray(vao);
     
     // --- Generate vertex data for the text string ---
@@ -1302,7 +1329,7 @@ void TextEffectNode::Process(const std::vector<GLuint>& inputs, const EffectCont
     for (const char* text_ptr = text_content.c_str(); *text_ptr; text_ptr++) {
         if (*text_ptr >= 32 && *text_ptr < 128) {
             stbtt_aligned_quad q;
-            stbtt_GetBakedQuad(cdata, 512, 512, *text_ptr - 32, &x, &y, &q, 1);
+            stbtt_GetPackedQuad(pdata, 2048, 2048, *text_ptr - 32, &x, &y, &q, 0);
             
             // For now, we ignore rotation for simplicity with VBOs
             // To add rotation, you would build a transformation matrix and apply it in the vertex shader
