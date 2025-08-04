@@ -15,6 +15,7 @@
 #include <mutex>   // For potential future threading
 #include <limits>  // For numeric_limits
 #include <stack>
+#include <functional>
 
 // External C libraries (FFmpeg, glad, tinyfiledialogs)
 extern "C" {
@@ -55,6 +56,16 @@ extern "C" {
 struct GradientData {
     ImVec4 window_grad_top;
     ImVec4 window_grad_bottom;
+};
+
+struct ScoredNodeResult {
+    std::string name;
+    int score; // Lower score is a better match
+
+    // We need a less-than operator to tell std::sort how to order the results.
+    bool operator<(const ScoredNodeResult& other) const {
+        return score < other.score;
+    }
 };
 
 // === Playback state ===
@@ -135,6 +146,25 @@ std::stack<std::string> redo_stack;
 if (condition) { \
     std::cerr << "Error: " << message << std::endl; \
     /* Consider returning false or throwing an exception */ \
+}
+
+// A map where the key is the node's display name and the value is a function that creates it.
+using NodeFactory = std::function<std::shared_ptr<EffectNode>()>;
+std::map<std::string, NodeFactory> node_registry;
+
+// A function to populate our registry.
+void InitializeNodeRegistry() {
+    node_registry["Gaussian Blur"] = []() { return std::make_shared<GaussianBlurNode>(); };
+    node_registry["Color Grading"] = []() { return std::make_shared<ColorGradingNode>(); };
+    node_registry["LUT Color Grading"] = []() { return std::make_shared<LUTColorGradingNode>(); };
+    node_registry["Mask"] = []() { return std::make_shared<MaskEffectNode>(); };
+    node_registry["Solid Color"] = []() { return std::make_shared<SolidColorEffectNode>(); };
+    node_registry["Gradient Overlay"] = []() { return std::make_shared<GradientEffectNode>(); };
+    node_registry["Drop Shadow"] = []() { return std::make_shared<DropShadowEffectNode>(); };
+    node_registry["Chroma Key"] = []() { return std::make_shared<ChromaKeyNode>(); };
+    node_registry["Text"] = []() { return std::make_shared<TextEffectNode>(); };
+    node_registry["Empty Source"] = []() { return std::make_shared<EmptySourceNode>(); };
+    // Add any new nodes here in the future.
 }
 
 // --- ImGui Styling and Custom Rendering ---
@@ -1214,6 +1244,7 @@ void DrawAddMediaWindow(std::vector<Clip>& clips, float zoom_factor, bool layers
 // --- Main Application ---
 int main(int argc, char* argv[]) {
     avformat_network_init();
+    InitializeNodeRegistry();
 
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) < 0) {
         std::cerr << "Failed to initialize SDL: " << SDL_GetError() << std::endl;
@@ -3505,9 +3536,9 @@ void DrawSmartMaskEditorWindow() {
 }
 
 void DrawNodeEditorWindow(Clip* clip) {
-    // if (!clip || !clip->effect_graph) return;
+    static char search_buffer[128] = "";
+    static ImVec2 popup_position;
 
-    // ImGui::SetNextWindowSize(ImVec2(800, 600), ImGuiCond_FirstUseEver);
     ImGui::Begin("Node Editor");
 
 
@@ -3515,6 +3546,96 @@ void DrawNodeEditorWindow(Clip* clip) {
         auto& graph = clip->effect_graph;
 
         ImNodes::BeginNodeEditor();
+
+        // Open the popup on Shift+A. We check IsWindowHovered to make sure
+        // the hotkey only works when the node editor is focused.
+        if (ImGui::IsWindowFocused(ImGuiFocusedFlags_None) && ImGui::IsKeyPressed(ImGuiKey_A) && ImGui::GetIO().KeyShift && clip) {
+            std::cout << "Opening search" << std::endl;
+            ImGui::OpenPopup("add_node_popup");
+            popup_position = ImGui::GetMousePos();
+            memset(search_buffer, 0, sizeof(search_buffer));
+        }
+
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 6.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 8.0f));
+
+        if (ImGui::BeginPopup("add_node_popup")) {
+            ImGui::Text("Add Node");
+            ImGui::Separator();
+            ImGui::PushItemWidth(200);
+            if (ImGui::IsWindowAppearing()) { ImGui::SetKeyboardFocusHere(); }
+            ImGui::InputText("##search", search_buffer, sizeof(search_buffer));
+            ImGui::PopItemWidth();
+            ImGui::Separator();
+
+            // 1. Calculate a score for every node in the registry.
+            std::vector<ScoredNodeResult> scored_results;
+            std::string search_str = search_buffer;
+            std::transform(search_str.begin(), search_str.end(), search_str.begin(), ::tolower);
+
+            for (const auto& [name, factory_func] : node_registry) {
+                std::string name_lower = name;
+                std::transform(name_lower.begin(), name_lower.end(), name_lower.begin(), ::tolower);
+
+                int score = -1; // -1 means "no match"
+
+                if (search_str.empty()) {
+                    score = 0; // Show all if search is empty, with a default score
+                } else {
+                    size_t pos = name_lower.find(search_str);
+                    if (pos != std::string::npos) {
+                        // We found a match! Now, let's score it.
+                        // A match at the beginning (pos=0) is the best score (0).
+                        // Matches later in the string get a higher (worse) score.
+                        score = static_cast<int>(pos);
+                    }
+                }
+
+                if (score != -1) {
+                    scored_results.push_back({name, score});
+                }
+            }
+            
+            // 2. Sort the results based on the score (lower is better).
+            std::sort(scored_results.begin(), scored_results.end());
+
+            // Lambda function to add a node (unchanged)
+            auto add_selected_node = [&](const std::string& node_name) {
+                if (clip && clip->effect_graph) {
+                    // 'graph' is a shared_ptr, so we must use the arrow operator '->' to access its members.
+                    auto& graph = clip->effect_graph; 
+                    
+                    // --- THIS IS THE FIX ---
+                    auto new_node = node_registry[node_name]();
+                    
+                    int new_id = graph->next_node_id++;
+                    new_node->id = new_id;
+                    
+                    ImNodes::SetNodeScreenSpacePos(new_id, popup_position);
+
+                    graph->nodes[new_id] = new_node;
+                    graph->node_order.push_back(new_id);
+                    graph->rebuild_links_from_order();
+                    // --- END FIX ---
+                }
+                ImGui::CloseCurrentPopup();
+            };
+
+            // 3. Check for Enter key press on the top result.
+            if ((ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter)) && !scored_results.empty()) {
+                add_selected_node(scored_results.front().name);
+            }
+
+            // 4. Display the sorted, selectable list.
+            for (const auto& result : scored_results) {
+                if (ImGui::Selectable(result.name.c_str())) {
+                    add_selected_node(result.name);
+                }
+            }
+            ImGui::EndPopup();
+        }
+
+        ImGui::PopStyleVar(2);
 
         // This is done once per node before it's drawn for the frame.
         // imnodes will use this position unless the user has already moved the node.
