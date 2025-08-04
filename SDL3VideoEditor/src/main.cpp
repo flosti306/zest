@@ -3422,105 +3422,120 @@ void DrawSmartMaskEditorWindow() {
 }
 
 void DrawNodeEditorWindow(Clip* clip) {
-    if (!clip || !clip->effect_graph) return;
-    auto& graph = clip->effect_graph;
+    // if (!clip || !clip->effect_graph) return;
 
     // ImGui::SetNextWindowSize(ImVec2(800, 600), ImGuiCond_FirstUseEver);
     ImGui::Begin("Node Editor");
-    ImNodes::BeginNodeEditor();
 
-    // This is done once per node before it's drawn for the frame.
-    // imnodes will use this position unless the user has already moved the node.
-    for (auto const& [node_id, node_ptr] : graph->nodes) {
-        ImNodes::SetNodeEditorSpacePos(node_id, node_ptr->editor_pos);
-    }
 
-    // --- Render Nodes and Pins ---
-    for (auto const& [node_id, node_ptr] : graph->nodes) {
-        ImNodes::BeginNode(node_id);
-        
-        ImNodes::BeginNodeTitleBar();
-        ImGui::TextUnformatted(node_ptr->name.c_str());
-        ImNodes::EndNodeTitleBar();
+    if (clip && clip->effect_graph) {
+        auto& graph = clip->effect_graph;
 
-        for (const auto& pin : node_ptr->input_pins) {
-            ImNodes::BeginInputAttribute(pin.id);
-            ImGui::TextUnformatted(pin.name.c_str());
-            ImNodes::EndInputAttribute();
+        ImNodes::BeginNodeEditor();
+
+        // This is done once per node before it's drawn for the frame.
+        // imnodes will use this position unless the user has already moved the node.
+        for (auto const& [node_id, node_ptr] : graph->nodes) {
+            ImNodes::SetNodeEditorSpacePos(node_id, node_ptr->editor_pos);
         }
 
-        for (const auto& pin : node_ptr->output_pins) {
-            ImNodes::BeginOutputAttribute(pin.id);
-            ImGui::TextUnformatted(pin.name.c_str());
-            ImNodes::EndOutputAttribute();
+        // --- Render Nodes and Pins ---
+        for (auto const& [node_id, node_ptr] : graph->nodes) {
+            ImNodes::BeginNode(node_id);
+            
+            ImNodes::BeginNodeTitleBar();
+            ImGui::TextUnformatted(node_ptr->name.c_str());
+            ImNodes::EndNodeTitleBar();
+
+            for (const auto& pin : node_ptr->input_pins) {
+                ImNodes::BeginInputAttribute(pin.id);
+                ImGui::TextUnformatted(pin.name.c_str());
+                ImNodes::EndInputAttribute();
+            }
+
+            for (const auto& pin : node_ptr->output_pins) {
+                ImNodes::BeginOutputAttribute(pin.id);
+                ImGui::TextUnformatted(pin.name.c_str());
+                ImNodes::EndOutputAttribute();
+            }
+
+            ImNodes::EndNode();
         }
 
-        ImNodes::EndNode();
-    }
-
-    // --- Render Links ---
-    for (const auto& link : graph->links) {
-        ImNodes::Link(link.id, link.from_pin_id, link.to_pin_id);
-    }
-
-    ImNodes::EndNodeEditor();
-
-    // After the editor has been drawn and interacted with, we poll the
-    // positions of all nodes and update our internal storage.
-    for (auto const& [node_id, node_ptr] : graph->nodes) {
-        node_ptr->editor_pos = ImNodes::GetNodeEditorSpacePos(node_id);
-    }
-
-    // --- NEW & CORRECTED Link Management for Intuitive UX ---
-
-    // 1. Handle CREATING new links (and replacing existing ones)
-    int start_pin_id, end_pin_id;
-    if (ImNodes::IsLinkCreated(&start_pin_id, &end_pin_id)) {
-        // Find which pin is the input and which is the output.
-        Pin* from_pin = nullptr;
-        Pin* to_pin = nullptr; // This will be the input pin
-        for (auto& [node_id, node] : graph->nodes) {
-            for (auto& pin : node->output_pins) if (pin.id == start_pin_id || pin.id == end_pin_id) from_pin = &pin;
-            for (auto& pin : node->input_pins) if (pin.id == start_pin_id || pin.id == end_pin_id) to_pin = &pin;
+        // --- Render Links ---
+        for (const auto& link : graph->links) {
+            ImNodes::Link(link.id, link.from_pin_id, link.to_pin_id);
         }
 
-        // Ensure the connection is valid (output to input on different nodes)
-        if (from_pin && to_pin && from_pin->node != to_pin->node) {
-            // Check if the target input pin already has a connection. If so, remove it.
-            // This creates the intuitive "replace" behavior.
+        ImNodes::EndNodeEditor();
+
+        // After the editor has been drawn and interacted with, we poll the
+        // positions of all nodes and update our internal storage.
+        for (auto const& [node_id, node_ptr] : graph->nodes) {
+            node_ptr->editor_pos = ImNodes::GetNodeEditorSpacePos(node_id);
+        }
+
+        // --- NEW & CORRECTED Link Management for Intuitive UX ---
+
+        // 1. Handle CREATING new links (and replacing existing ones)
+        int start_pin_id, end_pin_id;
+        if (ImNodes::IsLinkCreated(&start_pin_id, &end_pin_id)) {
+            // Find which pin is the input and which is the output.
+            Pin* from_pin = nullptr;
+            Pin* to_pin = nullptr; // This will be the input pin
+            for (auto& [node_id, node] : graph->nodes) {
+                for (auto& pin : node->output_pins) if (pin.id == start_pin_id || pin.id == end_pin_id) from_pin = &pin;
+                for (auto& pin : node->input_pins) if (pin.id == start_pin_id || pin.id == end_pin_id) to_pin = &pin;
+            }
+
+            // Ensure the connection is valid (output to input on different nodes)
+            if (from_pin && to_pin && from_pin->node != to_pin->node) {
+                // Check if the target input pin already has a connection. If so, remove it.
+                // This creates the intuitive "replace" behavior.
+                auto& links_vec = graph->links;
+                links_vec.erase(
+                    std::remove_if(links_vec.begin(), links_vec.end(), [to_pin](const Link& link) {
+                        return link.to_pin_id == to_pin->id;
+                    }),
+                    links_vec.end()
+                );
+
+                // Add the new link
+                static int next_link_id = 100; // User-created links
+                graph->links.push_back({
+                    next_link_id++,
+                    from_pin->node->id, to_pin->node->id,
+                    from_pin->id, to_pin->id
+                });
+            }
+        }
+
+        // 2. Handle DELETING links by dragging them off a pin
+        int dropped_pin_id;
+        // The 'true' argument is crucial: it reports drops that started from an existing link.
+        if (ImNodes::IsLinkDropped(&dropped_pin_id, true)) {
+            // A drag started on a pin and was dropped in empty space.
+            // We need to find the link that was attached to this pin and delete it.
             auto& links_vec = graph->links;
             links_vec.erase(
-                std::remove_if(links_vec.begin(), links_vec.end(), [to_pin](const Link& link) {
-                    return link.to_pin_id == to_pin->id;
+                std::remove_if(links_vec.begin(), links_vec.end(), [dropped_pin_id](const Link& link) {
+                    // Check if either end of the link matches the pin the drag started from.
+                    return link.from_pin_id == dropped_pin_id || link.to_pin_id == dropped_pin_id;
                 }),
                 links_vec.end()
             );
-
-            // Add the new link
-            static int next_link_id = 100; // User-created links
-            graph->links.push_back({
-                next_link_id++,
-                from_pin->node->id, to_pin->node->id,
-                from_pin->id, to_pin->id
-            });
         }
-    }
-
-    // 2. Handle DELETING links by dragging them off a pin
-    int dropped_pin_id;
-    // The 'true' argument is crucial: it reports drops that started from an existing link.
-    if (ImNodes::IsLinkDropped(&dropped_pin_id, true)) {
-        // A drag started on a pin and was dropped in empty space.
-        // We need to find the link that was attached to this pin and delete it.
-        auto& links_vec = graph->links;
-        links_vec.erase(
-            std::remove_if(links_vec.begin(), links_vec.end(), [dropped_pin_id](const Link& link) {
-                // Check if either end of the link matches the pin the drag started from.
-                return link.from_pin_id == dropped_pin_id || link.to_pin_id == dropped_pin_id;
-            }),
-            links_vec.end()
-        );
-    }
         // --- END NEW & CORRECTED LOGIC ---
+    } else {
+        ApplyWindowBackgroundGradients();
+        // --- NEW: Display a helpful message when no clip is selected ---
+        ImVec2 window_size = ImGui::GetWindowSize();
+        const char* text = "Select a clip to view its effect graph.";
+        ImVec2 text_size = ImGui::CalcTextSize(text);
+
+        // Center the text in the window
+        ImGui::SetCursorPos(ImVec2((window_size.x - text_size.x) * 0.5f, (window_size.y - text_size.y) * 0.5f));
+        ImGui::TextDisabled("%s", text);
+    }
     ImGui::End();
 }
