@@ -164,6 +164,7 @@ void InitializeNodeRegistry() {
     node_registry["Chroma Key"] = []() { return std::make_shared<ChromaKeyNode>(); };
     node_registry["Text"] = []() { return std::make_shared<TextEffectNode>(); };
     node_registry["Empty Source"] = []() { return std::make_shared<EmptySourceNode>(); };
+    node_registry["Merge"] = []() { return std::make_shared<MergeNode>(); };
     // Add any new nodes here in the future.
 }
 
@@ -3177,6 +3178,18 @@ void DrawEffectUIForClip(Clip& clip, GLResources& gl_resources) {
                     if (text_node->has_background) {
                         ImGui::ColorEdit4("BG Color", &text_node->background_color.x);
                         ImGui::DragFloat("BG Padding", &text_node->background_padding, 1.0f, 0.0f, 100.0f);
+                    }
+                } else if (auto merge_node = std::dynamic_pointer_cast<MergeNode>(node)) {
+                    // Dropdown for BlendMode enum
+                    const char* blend_modes[] = { "Normal", "Additive", "Multiply", "Screen", "Darken", "Lighten", "Difference", "Subtract", "Divide", "Overlay"};
+                    int current_mode = static_cast<int>(merge_node->blend_mode);
+                    if (ImGui::Combo("Blend Mode", &current_mode, blend_modes, IM_ARRAYSIZE(blend_modes))) {
+                        merge_node->blend_mode = static_cast<BlendMode>(current_mode);
+                    }
+
+                    ImGui::SliderFloat("Mix", &merge_node->mix, 0.0f, 1.0f);
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Controls the opacity of the Foreground (A) input.");
                     }
                 }
 

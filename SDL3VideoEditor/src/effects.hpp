@@ -556,3 +556,21 @@ struct EmptySourceNode : public EffectNode {
         return std::make_shared<EmptySourceNode>(*this);
     }
 };
+
+struct MergeNode : public EffectNode {
+    // --- Properties ---
+    BlendMode blend_mode = BlendMode::Normal;
+    float mix = 1.0f; // Opacity of the "A" input
+
+    MergeNode() {
+        name = "Merge";
+        // Define two inputs and one output
+        add_pin(true, "B (Background)"); // First input is the background layer
+        add_pin(true, "A (Foreground)"); // Second input is the layer to composite on top
+        add_pin(false, "Output");
+    }
+
+    // Process will now receive two textures in its 'inputs' vector
+    void Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) override;
+    std::shared_ptr<EffectNode> clone() const override;
+};

@@ -1463,3 +1463,56 @@ std::shared_ptr<EffectNode> TextEffectNode::clone() const {
     new_node->needs_rebake = true;
     return new_node;
 }
+
+std::shared_ptr<EffectNode> MergeNode::clone() const {
+    return std::make_shared<MergeNode>(*this);
+}
+
+void MergeNode::Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) {
+    // A merge node requires exactly two inputs to function.
+    if (!enabled || inputs.size() < 2 || inputs[0] == 0 || inputs[1] == 0) {
+        // If inputs are missing, we can choose to output black, or passthrough one of the inputs.
+        // Let's passthrough the 'B' input if it exists.
+        if (!inputs.empty() && inputs[0] != 0) {
+            // (Code to copy inputs[0] to ctx.output_fbo)
+        }
+        return;
+    }
+    
+    GLuint tex_b = inputs[0]; // Background
+    GLuint tex_a = inputs[1]; // Foreground
+
+    static GLuint merge_shader = 0;
+    if (merge_shader == 0) merge_shader = LoadShaderProgram("shaders/passthrough.vert", "shaders/merge.frag");
+    if (merge_shader == 0) return;
+
+    glBindFramebuffer(GL_FRAMEBUFFER, ctx.output_fbo);
+    glViewport(0, 0, (int)ctx.resolution.x, (int)ctx.resolution.y);
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    glUseProgram(merge_shader);
+
+    // Bind the two input textures to different texture units
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex_b);
+    glUniform1i(glGetUniformLocation(merge_shader, "u_TextureB"), 0);
+
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, tex_a);
+    glUniform1i(glGetUniformLocation(merge_shader, "u_TextureA"), 1);
+
+    // Set the uniforms
+    glUniform1i(glGetUniformLocation(merge_shader, "u_BlendMode"), static_cast<int>(blend_mode));
+    glUniform1f(glGetUniformLocation(merge_shader, "u_Mix"), mix);
+
+    RenderFullscreenQuad();
+
+    // Cleanup
+    glUseProgram(0);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
