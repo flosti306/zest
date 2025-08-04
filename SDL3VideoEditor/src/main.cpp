@@ -573,6 +573,53 @@ void AddNewCompositionClip(std::vector<Clip>& clips, float duration) {
     std::cout << "Added Composition clip." << std::endl;
 }
 
+void AddNewTextClip(std::vector<Clip>& clips) {
+    // 1. Create a standard Composition Clip
+    // (Using your existing logic to create an empty clip of type Video)
+    AddNewCompositionClip(clips, DEFAULT_IMAGE_DURATION); // Reuse the default 5s duration
+
+    // 2. Get the new clip and its graph
+    Clip& text_clip = clips.back();
+    text_clip.name = "Text"; // Rename it
+    auto& graph = *text_clip.effect_graph;
+
+    // 3. Create and add a TextEffectNode
+    auto text_fx = std::make_shared<TextEffectNode>();
+    int new_id = graph.next_node_id++;
+    text_fx->id = new_id;
+    graph.nodes[new_id] = text_fx;
+    graph.node_order.push_back(new_id); // Add it to the linear processing order
+
+    // 4. Rebuild the links to automatically connect it
+    // The graph will now be: Empty Source -> Text -> Final Output
+    graph.rebuild_links_from_order();
+    
+    std::cout << "Added pre-composed Text clip." << std::endl;
+}
+
+void AddNewSolidColorClip(std::vector<Clip>& clips) {
+    // 1. Create a standard Composition Clip
+    AddNewCompositionClip(clips, DEFAULT_IMAGE_DURATION);
+
+    // 2. Get the new clip and its graph
+    Clip& solid_clip = clips.back();
+    solid_clip.name = "Solid Color";
+    auto& graph = *solid_clip.effect_graph;
+
+    // 3. Create and add a SolidColorEffectNode
+    auto solid_fx = std::make_shared<SolidColorEffectNode>();
+    int new_id = graph.next_node_id++;
+    solid_fx->id = new_id;
+    graph.nodes[new_id] = solid_fx;
+    graph.node_order.push_back(new_id);
+
+    // 4. Rebuild the links to connect it
+    // The graph will be: Empty Source -> Solid Color -> Final Output
+    graph.rebuild_links_from_order();
+
+    std::cout << "Added pre-composed Solid Color clip." << std::endl;
+}
+
 // --- Video Duration Helper ---
 float get_video_duration(const std::string& input_path) {
     AVFormatContext* fmt_ctx = nullptr;
@@ -1162,6 +1209,7 @@ void DrawEffectUIForClip(Clip& clip, GLResources& gl_resources);
 void OpenSmartMaskEditor(MaskEffectNode* node, GLuint clip_texture_for_background, const DecodedFrame& decoded_frame_for_cv);
 void DrawSmartMaskEditorWindow();
 void DrawNodeEditorWindow(Clip* clip);
+void DrawAddMediaWindow(std::vector<Clip>& clips, float zoom_factor, bool layers_changed);
 
 // --- Main Application ---
 int main(int argc, char* argv[]) {
@@ -1587,12 +1635,6 @@ int main(int argc, char* argv[]) {
              layers_changed = true; playing = false;
         }
         ImGui::Separator();
-        if (ImGui::Button("Add Composition Clip")) {
-            PushUndo(clips, playhead_time, zoom_factor);
-            AddNewCompositionClip(clips, 5.0f); // Default to 5 seconds
-            layers_changed = true;
-        }
-        ImGui::Separator();
         if (ImGui::Button("Export Video")) {
             SDL_GL_MakeCurrent(window, gl_context);
             std::filesystem::path out_p(output_path);
@@ -1661,6 +1703,7 @@ int main(int argc, char* argv[]) {
         DrawTimelineEditor(clips, playhead_time, max_duration, zoom_factor, layers_changed, selected_clip, gl_resources, last_playhead_time_for_velocity);
         RenderPreviewWindow(gl_resources, preview_width, preview_height);
         DrawNodeEditorWindow(selected_clip); // Pass selected_clip if needed
+        DrawAddMediaWindow(clips, zoom_factor, layers_changed);
 
         if (mask_editor_open) {
             DrawMaskEditorWindow(gl_resources); // Pass gl_resources if needed inside editor
@@ -3577,5 +3620,50 @@ void DrawNodeEditorWindow(Clip* clip) {
         ImGui::SetCursorPos(ImVec2((window_size.x - text_size.x) * 0.5f, (window_size.y - text_size.y) * 0.5f));
         ImGui::TextDisabled("%s", text);
     }
+    ImGui::End();
+}
+
+void DrawAddMediaWindow(std::vector<Clip>& clips, float zoom_factor, bool layers_changed) {
+    ImGui::Begin("Add Media");
+    ApplyWindowBackgroundGradients();
+
+    ImGui::Text("Generators");
+    ImGui::Separator();
+
+    // Button for a simple, empty composition
+    if (ImGui::Button("Empty Composition", ImVec2(-1, 40))) { // -1 width = fill available space
+        PushUndo(clips, playhead_time, zoom_factor);
+        AddNewCompositionClip(clips, DEFAULT_IMAGE_DURATION);
+        layers_changed = true;
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Adds a blank clip to host effects.");
+    }
+
+    ImGui::Spacing();
+
+    ImGui::Text("Pre-Compositions");
+    ImGui::Separator();
+
+    if (ImGui::Button("Text Clip", ImVec2(-1, 40))) {
+        PushUndo(clips, playhead_time, zoom_factor);
+        AddNewTextClip(clips);
+        layers_changed = true;
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Adds a composition with a Text effect pre-applied.");
+    }
+
+    if (ImGui::Button("Solid Color", ImVec2(-1, 40))) {
+        PushUndo(clips, playhead_time, zoom_factor);
+        AddNewSolidColorClip(clips);
+        layers_changed = true;
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Adds a composition with a Solid Color effect pre-applied.");
+    }
+    
+    // You can easily add more buttons here for other pre-compositions, like Gradient Clip, etc.
+
     ImGui::End();
 }
