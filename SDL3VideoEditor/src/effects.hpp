@@ -122,6 +122,7 @@ struct EffectGraph {
     std::vector<Link> links;
     std::vector<int> node_order;
     int next_node_id = 1;
+    int next_link_id = 1;
 
     // The start and end points of the graph
     int input_node_id = 0;
@@ -149,7 +150,6 @@ struct EffectGraph {
 
         nodes[output_node_id] = output_node;
 
-        static int next_link_id = 1; // This could be a member variable if preferred
         links.push_back({
             next_link_id++, // Use a normal, positive, unique ID
             input_node_id, output_node_id,
@@ -159,6 +159,9 @@ struct EffectGraph {
 
     void cleanup_transient_resources();
     void rebuild_links_from_order();
+    void rebuild_order_from_links();
+
+    void insert_node_before_output(std::shared_ptr<EffectNode> new_node);
     
     // ... (deep copy constructor and processing methods)
     void ProcessNodeGraph(GLuint source_clip_texture, GLuint final_output_fbo, float time, glm::vec2 resolution);

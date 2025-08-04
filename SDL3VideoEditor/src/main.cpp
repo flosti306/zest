@@ -2803,18 +2803,12 @@ void DrawEffectUIForClip(Clip& clip, GLResources& gl_resources) {
 
         if (ImGui::Button("Add Gaussian Blur")) {
             auto blur = std::make_shared<GaussianBlurNode>();
-            int new_id = graph.next_node_id++; // Get a new unique ID
-            blur->id = new_id;
             blur->name = "Blur";
             blur->blur_amount = 5.0f;
-            graph.nodes[new_id] = blur;         // Add to the map
-            graph.node_order.push_back(new_id); // Add ID to the order vector
-            graph.rebuild_links_from_order();
+            clip.effect_graph->insert_node_before_output(blur);
         }
         if (ImGui::Button("Add Color Grading")) {
             auto color_grade = std::make_shared<ColorGradingNode>();
-            int new_id = graph.next_node_id++;
-            color_grade->id = new_id;
             color_grade->name = "Color Grading";
             color_grade->brightness = 0.0f;
             color_grade->contrast = 1.0f;
@@ -2822,71 +2816,31 @@ void DrawEffectUIForClip(Clip& clip, GLResources& gl_resources) {
             color_grade->temperature = 0.0f;
             color_grade->tint = 0.0f;
             color_grade->gamma = 1.0f;
-            graph.nodes[new_id] = color_grade;
-            graph.node_order.push_back(new_id);
-            graph.rebuild_links_from_order();
+            clip.effect_graph->insert_node_before_output(color_grade);
         }
         if (ImGui::Button("Add LUT")) {
             auto lut = std::make_shared<LUTColorGradingNode>();
-            int new_id = graph.next_node_id++;
-            lut->id = new_id;
             lut->name = "LUT Color Grading";
             lut->strength = 1.0f;
-            graph.nodes[new_id] = lut;
-            graph.node_order.push_back(new_id);
-            graph.rebuild_links_from_order();
+            clip.effect_graph->insert_node_before_output(lut);
         }
         if (ImGui::Button("Add Mask")) {
-            auto mask = std::make_shared<MaskEffectNode>();
-            int new_id = graph.next_node_id++;
-            mask->id = new_id;
-            // Default settings are set in constructor
-            graph.nodes[new_id] = mask;
-            graph.node_order.push_back(new_id);
-            graph.rebuild_links_from_order();
+            clip.effect_graph->insert_node_before_output(std::make_shared<MaskEffectNode>());
         }
         if (ImGui::Button("Add Solid Color Overlay")) {
-            auto solid_fx = std::make_shared<SolidColorEffectNode>();
-            int new_id = graph.next_node_id++;
-            solid_fx->id = new_id;
-            // Default values are set in constructor
-            graph.nodes[new_id] = solid_fx;
-            graph.node_order.push_back(new_id);
-            graph.rebuild_links_from_order();
+            clip.effect_graph->insert_node_before_output(std::make_shared<SolidColorEffectNode>());
         }
         if (ImGui::Button("Add Gradient Overlay")) {
-            auto grad_fx = std::make_shared<GradientEffectNode>();
-            int new_id = graph.next_node_id++;
-            grad_fx->id = new_id;
-            // Default values are set in constructor
-            graph.nodes[new_id] = grad_fx;
-            graph.node_order.push_back(new_id);
-            graph.rebuild_links_from_order();
+            clip.effect_graph->insert_node_before_output(std::make_shared<GradientEffectNode>());
         }
         if (ImGui::Button("Add Drop Shadow")) {
-            auto shadow_fx = std::make_shared<DropShadowEffectNode>();
-            int new_id = graph.next_node_id++;
-            shadow_fx->id = new_id;
-            // Default values are in constructor
-            graph.nodes[new_id] = shadow_fx;
-            graph.node_order.push_back(new_id);
-            graph.rebuild_links_from_order();
+            clip.effect_graph->insert_node_before_output(std::make_shared<DropShadowEffectNode>());
         }
         if (ImGui::Button("Add Chroma Key")) {
-            auto keyer = std::make_shared<ChromaKeyNode>();
-            int new_id = graph.next_node_id++;
-            keyer->id = new_id;
-            graph.nodes[new_id] = keyer;
-            graph.node_order.push_back(new_id);
-            graph.rebuild_links_from_order();
+            clip.effect_graph->insert_node_before_output(std::make_shared<DropShadowEffectNode>());
         }
         if (ImGui::Button("Add Text")) {
-            auto text_fx = std::make_shared<TextEffectNode>();
-            int new_id = graph.next_node_id++;
-            text_fx->id = new_id;
-            graph.nodes[new_id] = text_fx;
-            graph.node_order.push_back(new_id);
-            graph.rebuild_links_from_order();
+            clip.effect_graph->insert_node_before_output(std::make_shared<TextEffectNode>());
         }
 
         for (size_t i = 0; i < clip.effect_graph->node_order.size(); ++i) {
@@ -3602,21 +3556,10 @@ void DrawNodeEditorWindow(Clip* clip) {
             // Lambda function to add a node (unchanged)
             auto add_selected_node = [&](const std::string& node_name) {
                 if (clip && clip->effect_graph) {
-                    // 'graph' is a shared_ptr, so we must use the arrow operator '->' to access its members.
-                    auto& graph = clip->effect_graph; 
-                    
-                    // --- THIS IS THE FIX ---
-                    auto new_node = node_registry[node_name]();
-                    
-                    int new_id = graph->next_node_id++;
-                    new_node->id = new_id;
-                    
-                    ImNodes::SetNodeScreenSpacePos(new_id, popup_position);
-
-                    graph->nodes[new_id] = new_node;
-                    graph->node_order.push_back(new_id);
-                    graph->rebuild_links_from_order();
-                    // --- END FIX ---
+                    auto& graph = clip->effect_graph;
+                    auto new_node_instance = node_registry[node_name]();
+                    graph->insert_node_before_output(new_node_instance);
+                    // ImNodes::SetNodeScreenSpacePos(new_node_instance->id, popup_position); // Now the ID is set
                 }
                 ImGui::CloseCurrentPopup();
             };
@@ -3712,6 +3655,8 @@ void DrawNodeEditorWindow(Clip* clip) {
                     from_pin->id, to_pin->id
                 });
             }
+
+            graph->rebuild_order_from_links();
         }
 
         // 2. Handle DELETING links by dragging them off a pin
@@ -3728,6 +3673,8 @@ void DrawNodeEditorWindow(Clip* clip) {
                 }),
                 links_vec.end()
             );
+
+            graph->rebuild_order_from_links();
         }
         // --- END NEW & CORRECTED LOGIC ---
     } else {

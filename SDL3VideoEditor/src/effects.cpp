@@ -349,6 +349,85 @@ void EffectGraph::rebuild_links_from_order() {
     output_node->editor_pos = ImVec2(current_x, START_Y);
 }
 
+void EffectGraph::rebuild_order_from_links() {
+    node_order.clear(); // Start with a fresh list
+
+    int current_node_id = input_node_id;
+    int safety_break = 0; // Prevents infinite loops if user creates a cycle
+
+    while (current_node_id != output_node_id && safety_break < nodes.size()) {
+        bool found_next = false;
+        // Find the link that starts at the current node
+        for (const auto& link : links) {
+            if (link.from_node_id == current_node_id) {
+                int next_node_id = link.to_node_id;
+                
+                // Only add user-editable effect nodes to the order list
+                if (next_node_id != output_node_id) {
+                    node_order.push_back(next_node_id);
+                }
+                
+                current_node_id = next_node_id;
+                found_next = true;
+                break; // Found the next node in the chain
+            }
+        }
+        if (!found_next) {
+            break; // The chain is broken, stop traversing
+        }
+        safety_break++;
+    }
+}
+
+void EffectGraph::insert_node_before_output(std::shared_ptr<EffectNode> new_node) {
+    int new_id = next_node_id++;
+    new_node->id = new_id;
+    
+    // --- NEW: Auto-positioning logic ---
+    ImVec2 from_pos, to_pos;
+    // --- END NEW ---
+
+    // Find the link that currently goes into the final output node
+    auto it = std::find_if(links.begin(), links.end(), [&](const Link& link) {
+        return link.to_node_id == output_node_id;
+    });
+
+    if (it != links.end()) {
+        Link old_link = *it;
+        
+        // --- NEW: Get the positions of the nodes we are inserting between ---
+        from_pos = nodes.at(old_link.from_node_id)->editor_pos;
+        to_pos = nodes.at(old_link.to_node_id)->editor_pos;
+        // --- END NEW ---
+
+        links.erase(it);
+
+        links.push_back({
+            next_node_id++,
+            old_link.from_node_id, new_id,
+            old_link.from_pin_id, new_node->input_pins[0].id
+        });
+        
+        links.push_back({
+            next_node_id++,
+            new_id, output_node_id,
+            new_node->output_pins[0].id, nodes.at(output_node_id)->input_pins[0].id
+        });
+    }
+
+    // --- NEW: Calculate and set the new node's position ---
+    // Place it halfway between the 'from' and 'to' nodes.
+    new_node->editor_pos.x = from_pos.x + (to_pos.x - from_pos.x) * 0.5f;
+    new_node->editor_pos.y = from_pos.y + (to_pos.y - from_pos.y) * 0.5f;
+    // Nudge the final output node to the right to make space.
+    nodes.at(output_node_id)->editor_pos.x = to_pos.x + 150.0f; // Adjust spacing as needed
+    // --- END NEW ---
+
+    // Finally, add the node to the map and update the simple order list.
+    nodes[new_id] = new_node;
+    rebuild_order_from_links();
+}
+
 void EffectGraph::ProcessNodeGraph(GLuint source_clip_texture, GLuint final_output_fbo, float time, glm::vec2 resolution) {
     if (nodes.empty() || output_node_id == 0) return;
 
