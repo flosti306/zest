@@ -163,7 +163,7 @@ struct EffectGraph {
     // ... (deep copy constructor and processing methods)
     void ProcessNodeGraph(GLuint source_clip_texture, GLuint final_output_fbo, float time, glm::vec2 resolution);
 private:
-    void evaluate_node(int node_id, const EffectContext& base_ctx);
+    void evaluate_node(int node_id, const EffectContext& base_ctx, GLuint source_clip_texture);
 };
 
 struct GaussianBlurNode : public EffectNode {
@@ -531,4 +531,25 @@ struct TextEffectNode : public EffectNode {
 
     void Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) override;
     std::shared_ptr<EffectNode> clone() const override;
+};
+
+struct EmptySourceNode : public EffectNode {
+    EmptySourceNode() {
+        name = "Empty Source";
+        // It has no inputs, only an output.
+        add_pin(false, "Output");
+    }
+
+    // Its "process" is simply to clear the output FBO.
+    void Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) override {
+        glBindFramebuffer(GL_FRAMEBUFFER, ctx.output_fbo);
+        glViewport(0, 0, (int)ctx.resolution.x, (int)ctx.resolution.y);
+        glClearColor(0.0f, 0.0f, 0.0f, 0.0f); // Transparent Black
+        glClear(GL_COLOR_BUFFER_BIT);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    }
+
+    std::shared_ptr<EffectNode> clone() const override {
+        return std::make_shared<EmptySourceNode>(*this);
+    }
 };

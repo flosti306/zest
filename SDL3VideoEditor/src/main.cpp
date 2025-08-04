@@ -539,6 +539,40 @@ void AddNewImageClip(std::vector<Clip>& clips, const std::string& input_path, in
     std::cout << "Added Image clip: " << image_clip.name << " with duration " << DEFAULT_IMAGE_DURATION << "s" << std::endl;
 }
 
+// Place this near your other AddNew... functions
+void AddNewCompositionClip(std::vector<Clip>& clips, float duration) {
+    clips.emplace_back();
+    Clip& comp_clip = clips.back();
+
+    comp_clip.name = "Composition";
+    comp_clip.path = "Composition"; // Use a special identifier, not a file path
+    comp_clip.type = ClipType::Video;
+    comp_clip.start_time = playhead_time;
+    comp_clip.duration = duration;
+    comp_clip.layer = 0;
+
+    // Set default properties
+    comp_clip.has_audio = false;
+    comp_clip.has_effects = true; // It exists only to hold effects
+    comp_clip.selected = false;
+    
+    // --- CRITICAL: Initialize and configure the EffectGraph ---
+    comp_clip.effect_graph = std::make_shared<EffectGraph>();
+    auto& graph = *comp_clip.effect_graph;
+
+    // Find the auto-generated SourceClipNode by its ID
+    int source_node_id = graph.input_node_id;
+    
+    // Replace it with our new EmptySourceNode
+    graph.nodes[source_node_id] = std::make_shared<EmptySourceNode>();
+    graph.nodes[source_node_id]->id = source_node_id; // Assign the same ID
+    
+    // Ensure the graph links are correct after the swap
+    graph.rebuild_links_from_order();
+
+    std::cout << "Added Composition clip." << std::endl;
+}
+
 // --- Video Duration Helper ---
 float get_video_duration(const std::string& input_path) {
     AVFormatContext* fmt_ctx = nullptr;
@@ -1551,6 +1585,12 @@ int main(int argc, char* argv[]) {
         ImGui::Text("Time: %.2f / %.2f", playhead_time, max_duration);
         if (ImGui::SliderFloat("##Seek", &playhead_time, 0.0f, max_duration, "%.2f s")) {
              layers_changed = true; playing = false;
+        }
+        ImGui::Separator();
+        if (ImGui::Button("Add Composition Clip")) {
+            PushUndo(clips, playhead_time, zoom_factor);
+            AddNewCompositionClip(clips, 5.0f); // Default to 5 seconds
+            layers_changed = true;
         }
         ImGui::Separator();
         if (ImGui::Button("Export Video")) {

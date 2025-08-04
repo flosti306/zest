@@ -647,17 +647,22 @@ void render_frame(GLResources& res, float current_time,
         bool is_video = is_video_file(clip.path);
 
         // Find the texture
-        if (is_video) {
-            auto vid_it = res.video_cache.find(clip.path);
-            if (vid_it != res.video_cache.end() && vid_it->second.is_initialized) {
-                tex_id = vid_it->second.texture_id;
+        if (clip.path != "Composition") {
+            if (is_video) {
+                auto vid_it = res.video_cache.find(clip.path);
+                if (vid_it != res.video_cache.end() && vid_it->second.is_initialized) {
+                    tex_id = vid_it->second.texture_id;
+                }
+            } else {
+                auto img_it = res.texture_cache.find(clip.path);
+                if (img_it != res.texture_cache.end()) {
+                    tex_id = img_it->second;
+                }
             }
         } else {
-            auto img_it = res.texture_cache.find(clip.path);
-            if (img_it != res.texture_cache.end()) {
-                tex_id = img_it->second;
-            }
+            tex_id = -1; // special id for compositions
         }
+        
 
         if (tex_id != 0) {
             // If the clip has effects, we need to handle them differently

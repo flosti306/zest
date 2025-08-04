@@ -185,10 +185,32 @@ void EffectGraph::cleanup_transient_resources() {
 }
 
 // Private helper function to recursively evaluate
-void EffectGraph::evaluate_node(int node_id, const EffectContext& base_ctx) {
+void EffectGraph::evaluate_node(int node_id, const EffectContext& base_ctx, GLuint source_clip_texture) {
     auto& node = nodes.at(node_id);
     if (node->is_evaluated_this_frame) {
         return; // Already processed this node, its result is ready.
+    }
+
+    // --- SPECIAL HANDLING FOR SOURCE NODES ---
+    if (node_id == input_node_id) {
+        // Check if it's a standard source node or an empty source node
+        if (auto source_node = std::dynamic_pointer_cast<SourceClipNode>(node)) {
+            // Its result is just the texture passed in from the clip.
+            node->result_texture = source_clip_texture;
+        }
+        else if (auto empty_source_node = std::dynamic_pointer_cast<EmptySourceNode>(node)) {
+            // An EmptySourceNode must generate its own texture by running its process.
+            GLuint output_tex;
+            GLuint temp_fbo = create_temp_fbo(base_ctx.resolution, output_tex);
+            transient_textures.push_back(output_tex); // Manage memory
+            EffectContext node_ctx = base_ctx;
+            node_ctx.output_fbo = temp_fbo;
+            node->Process({}, node_ctx); // Call its process to clear the texture
+            node->result_texture = output_tex;
+            glDeleteFramebuffers(1, &temp_fbo);
+        }
+        node->is_evaluated_this_frame = true;
+        return; // Source nodes have no inputs, so we are done.
     }
 
     // --- NEW: Passthrough logic for disabled nodes ---
@@ -205,7 +227,7 @@ void EffectGraph::evaluate_node(int node_id, const EffectContext& base_ctx) {
             for (const auto& link : links) {
                 if (link.to_pin_id == node->input_pins[0].id) {
                     // Recursively evaluate the node that feeds into this disabled one.
-                    evaluate_node(link.from_node_id, base_ctx);
+                    evaluate_node(link.from_node_id, base_ctx, source_clip_texture);
                     
                     // The result we pass through is the result from that upstream node.
                     passthrough_texture = nodes.at(link.from_node_id)->result_texture;
@@ -227,7 +249,7 @@ void EffectGraph::evaluate_node(int node_id, const EffectContext& base_ctx) {
             if (link.to_pin_id == input_pin.id) {
                 // This link connects to our input pin.
                 // We must recursively evaluate the node that FEEDS this link.
-                evaluate_node(link.from_node_id, base_ctx);
+                evaluate_node(link.from_node_id, base_ctx, source_clip_texture);
                 
                 // Now that the source node is evaluated, get its result texture.
                 input_textures.push_back(nodes.at(link.from_node_id)->result_texture);
@@ -335,14 +357,10 @@ void EffectGraph::ProcessNodeGraph(GLuint source_clip_texture, GLuint final_outp
         node->is_evaluated_this_frame = false;
         node->result_texture = 0;
     }
-    
-    // --- Step 3 becomes Step 2: Set the starting condition ---
-    nodes.at(input_node_id)->result_texture = source_clip_texture;
-    nodes.at(input_node_id)->is_evaluated_this_frame = true;
 
     // --- Step 4 becomes Step 3: Start the recursive evaluation ---
     EffectContext base_ctx = { 0, 0, time, resolution };
-    evaluate_node(output_node_id, base_ctx);
+    evaluate_node(output_node_id, base_ctx, source_clip_texture);
 
     // --- 5. Copy the final result to the destination FBO ---
     // After evaluation, the final image is stored in the output node's input's source.
