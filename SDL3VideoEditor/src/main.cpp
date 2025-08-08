@@ -2848,371 +2848,87 @@ void DrawEffectUIForClip(Clip& clip, GLResources& gl_resources) {
             clip.effect_graph->insert_node_before_output(std::make_shared<TextEffectNode>());
         }
 
+        ImGui::Separator();
+        ImGui::Text("Effect Stack (Drag to Reorder)");
+        ImGui::Separator();
+
         for (size_t i = 0; i < clip.effect_graph->node_order.size(); ++i) {
             bool effect_changed = false;
             int node_id = clip.effect_graph->node_order[i];
             auto& node = clip.effect_graph->nodes[node_id];
 
-            ImGui::PushID(node_id); // Use the STABLE node ID for ImGui
+            ImGui::PushID(node_id); // Use the stable node ID for a unique ID
 
-            const char* node_name = node->name.c_str();
-            ImGui::SetNextItemOpen(true, ImGuiCond_Once);
+            // --- Styling ---
+            // We'll draw a custom UI element that looks like a "pill".
+            ImDrawList* draw_list = ImGui::GetWindowDrawList();
+            ImVec2 cursor_pos = ImGui::GetCursorScreenPos();
+            float item_height = ImGui::GetFrameHeight();
+            float item_width = ImGui::GetContentRegionAvail().x;
+            ImVec2 item_p1 = ImVec2(cursor_pos.x + item_width, cursor_pos.y + item_height);
 
-            // --- DROP TARGET (Part 1) ---
-            // We make the whole item a drop target.
-            // We draw a separator *before* the item to visualize the drop zone.
-            // When hovering, this separator will change color.
-            ImGui::Separator();
+            // Background color for the pill
+            ImU32 bg_color = ImGui::GetColorU32(ImGuiCol_FrameBg);
+            draw_list->AddRectFilled(cursor_pos, item_p1, bg_color, 4.0f);
 
+            // Drag handle icon (three horizontal lines)
+            float handle_width = 10.0f;
+            float handle_x = cursor_pos.x + 8.0f;
+            float handle_y_center = cursor_pos.y + item_height * 0.5f;
+            ImU32 handle_color = ImGui::GetColorU32(ImGuiCol_TextDisabled);
+            draw_list->AddLine(ImVec2(handle_x, handle_y_center - 3), ImVec2(handle_x + handle_width, handle_y_center - 3), handle_color, 1.5f);
+            draw_list->AddLine(ImVec2(handle_x, handle_y_center), ImVec2(handle_x + handle_width, handle_y_center), handle_color, 1.5f);
+            draw_list->AddLine(ImVec2(handle_x, handle_y_center + 3), ImVec2(handle_x + handle_width, handle_y_center + 3), handle_color, 1.5f);
+
+            // Effect name text, indented past the handle
+            ImVec2 text_pos = ImVec2(cursor_pos.x + 30.0f, cursor_pos.y + (item_height - ImGui::GetTextLineHeight()) * 0.5f);
+            draw_list->AddText(text_pos, ImGui::GetColorU32(ImGuiCol_Text), node->name.c_str());
+
+            // Use an invisible button over the whole area to capture input
+            ImGui::InvisibleButton("##effect_item", ImVec2(item_width, item_height));
+            
+            // --- NEW: Double-click to Focus Logic ---
+            if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                if (selected_node_id != -1) ImNodes::ClearNodeSelection(selected_node_id);
+
+                // 1. Set the global selection ID for the Node Inspector
+                selected_node_id = node_id;
+                
+                // 2. Bring the Node Editor and Inspector windows into focus
+                ImGui::SetWindowFocus("Node Editor");
+                ImGui::SetWindowFocus("Node Inspector");
+
+                // 3. Tell ImNodes to pan its view to the selected node
+                ImNodes::SelectNode(node_id);
+            }
+            // --- END NEW ---
+
+            // --- Drag-and-Drop Source (attached to the invisible button) ---
+            if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
+                ImGui::SetDragDropPayload("EFFECT_NODE_DND", &i, sizeof(size_t));
+                ImGui::Text("Moving: %s", node->name.c_str());
+                ImGui::EndDragDropSource();
+            }
+
+            // --- Drag-and-Drop Target (also attached to the invisible button) ---
+            // (The drop target logic is slightly different now, we make the whole item the target)
             if (ImGui::BeginDragDropTarget()) {
                 if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("EFFECT_NODE_DND")) {
                     size_t source_index = *(const size_t*)payload->Data;
                     size_t target_index = i;
 
                     if (source_index != target_index) {
-                        //PushUndo(clips, playhead_time, zoom_factor);
-
-                        // --- REORDER THE node_order VECTOR ---
-                        auto& order_vec = clip.effect_graph->node_order;
+                        // PushUndo(clips, playhead_time, zoom_factor);
+                        auto& order_vec = graph.node_order;
                         int id_to_move = order_vec[source_index];
                         order_vec.erase(order_vec.begin() + source_index);
                         order_vec.insert(order_vec.begin() + target_index, id_to_move);
-
                         graph.rebuild_links_from_order();
-                        
-                        ImGui::EndDragDropTarget();
-                        ImGui::PopID();
-                        break; 
                     }
                 }
                 ImGui::EndDragDropTarget();
             }
 
-            if (ImGui::TreeNode(node_name)) {
-                // --- DRAG SOURCE LOGIC (Now sends the vector index 'i') ---
-                if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
-                    ImGui::SetDragDropPayload("EFFECT_NODE_DND", &i, sizeof(size_t));
-                    ImGui::Text("Moving: %s", node_name);
-                    ImGui::EndDragDropSource();
-                }
-                // Render type-specific UI
-                if (auto blur = std::dynamic_pointer_cast<GaussianBlurNode>(node)) {
-                    ImGui::SliderFloat("Blur Amount", &blur->blur_amount, 0.0f, 50.0f);
-                } else if (auto clr_grade = std::dynamic_pointer_cast<ColorGradingNode>(node)) {
-                    ImGui::SliderFloat("Brightness", &clr_grade->brightness, -1.0f, 1.0f);
-                    ImGui::SliderFloat("Contrast", &clr_grade->contrast, 0.0f, 2.0f);
-                    ImGui::SliderFloat("Saturation", &clr_grade->saturation, 0.0f, 2.0f);
-                    ImGui::SliderFloat("Temperature", &clr_grade->temperature, -1.0f, 1.0f);
-                    ImGui::SliderFloat("Tint", &clr_grade->tint, -1.0f, 1.0f);
-                    ImGui::SliderFloat("Gamma", &clr_grade->gamma, 0.1f, 3.0f);
-                } else if (auto lut = std::dynamic_pointer_cast<LUTColorGradingNode>(node)) {
-                    ImGui::SliderFloat("Strength", &lut->strength, 0.0f, 1.0f);
-                    if (ImGui::Button("Load LUT")) {
-                        const char* load_path = tinyfd_openFileDialog("Load Project", "", 1, NULL, "", 0);
-                        if (load_path) lut->lut_path = load_path;
-                    }
-                } else if (auto mask = std::dynamic_pointer_cast<MaskEffectNode>(node)) {
-                    const char* mask_types[] = { "None", "Rectangle", "Circle", "Texture", "Smart"};
-                    int current_type = static_cast<int>(mask->mask_type);
-                    if (ImGui::Combo("Mask Type", &current_type, mask_types, IM_ARRAYSIZE(mask_types))) {
-                        mask->mask_type = static_cast<MaskEffectNode::MaskType>(current_type);
-                        effect_changed = true;
-                    }
-
-                    effect_changed |= ImGui::Checkbox("Invert Mask", &mask->invert);
-                    effect_changed |= ImGui::SliderFloat("Feather", &mask->feather, 0.0f, 0.5f, "%.3f"); // Adjust range as needed
-                    DrawKeyframeTrackEditor("Feather Keyframes", mask->feather_track);
-
-                    ImGui::Separator();
-
-                    switch (mask->mask_type) {
-                        case MaskEffectNode::MaskType::Rectangle:
-                            ImGui::Text("Rectangle Properties (Normalized)");
-                            effect_changed |= ImGui::SliderFloat2("Center##Rect", &mask->rect_center.x, 0.0f, 1.0f);
-                            DrawKeyframeTrackEditor("Center X Keyframes##Rect", mask->rect_center_x_track);
-                            DrawKeyframeTrackEditor("Center Y Keyframes##Rect", mask->rect_center_y_track);
-                            effect_changed |= ImGui::SliderFloat2("Size##Rect", &mask->rect_size.x, 0.0f, 1.0f);
-                            DrawKeyframeTrackEditor("Size X Keyframes##Rect", mask->rect_size_x_track);
-                            DrawKeyframeTrackEditor("Size Y Keyframes##Rect", mask->rect_size_y_track);
-                            effect_changed |= ImGui::SliderFloat("Rotation##Rect", &mask->rect_rotation, -180.0f, 180.0f);
-                            DrawKeyframeTrackEditor("Rotation Keyframes##Rect", mask->rect_rotation_track);
-                            effect_changed |= ImGui::SliderFloat("Corner Radius##Rect", &mask->rect_corner_radius, 0.0f, 0.5f, "%.3f");
-                            DrawKeyframeTrackEditor("Corner Radius Keyframes##Rect", mask->rect_corner_radius_track);
-                            break;
-                        case MaskEffectNode::MaskType::Circle:
-                            ImGui::Text("Circle Properties (Normalized)");
-                            effect_changed |= ImGui::SliderFloat2("Center##Circle", &mask->circle_center.x, 0.0f, 1.0f);
-                            DrawKeyframeTrackEditor("Center X Keyframes##Circle", mask->circle_center_x_track);
-                            DrawKeyframeTrackEditor("Center Y Keyframes##Circle", mask->circle_center_y_track);
-                            effect_changed |= ImGui::SliderFloat("Radius##Circle", &mask->circle_radius, 0.0f, 1.0f); // Radius relative to smaller dimension? Or just normalized? Let's stick to normalized for now.
-                            DrawKeyframeTrackEditor("Radius Keyframes##Circle", mask->circle_radius_track);
-                            effect_changed |= ImGui::SliderFloat("Aspect Ratio##Circle", &mask->circle_aspect_ratio, 0.1f, 10.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
-                            DrawKeyframeTrackEditor("Aspect Ratio Keyframes##Circle", mask->circle_aspect_ratio_track);
-                            break;
-                        case MaskEffectNode::MaskType::Texture:
-                            ImGui::Text("Texture Mask Properties");
-                            if (ImGui::Button("Load Mask Texture")) {
-                                const char* filterPatterns[3] = { "*.png", "*.bmp", "*.jpg" }; // Allow common image formats
-                                const char* path = tinyfd_openFileDialog("Load Mask Texture", "", 3, filterPatterns, "Image Files", 0);
-                                if (path) {
-                                     if (mask->loadMaskTexture(path)) {
-                                         effect_changed = true;
-                                         if (current_editing_mask_node == mask.get()) cleanup_mask_draw_buffer();
-                                     } else {
-                                        tinyfd_messageBox("Error", "Failed to load mask texture.", "ok", "error", 1);
-                                     }
-                                }
-                            }
-                            ImGui::Text("Path: %s", mask->mask_texture_path.empty() ? "None" : mask->mask_texture_path.c_str());
-                             if (mask->mask_texture != 0) {
-                                 ImGui::Image((ImTextureID)(intptr_t)mask->mask_texture, ImVec2(64, 64), ImVec2(0, 0), ImVec2(1, 1), ImVec4(1,1,1,1), ImVec4(1,1,1,0.5)); // Show preview
-                             } else {
-                                 ImGui::TextColored(ImVec4(1,0,0,1), "No mask texture loaded!");
-                             }
-                            // TODO: Button "Create/Edit Drawn Mask" - opens a dedicated editor window
-                            if (ImGui::Button("Create/Edit Drawn Mask")) {
-                                // Need the clip's current texture for background guide
-                                GLuint bg_tex_id = 0;
-                                if (is_video_file(clip.path)) { // Assuming 'clip' is available here
-                                    auto vid_it = gl_resources.video_cache.find(clip.path); // Assuming gl_resources is available
-                                    if (vid_it != gl_resources.video_cache.end() && vid_it->second.is_initialized) {
-                                        bg_tex_id = vid_it->second.texture_id;
-                                    }
-                                } else {
-                                    auto img_it = gl_resources.texture_cache.find(clip.path);
-                                    if (img_it != gl_resources.texture_cache.end()) {
-                                        bg_tex_id = img_it->second;
-                                    }
-                                }
-                                if (bg_tex_id != 0) {
-                                   OpenMaskEditor(mask.get(), bg_tex_id);
-                                } else {
-                                    tinyfd_messageBox("Error", "Cannot open mask editor: Clip texture not available.", "ok", "warning", 1);
-                                }
-                           }
-
-                           ImGui::Text("Path: %s", mask->mask_texture_path.empty() ? "(Using Drawn Mask)" : mask->mask_texture_path.c_str());
-                            if (mask->mask_texture != 0) {
-                                ImGui::Image((ImTextureID)(intptr_t)mask->mask_texture, ImVec2(128, 128), ImVec2(0, 0), ImVec2(1, 1), ImVec4(1, 1, 1, 1), ImVec4(0, 0, 0, 0.5));
-                            } else {
-                                ImGui::TextColored(ImVec4(1,0,0,1), "No mask texture loaded!");
-                            }
-                           break; // End MaskType::Texture case
-                        case MaskEffectNode::MaskType::Smart_Interactive:
-                            ImGui::Text("Smart Mask");
-                            if (ImGui::Button("Edit Interactive Smart Mask...")) {
-                                DecodedFrame frame_for_smart_mask;
-                                GLuint bg_tex_id_for_smart_mask = 0;
-
-                                // selected_clip should be the same as 'clip' passed to this function
-                                // Ensure 'clip' (the function parameter) is the correct one.
-                                // If selected_clip is a global, it might be different.
-                                // Assuming 'clip' is the relevant one for this effect:
-                                if (is_video_file(clip.path)) { // Check if it's a video
-                                    auto it = gl_resources.video_cache.find(clip.path);
-                                    if (it != gl_resources.video_cache.end() && it->second.is_initialized) {
-                                        VideoData& vid_data = it->second;
-                                        // Use playhead_time (global or passed in) to determine the current frame
-                                        // Make sure playhead_time is accessible here.
-                                        float clip_media_time = playhead_time - clip.start_time + clip.media_start;
-                                        
-                                        ensure_video_decoded_upto(vid_data, clip_media_time);
-                                        
-                                        const DecodedFrame* found_frame = nullptr;
-                                        double min_diff = std::numeric_limits<double>::max();
-                                        for (const auto& cached_f : vid_data.frame_cache) {
-                                            double diff = std::abs(cached_f.pts - clip_media_time);
-                                            if (diff < min_diff) {
-                                                min_diff = diff;
-                                                found_frame = &cached_f;
-                                            }
-                                        }
-                                        if (found_frame) {
-                                            frame_for_smart_mask = *found_frame; 
-                                            bg_tex_id_for_smart_mask = vid_data.texture_id;
-                                        }
-                                    }
-                                } else { // It's an image clip
-                                    auto img_it = gl_resources.texture_cache.find(clip.path);
-                                    if (img_it != gl_resources.texture_cache.end()) {
-                                        bg_tex_id_for_smart_mask = img_it->second;
-                                        // For images, DecodedFrame needs to be constructed from the image pixels.
-                                        // This part is missing if you want to apply GrabCut to images.
-                                        // You'd need a function to load image into a DecodedFrame structure
-                                        // or adapt RunGrabCut to take a GLuint texture ID and read its pixels.
-                                        // For now, let's assume Smart Mask is primarily for video frames.
-                                        // If you want it for images, this path needs more work.
-                                        std::cerr << "Warning: Smart Mask for still images requires loading image pixels into DecodedFrame." << std::endl;
-                                    }
-                                }
-
-
-                                if (!frame_for_smart_mask.pixels.empty() && bg_tex_id_for_smart_mask != 0) {
-                                    // --- THIS IS THE FIX ---
-                                    OpenSmartMaskEditor(mask.get(), bg_tex_id_for_smart_mask, frame_for_smart_mask);
-                                    // --- END FIX ---
-                                } else {
-                                    tinyfd_messageBox("Error", "Could not get current video frame (or its texture) for smart mask.", "ok", "error", 1);
-                                    if (frame_for_smart_mask.pixels.empty()) std::cerr << "Frame for smart mask pixels is empty." << std::endl;
-                                    if (bg_tex_id_for_smart_mask == 0) std::cerr << "Background tex ID for smart mask is 0." << std::endl;
-                                }
-                            }
-                            break;
-                        case MaskEffectNode::MaskType::None:
-                            break; // No specific controls needed
-                    }
-                } else if (auto solid_color_node = std::dynamic_pointer_cast<SolidColorEffectNode>(node)) {
-                    ImGui::Text("Solid Color Properties:");
-                    ImGui::ColorEdit4("Color##Solid", &solid_color_node->color.x); // ImGui uses float pointers for colors
-                    DrawKeyframeTrackEditor("Red", solid_color_node->red_track);
-                    DrawKeyframeTrackEditor("Green", solid_color_node->green_track);
-                    DrawKeyframeTrackEditor("Blue", solid_color_node->blue_track);
-                    DrawKeyframeTrackEditor("Alpha", solid_color_node->alpha_track);
-                    ImGui::SliderFloat("Blend with Original##Solid", &solid_color_node->blend_with_original, 0.0f, 1.0f);
-                    DrawKeyframeTrackEditor("Blend", solid_color_node->blend_track);
-
-                } else if (auto gradient_node = std::dynamic_pointer_cast<GradientEffectNode>(node)) {
-                    ImGui::Text("Gradient Properties:");
-                    const char* grad_types[] = { "Linear", "Radial" };
-                    int current_g_type = static_cast<int>(gradient_node->type);
-                    if (ImGui::Combo("Type##Gradient", &current_g_type, grad_types, IM_ARRAYSIZE(grad_types))) {
-                        gradient_node->type = static_cast<GradientEffectNode::GradientType>(current_g_type);
-                    }
-
-                    ImGui::ColorEdit4("Start Color##Gradient", &gradient_node->color_start.x);
-                    ImGui::ColorEdit4("End Color##Gradient", &gradient_node->color_end.x);
-                    // Example keyframes for alpha
-                    DrawKeyframeTrackEditor("Start Alpha", gradient_node->start_color_alpha_track);
-                    DrawKeyframeTrackEditor("End Alpha", gradient_node->end_color_alpha_track);
-
-
-                    if (gradient_node->type == GradientEffectNode::GradientType::Linear) {
-                        ImGui::SliderFloat2("Start Point##LinearGrad", &gradient_node->start_point.x, 0.0f, 1.0f, "%.2f");
-                        ImGui::SliderFloat2("End Point##LinearGrad", &gradient_node->end_point.x, 0.0f, 1.0f, "%.2f");
-                    } else if (gradient_node->type == GradientEffectNode::GradientType::Radial) {
-                        ImGui::SliderFloat2("Center##RadialGrad", &gradient_node->center_point.x, 0.0f, 1.0f, "%.2f");
-                        ImGui::SliderFloat("Inner Radius##RadialGrad", &gradient_node->radius_inner, 0.0f, 1.0f, "%.3f");
-                        ImGui::SliderFloat("Outer Radius##RadialGrad", &gradient_node->radius_outer, 0.0f, 1.5f, "%.3f"); // Outer can go beyond 1
-                        ImGui::SliderFloat("Aspect Ratio##RadialGrad", &gradient_node->aspect_ratio, 0.1f, 10.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
-                        ImGui::TextWrapped("Aspect ratio for radial. 1.0 attempts to use viewport aspect. Other values override.");
-                    }
-
-                    ImGui::SliderFloat("Intensity##Gradient", &gradient_node->intensity, 0.0f, 1.0f);
-                    DrawKeyframeTrackEditor("Intensity", gradient_node->intensity_track);
-                } else if (auto shadow_node = std::dynamic_pointer_cast<DropShadowEffectNode>(node)) {
-                    ImGui::Text("Drop Shadow Properties:");
-                    ImGui::DragFloat2("Offset##Shadow", &shadow_node->offset.x, 0.001f, -1.0f, 1.0f, "%.3f");
-                    DrawKeyframeTrackEditor("Offset X##Shadow", shadow_node->offset_x_track);
-                    DrawKeyframeTrackEditor("Offset Y##Shadow", shadow_node->offset_y_track);
-
-                    ImGui::ColorEdit4("Shadow Color##Shadow", &shadow_node->shadow_color.x);
-                    // Add keyframe editors for shadow_color components if desired
-                    // DrawKeyframeTrackEditor("Shadow R", shadow_node->shadow_r_track); ... etc.
-
-
-                    ImGui::SliderFloat("Blur Amount##Shadow", &shadow_node->blur_amount, 0.0f, 50.0f);
-                    DrawKeyframeTrackEditor("Blur Amount", shadow_node->blur_amount_track);
-                } else if (auto keyer = std::dynamic_pointer_cast<ChromaKeyNode>(node)) {
-                    ImGui::Text("Chroma Key Properties:");
-                    ImGui::ColorEdit3("Key Color", &keyer->key_color.x);
-                    ImGui::SameLine();
-                    if (eyedropper_icon_tex_id != 0) {
-                        // Use the loaded icon as a button
-                        if (ImGui::ImageButton("##eyedropper", (ImTextureID)(intptr_t)eyedropper_icon_tex_id, ImVec2(16, 16))) {
-                            eyedropper_active = true;
-                            target_chroma_key_node = keyer.get();
-                        }
-                    } else {
-                        // Fallback to a text button if the icon failed to load
-                        if (ImGui::Button("...")) { // Shorter text
-                            eyedropper_active = true;
-                            target_chroma_key_node = keyer.get();
-                        }
-                    }
-                    if (ImGui::IsItemHovered()) {
-                        ImGui::SetTooltip("Pick color from preview");
-                    }
-                    if (eyedropper_active && target_chroma_key_node == keyer.get()) {
-                        ImGui::SameLine();
-                        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "Picking...");
-                    }
-                    ImGui::SliderFloat("Similarity", &keyer->similarity, 0.0f, 1.0f, "%.3f");
-                    ImGui::SliderFloat("Blend", &keyer->blend, 0.0f, 1.0f, "%.3f");
-                    ImGui::SliderFloat("Spill Suppression", &keyer->spill, 0.0f, 1.0f, "%.3f");
-                } else if (auto text_node = std::dynamic_pointer_cast<TextEffectNode>(node)) {
-                    char text_buffer[1024];
-                    strncpy(text_buffer, text_node->text_content.c_str(), sizeof(text_buffer));
-                    if (ImGui::InputTextMultiline("Text", text_buffer, sizeof(text_buffer))) {
-                        text_node->text_content = text_buffer;
-                    }
-
-                    char font_path_buffer[260];
-                    strncpy(font_path_buffer, text_node->font_path.c_str(), sizeof(font_path_buffer));
-                    if (ImGui::InputText("Font Path", font_path_buffer, sizeof(font_path_buffer))) {
-                        text_node->font_path = font_path_buffer;
-                        text_node->needs_rebake = true;
-                    }
-                    ImGui::SameLine();
-                    if (ImGui::Button("...")) {
-                        const char* filters[] = { "*.ttf" };
-                        const char* path = tinyfd_openFileDialog("Select Font", text_node->font_path.c_str(), 1, filters, "TrueType Fonts (*.ttf)", 0);
-                        if (path) {
-                            text_node->font_path = path;
-                            text_node->needs_rebake = true;
-                        }
-                    }
-                    
-                    if (ImGui::DragFloat("Font Size", &text_node->font_size, 1.0f, 8.0f, 256.0f)) {
-                        text_node->needs_rebake = true;
-                    }
-
-                    ImGui::ColorEdit4("Color", &text_node->text_color.x);
-                    ImGui::SliderFloat2("Position", &text_node->position.x, 0.0f, 1.0f);
-                    ImGui::SliderFloat("Rotation", &text_node->rotation, -180.0f, 180.0f);
-                    
-                    ImGui::Separator();
-                    ImGui::Checkbox("Enable Outline", &text_node->has_outline);
-                    if (text_node->has_outline) {
-                        ImGui::ColorEdit4("Outline Color", &text_node->outline_color.x);
-                        ImGui::DragFloat("Outline Thickness", &text_node->outline_thickness, 0.005f, 0.0f, 0.5f);
-                    }
-
-                    ImGui::Separator();
-                    ImGui::Checkbox("Show Background", &text_node->has_background);
-                    if (text_node->has_background) {
-                        ImGui::ColorEdit4("BG Color", &text_node->background_color.x);
-                        ImGui::DragFloat("BG Padding", &text_node->background_padding, 1.0f, 0.0f, 100.0f);
-                    }
-                } else if (auto merge_node = std::dynamic_pointer_cast<MergeNode>(node)) {
-                    // Dropdown for BlendMode enum
-                    const char* blend_modes[] = { "Normal", "Additive", "Multiply", "Screen", "Darken", "Lighten", "Difference", "Subtract", "Divide", "Overlay"};
-                    int current_mode = static_cast<int>(merge_node->blend_mode);
-                    if (ImGui::Combo("Blend Mode", &current_mode, blend_modes, IM_ARRAYSIZE(blend_modes))) {
-                        merge_node->blend_mode = static_cast<BlendMode>(current_mode);
-                    }
-
-                    ImGui::SliderFloat("Mix", &merge_node->mix, 0.0f, 1.0f);
-                    if (ImGui::IsItemHovered()) {
-                        ImGui::SetTooltip("Controls the opacity of the Foreground (A) input.");
-                    }
-                }
-
-                // Render common UI elements
-                ImGui::Checkbox("Enabled", &node->enabled);
-                if (ImGui::Button("Remove")) {
-                    auto& graph = *clip.effect_graph;
-                    graph.nodes.erase(node_id); // Remove from map by key
-                    graph.node_order.erase(graph.node_order.begin() + i); // Remove from order vector by iterator
-                    graph.rebuild_links_from_order();
-
-                    ImGui::TreePop();
-                    ImGui::PopID();
-
-                    break;
-                }
-
-                ImGui::TreePop();
-            }
             ImGui::PopID();
         }
     }
