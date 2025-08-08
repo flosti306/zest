@@ -13,7 +13,7 @@ else
 endif
 
 # --- OpenCV Configuration (Point to your installed OpenCV) ---
-OPENCV_INSTALL_DIR = C:/Programs/OpenCV/opencv/build_mingw/install
+OPENCV_INSTALL_DIR = C:/Programs/OpenCV/opencv-4.12.0/build_mingw/install
 OPENCV_SUBDIR_FOR_LIBS_BINS = x64/mingw
 
 # Corrected construction - ensure no extra spaces are introduced
@@ -21,10 +21,11 @@ OPENCV_INCLUDE_DIR = $(OPENCV_INSTALL_DIR)/include
 OPENCV_LIB_DIR = $(OPENCV_INSTALL_DIR)/$(OPENCV_SUBDIR_FOR_LIBS_BINS)/lib
 OPENCV_BIN_DIR = $(OPENCV_INSTALL_DIR)/$(OPENCV_SUBDIR_FOR_LIBS_BINS)/bin
 
-OPENCV_VERSION_SUFFIX = 4110
+OPENCV_VERSION_SUFFIX = 4120
 
 OPENCV_LIBS = -lopencv_core$(OPENCV_VERSION_SUFFIX) \
-              -lopencv_imgproc$(OPENCV_VERSION_SUFFIX)
+              -lopencv_imgproc$(OPENCV_VERSION_SUFFIX) \
+              -lopencv_tracking$(OPENCV_VERSION_SUFFIX)
 
 # Use quotes around each path individually for -I and -L
 INCLUDE_DIRS = -Iinclude -Iinclude/SDL3 -Iinclude/imgui -Iinclude/ffmpeg -I"$(OPENCV_INCLUDE_DIR)"

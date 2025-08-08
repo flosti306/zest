@@ -7,6 +7,7 @@
 #include <iostream>
 #include <sstream>
 #include <map>
+#include <any>
 #include <glm/glm.hpp>
 #include <glad/glad.h> // Include glad for OpenGL function loading
 #include <SDL3/SDL.h>
@@ -30,11 +31,25 @@ GLuint LoadShaderProgram(const std::string& vert_path, const std::string& frag_p
 
 struct EffectNode;
 
+enum class PinType {
+    Image,
+    Transform,
+    Float, // For future use (e.g., a slider value)
+    // Add other data types like Color, Vector, etc. as needed
+};
+
+struct TransformData {
+    glm::vec2 translate = {0.0f, 0.0f};
+    glm::vec2 scale = {1.0f, 1.0f};
+    float rotation = 0.0f;
+};
+
 // Represents an input or output "pin" on a node
 struct Pin {
     int id;
     EffectNode* node; // The node this pin belongs to
     std::string name;
+    PinType type;
 };
 
 struct EffectContext {
@@ -43,6 +58,8 @@ struct EffectContext {
     float time = 0.0f;        // Timeline time
     glm::vec2 resolution;     // Frame resolution
 };
+
+inline Pin* find_pin_by_id(EffectNode* node, int pin_id);
 
 struct EffectNode {
     int id; // Every node now needs a unique ID
@@ -56,26 +73,33 @@ struct EffectNode {
 
     // Cache the result of this node's processing for one frame
     GLuint result_texture = 0;
+    std::map<int, std::any> data_outputs;
     bool is_evaluated_this_frame = false;
 
     virtual ~EffectNode() = default;
 
     // Process is now given a list of its input textures
-    virtual void Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) = 0;
+    virtual void Process(const std::vector<GLuint>& image_inputs, const std::map<int, std::any>& data_inputs, const EffectContext& ctx) = 0;
     
     virtual std::shared_ptr<EffectNode> clone() const = 0;
 
 protected:
     // Helper to create pins in constructors
-    void add_pin(bool is_input, const std::string& pin_name) {
-        static int next_pin_id = 1; // Global pin ID counter
+    void add_pin(bool is_input, const std::string& pin_name, PinType type) {
+        static int next_pin_id = 1;
         if (is_input) {
-            input_pins.push_back({next_pin_id++, this, pin_name});
+            input_pins.push_back({next_pin_id++, this, pin_name, type});
         } else {
-            output_pins.push_back({next_pin_id++, this, pin_name});
+            output_pins.push_back({next_pin_id++, this, pin_name, type});
         }
     }
 };
+
+inline Pin* find_pin_by_id(EffectNode* node, int pin_id) {
+    for (auto& pin : node->output_pins) if (pin.id == pin_id) return &pin;
+    for (auto& pin : node->input_pins) if (pin.id == pin_id) return &pin;
+    return nullptr;
+}
 
 // Represents a connection between two pins
 struct Link {
@@ -87,13 +111,13 @@ struct Link {
 struct SourceClipNode : public EffectNode {
     SourceClipNode() {
         name = "Source Clip";
-        add_pin(false, "Source"); // Add one output pin
+        add_pin(false, "Source", PinType::Image); // Add one output pin
         editor_pos = ImVec2(50.0f, 100.0f);
     }
 
     // This node doesn't process anything; it's just a starting point.
     // The evaluation engine will assign its texture manually.
-    void Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) override {}
+    void Process(const std::vector<GLuint>& image_inputs, const std::map<int, std::any>& data_inputs, const EffectContext& ctx) override {}
 
     std::shared_ptr<EffectNode> clone() const override {
         return std::make_shared<SourceClipNode>(*this);
@@ -104,13 +128,13 @@ struct SourceClipNode : public EffectNode {
 struct FinalOutputNode : public EffectNode {
     FinalOutputNode() {
         name = "Final Output";
-        add_pin(true, "Final Image"); // Add one input pin
+        add_pin(true, "Final Image", PinType::Image); // Add one input pin
         editor_pos = ImVec2(300.0f, 100.0f);
     }
 
     // This node is just a sink. The evaluation engine takes its input
     // and blits it to the final framebuffer.
-    void Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) override {}
+    void Process(const std::vector<GLuint>& image_inputs, const std::map<int, std::any>& data_inputs, const EffectContext& ctx) override {}
 
     std::shared_ptr<EffectNode> clone() const override {
         return std::make_shared<FinalOutputNode>(*this);
@@ -174,11 +198,11 @@ struct GaussianBlurNode : public EffectNode {
 
     GaussianBlurNode() {
         name = "Gaussian Blur";
-        add_pin(true, "Image");  // One input pin
-        add_pin(false, "Image"); // One output pin
+        add_pin(true, "Image", PinType::Image);  // One input pin
+        add_pin(false, "Image", PinType::Image); // One output pin
     }
 
-    void Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) override;
+    void Process(const std::vector<GLuint>& image_inputs, const std::map<int, std::any>& data_inputs, const EffectContext& ctx) override;
 
     std::shared_ptr<EffectNode> clone() const override {
         auto new_node = std::make_shared<GaussianBlurNode>();
@@ -198,11 +222,11 @@ struct ColorGradingNode : public EffectNode {
     
     ColorGradingNode() {
         name = "Color Grading";
-        add_pin(true, "Image");
-        add_pin(false, "Image");
+        add_pin(true, "Image", PinType::Image);
+        add_pin(false, "Image", PinType::Image);
     }
     
-    void Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) override;
+    void Process(const std::vector<GLuint>& image_inputs, const std::map<int, std::any>& data_inputs, const EffectContext& ctx) override;
 
     std::shared_ptr<EffectNode> clone() const override {
         auto new_node = std::make_shared<ColorGradingNode>();
@@ -224,8 +248,8 @@ struct LUTColorGradingNode : public EffectNode {
     
     LUTColorGradingNode() {
         name = "LUT Color Grading";
-        add_pin(true, "Image");
-        add_pin(false, "Image");
+        add_pin(true, "Image", PinType::Image);
+        add_pin(false, "Image", PinType::Image);
     }
     
     ~LUTColorGradingNode() {
@@ -237,7 +261,7 @@ struct LUTColorGradingNode : public EffectNode {
     // Load a LUT from file (supports common 3D LUT formats)
     bool loadLUT(const std::string& path);
     
-    void Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) override;
+    void Process(const std::vector<GLuint>& image_inputs, const std::map<int, std::any>& data_inputs, const EffectContext& ctx) override;
 
     std::shared_ptr<EffectNode> clone() const override {
         auto new_node = std::make_shared<LUTColorGradingNode>();
@@ -301,8 +325,8 @@ struct MaskEffectNode : public EffectNode {
 
     MaskEffectNode() {
         name = "Mask";
-        add_pin(true, "Image");
-        add_pin(false, "Image");
+        add_pin(true, "Image", PinType::Image);
+        add_pin(false, "Image", PinType::Image);
     }
 
     ~MaskEffectNode() override {
@@ -326,7 +350,7 @@ struct MaskEffectNode : public EffectNode {
     // Function to load a texture mask
     bool loadMaskTexture(const std::string& path);
 
-    void Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) override;
+    void Process(const std::vector<GLuint>& image_inputs, const std::map<int, std::any>& data_inputs, const EffectContext& ctx) override;
 
 
     enum class GrabCutInitMode { RECT, MASK };
@@ -359,11 +383,11 @@ struct SolidColorEffectNode : public EffectNode {
 
     SolidColorEffectNode() {
         name = "Solid Color Overlay";
-        add_pin(true, "Image");
-        add_pin(false, "Image");
+        add_pin(true, "Image", PinType::Image);
+        add_pin(false, "Image", PinType::Image);
     }
 
-    void Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) override;
+    void Process(const std::vector<GLuint>& image_inputs, const std::map<int, std::any>& data_inputs, const EffectContext& ctx) override;
 
     std::shared_ptr<EffectNode> clone() const override {
         auto new_node = std::make_shared<SolidColorEffectNode>();
@@ -405,11 +429,11 @@ struct GradientEffectNode : public EffectNode {
 
     GradientEffectNode() {
         name = "Gradient Overlay";
-        add_pin(true, "Image");
-        add_pin(false, "Image");
+        add_pin(true, "Image", PinType::Image);
+        add_pin(false, "Image", PinType::Image);
     }
 
-    void Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) override;
+    void Process(const std::vector<GLuint>& image_inputs, const std::map<int, std::any>& data_inputs, const EffectContext& ctx) override;
 
     std::shared_ptr<EffectNode> clone() const override {
         auto new_node = std::make_shared<GradientEffectNode>();
@@ -444,8 +468,8 @@ struct DropShadowEffectNode : public EffectNode {
 
     DropShadowEffectNode() {
         name = "Drop Shadow";
-        add_pin(true, "Image");
-        add_pin(false, "Image");
+        add_pin(true, "Image", PinType::Image);
+        add_pin(false, "Image", PinType::Image);
     }
 
     ~DropShadowEffectNode() override {
@@ -458,7 +482,7 @@ struct DropShadowEffectNode : public EffectNode {
     // Helper to manage internal FBOs/textures
     void EnsureTempResources(int width, int height);
 
-    void Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) override;
+    void Process(const std::vector<GLuint>& image_inputs, const std::map<int, std::any>& data_inputs, const EffectContext& ctx) override;
 
     std::shared_ptr<EffectNode> clone() const override {
         auto new_node = std::make_shared<DropShadowEffectNode>();
@@ -480,11 +504,11 @@ struct ChromaKeyNode : public EffectNode {
 
     ChromaKeyNode() {
         name = "Chroma Key";
-        add_pin(true, "Image");
-        add_pin(false, "Image");
+        add_pin(true, "Image", PinType::Image);
+        add_pin(false, "Image", PinType::Image);
     }
 
-    void Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) override;
+    void Process(const std::vector<GLuint>& image_inputs, const std::map<int, std::any>& data_inputs, const EffectContext& ctx) override;
 
     std::shared_ptr<EffectNode> clone() const override {
         auto new_node = std::make_shared<ChromaKeyNode>();
@@ -519,8 +543,8 @@ struct TextEffectNode : public EffectNode {
 
     TextEffectNode() {
         name = "Text";
-        add_pin(true, "Image");
-        add_pin(false, "Image");
+        add_pin(true, "Image", PinType::Image);
+        add_pin(false, "Image", PinType::Image);
     }
     
     ~TextEffectNode() override {
@@ -532,7 +556,7 @@ struct TextEffectNode : public EffectNode {
     // Public method to trigger a font re-bake
     void RebakeFont();
 
-    void Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) override;
+    void Process(const std::vector<GLuint>& image_inputs, const std::map<int, std::any>& data_inputs, const EffectContext& ctx) override;
     std::shared_ptr<EffectNode> clone() const override;
 };
 
@@ -540,11 +564,11 @@ struct EmptySourceNode : public EffectNode {
     EmptySourceNode() {
         name = "Empty Source";
         // It has no inputs, only an output.
-        add_pin(false, "Output");
+        add_pin(false, "Output", PinType::Image);
     }
 
     // Its "process" is simply to clear the output FBO.
-    void Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) override {
+    void Process(const std::vector<GLuint>& image_inputs, const std::map<int, std::any>& data_inputs, const EffectContext& ctx) override {
         glBindFramebuffer(GL_FRAMEBUFFER, ctx.output_fbo);
         glViewport(0, 0, (int)ctx.resolution.x, (int)ctx.resolution.y);
         glClearColor(0.0f, 0.0f, 0.0f, 0.0f); // Transparent Black
@@ -565,13 +589,13 @@ struct MergeNode : public EffectNode {
     MergeNode() {
         name = "Merge";
         // Define two inputs and one output
-        add_pin(true, "B (Background)"); // First input is the background layer
-        add_pin(true, "A (Foreground)"); // Second input is the layer to composite on top
-        add_pin(false, "Output");
+        add_pin(true, "B (Background)", PinType::Image); // First input is the background layer
+        add_pin(true, "A (Foreground)", PinType::Image); // Second input is the layer to composite on top
+        add_pin(false, "Output", PinType::Image);
     }
 
     // Process will now receive two textures in its 'inputs' vector
-    void Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) override;
+    void Process(const std::vector<GLuint>& image_inputs, const std::map<int, std::any>& data_inputs, const EffectContext& ctx) override;
     std::shared_ptr<EffectNode> clone() const override;
 };
 
@@ -584,10 +608,45 @@ struct TransformNode : public EffectNode {
 
     TransformNode() {
         name = "Transform";
-        add_pin(true, "Image");
-        add_pin(false, "Image");
+        add_pin(true, "Image", PinType::Image);
+        add_pin(true, "Transform", PinType::Transform);
+        add_pin(false, "Image", PinType::Image);
     }
 
-    void Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) override;
+    void Process(const std::vector<GLuint>& image_inputs, const std::map<int, std::any>& data_inputs, const EffectContext& ctx) override;
+    std::shared_ptr<EffectNode> clone() const override;
+};
+
+struct TrackerNode : public EffectNode {
+    // --- UI Properties ---
+    // The initial ROI is set by the user, in normalized [0,1] coords
+    cv::Rect2f initial_roi_norm; 
+    
+    // --- Public State ---
+    bool is_initialized = false;
+    bool is_selecting_roi = false; // Is the user currently drawing the box?
+
+    int track_start_frame = 0;
+    int track_end_frame = 100;
+
+    // --- Internal State ---
+    cv::Ptr<cv::Tracker> tracker;
+    // Cache of found transforms, mapping frame number to TransformData
+    std::map<int, TransformData> tracking_data_cache;
+
+    TrackerNode() {
+        name = "Tracker";
+        add_pin(true, "Image", PinType::Image);
+        add_pin(false, "Transform", PinType::Transform);
+    }
+
+    void Process(const std::vector<GLuint>& image_inputs,
+                 const std::map<int, std::any>& data_inputs,
+                 const EffectContext& ctx) override;
+    
+    // NEW: The function that does the heavy lifting
+    void InitializeAt(const DecodedFrame& frame);
+    void TrackRange(const Clip& clip, GLResources& res, int start_frame, int end_frame, int export_fps);
+
     std::shared_ptr<EffectNode> clone() const override;
 };

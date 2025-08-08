@@ -205,7 +205,7 @@ void EffectGraph::evaluate_node(int node_id, const EffectContext& base_ctx, GLui
             transient_textures.push_back(output_tex); // Manage memory
             EffectContext node_ctx = base_ctx;
             node_ctx.output_fbo = temp_fbo;
-            node->Process({}, node_ctx); // Call its process to clear the texture
+            node->Process({}, {}, node_ctx); // Call its process to clear the texture
             node->result_texture = output_tex;
             glDeleteFramebuffers(1, &temp_fbo);
         }
@@ -242,18 +242,31 @@ void EffectGraph::evaluate_node(int node_id, const EffectContext& base_ctx, GLui
         return; // CRITICAL: Skip the rest of the function.
     }
 
-    // 1. Gather the textures from all incoming connections.
-    std::vector<GLuint> input_textures;
+    // --- UPDATED: Input Gathering ---
+    std::vector<GLuint> image_inputs;
+    std::map<int, std::any> data_inputs;
+
     for (const auto& input_pin : node->input_pins) {
         for (const auto& link : links) {
             if (link.to_pin_id == input_pin.id) {
-                // This link connects to our input pin.
-                // We must recursively evaluate the node that FEEDS this link.
                 evaluate_node(link.from_node_id, base_ctx, source_clip_texture);
                 
-                // Now that the source node is evaluated, get its result texture.
-                input_textures.push_back(nodes.at(link.from_node_id)->result_texture);
-                break; // Move to the next input pin
+                auto& from_node = nodes.at(link.from_node_id);
+                // Find the specific output pin on the source node that this link comes from
+                Pin* from_pin = find_pin_by_id(from_node.get(), link.from_pin_id);
+
+                if (from_pin) {
+                    if (from_pin->type == PinType::Image) {
+                        image_inputs.push_back(from_node->result_texture);
+                    } else {
+                        // If it's a data pin, find the data in the source node's output map
+                        auto data_it = from_node->data_outputs.find(from_pin->id);
+                        if (data_it != from_node->data_outputs.end()) {
+                            data_inputs[input_pin.id] = data_it->second;
+                        }
+                    }
+                }
+                break;
             }
         }
     }
@@ -268,7 +281,7 @@ void EffectGraph::evaluate_node(int node_id, const EffectContext& base_ctx, GLui
     EffectContext node_ctx = base_ctx;
     node_ctx.output_fbo = temp_fbo;
     
-    node->Process(input_textures, node_ctx);
+    node->Process(image_inputs, data_inputs, node_ctx);
 
     // 3. Store the result and mark the node as finished for this frame.
     node->result_texture = output_tex_for_this_node;
@@ -533,14 +546,14 @@ bool LUTColorGradingNode::loadLUT(const std::string& path) {
     return true;
 }
 
-void GaussianBlurNode::Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) {
-    if (!enabled || inputs.empty() || inputs[0] == 0) return;
+void GaussianBlurNode::Process(const std::vector<GLuint>& image_inputs, const std::map<int, std::any>& data_inputs, const EffectContext& ctx) {
+    if (!enabled || image_inputs.empty() || image_inputs[0] == 0) return;
         
     // Load shader program (consider caching this instead of loading every frame)
     GLuint blur_shader_program = LoadShaderProgram("shaders/blur.vert", "shaders/blur.frag");
     if (blur_shader_program == 0) return;
 
-    GLuint input_texture = inputs[0];
+    GLuint input_texture = image_inputs[0];
         
     // Setup modern shader VAO/VBO for the fullscreen quad
     static GLuint quadVAO = 0;
@@ -636,10 +649,10 @@ void GaussianBlurNode::Process(const std::vector<GLuint>& inputs, const EffectCo
     destroy_temp_fbo(horizontal_fbo, horizontal_tex);
 }
 
-void ColorGradingNode::Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) {
-    if (!enabled || inputs.empty() || inputs[0] == 0) return;
+void ColorGradingNode::Process(const std::vector<GLuint>& image_inputs, const std::map<int, std::any>& data_inputs, const EffectContext& ctx) {
+    if (!enabled || image_inputs.empty() || image_inputs[0] == 0) return;
 
-    GLuint input_texture = inputs[0];
+    GLuint input_texture = image_inputs[0];
     
     // Load shader program (consider caching this instead of loading every frame)
     GLuint color_grade_program = LoadShaderProgram("shaders/colorgrade.vert", "shaders/colorgrade.frag");
@@ -731,10 +744,10 @@ void ColorGradingNode::applyFadedFilmPreset() {
     ColorGradingNode::gamma = 1.0f;
 }
 
-void LUTColorGradingNode::Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) {
-    if (!enabled || inputs.empty() || inputs[0] == 0 || lut_texture == 0) return;
+void LUTColorGradingNode::Process(const std::vector<GLuint>& image_inputs, const std::map<int, std::any>& data_inputs, const EffectContext& ctx) {
+    if (!enabled || image_inputs.empty() || image_inputs[0] == 0 || lut_texture == 0) return;
 
-    GLuint input_texture = inputs[0];
+    GLuint input_texture = image_inputs[0];
     
     // Load shader program (consider caching this instead of loading every frame)
     GLuint lut_program = LoadShaderProgram("shaders/lut.vert", "shaders/lut.frag");
@@ -840,10 +853,10 @@ bool MaskEffectNode::loadMaskTexture(const std::string& path) {
 
 
 // NEW: Implementation for MaskEffectNode::Process
-void MaskEffectNode::Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) {
-    if (!enabled || inputs.empty() || inputs[0] == 0 || mask_type == MaskType::None) return;
+void MaskEffectNode::Process(const std::vector<GLuint>& image_inputs, const std::map<int, std::any>& data_inputs, const EffectContext& ctx) {
+    if (!enabled || image_inputs.empty() || image_inputs[0] == 0 || mask_type == MaskType::None) return;
 
-    GLuint input_texture = inputs[0];
+    GLuint input_texture = image_inputs[0];
 
     // Load shader program (consider caching)
     GLuint mask_program = LoadShaderProgram("shaders/mask.vert", "shaders/mask.frag");
@@ -1048,10 +1061,10 @@ GLuint MaskEffectNode::RunGrabCut(const DecodedFrame& current_clip_frame,
     return generated_texture_id;
 }
 
-void SolidColorEffectNode::Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) {
-    if (!enabled || inputs.empty() || inputs[0] == 0) return;
+void SolidColorEffectNode::Process(const std::vector<GLuint>& image_inputs, const std::map<int, std::any>& data_inputs, const EffectContext& ctx) {
+    if (!enabled || image_inputs.empty() || image_inputs[0] == 0) return;
 
-    GLuint input_texture = inputs[0];
+    GLuint input_texture = image_inputs[0];
 
     // Consider caching shader programs
     static GLuint program = 0;
@@ -1090,10 +1103,10 @@ void SolidColorEffectNode::Process(const std::vector<GLuint>& inputs, const Effe
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }
 
-void GradientEffectNode::Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) {
-    if (!enabled || inputs.empty() || inputs[0] == 0) return;
+void GradientEffectNode::Process(const std::vector<GLuint>& image_inputs, const std::map<int, std::any>& data_inputs, const EffectContext& ctx) {
+    if (!enabled || image_inputs.empty() || image_inputs[0] == 0) return;
 
-    GLuint input_texture = inputs[0];
+    GLuint input_texture = image_inputs[0];
 
     static GLuint program = 0;
     if (program == 0) {
@@ -1171,13 +1184,13 @@ void DropShadowEffectNode::EnsureTempResources(int width, int height) {
 }
 
 
-void DropShadowEffectNode::Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) {
-    if (!enabled || inputs.empty() || inputs[0] == 0) {
+void DropShadowEffectNode::Process(const std::vector<GLuint>& image_inputs, const std::map<int, std::any>& data_inputs, const EffectContext& ctx) {
+    if (!enabled || image_inputs.empty() || image_inputs[0] == 0) {
         // If disabled, we must do a passthrough to not break the chain.
         // The evaluation engine's passthrough logic handles this.
         return;
     }
-    GLuint input_texture = inputs[0];
+    GLuint input_texture = image_inputs[0];
 
     EnsureTempResources((int)ctx.resolution.x, (int)ctx.resolution.y);
     if (temp_fbo1 == 0 || temp_fbo2 == 0) return; // Can't proceed without resources
@@ -1250,10 +1263,10 @@ void DropShadowEffectNode::Process(const std::vector<GLuint>& inputs, const Effe
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 
-void ChromaKeyNode::Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) {
-    if (!enabled || inputs.empty() || inputs[0] == 0) return;
+void ChromaKeyNode::Process(const std::vector<GLuint>& image_inputs, const std::map<int, std::any>& data_inputs, const EffectContext& ctx) {
+    if (!enabled || image_inputs.empty() || image_inputs[0] == 0) return;
 
-    GLuint input_texture = inputs[0];
+    GLuint input_texture = image_inputs[0];
 
     // Load shader program (consider caching this for performance)
     GLuint chroma_key_program = LoadShaderProgram("shaders/passthrough.vert", "shaders/chroma_key.frag");
@@ -1341,9 +1354,9 @@ void TextEffectNode::RebakeFont() {
     std::cout << "Re-baked SDF font: " << font_path << " at size " << font_size << std::endl;
 }
 
-void TextEffectNode::Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) {
+void TextEffectNode::Process(const std::vector<GLuint>& image_inputs, const std::map<int, std::any>& data_inputs, const EffectContext& ctx) {
     if (!enabled) return;
-    GLuint input_texture = inputs.empty() ? 0 : inputs[0];
+    GLuint input_texture = image_inputs.empty() ? 0 : image_inputs[0];
 
     if (needs_rebake) {
         RebakeFont();
@@ -1468,19 +1481,19 @@ std::shared_ptr<EffectNode> MergeNode::clone() const {
     return std::make_shared<MergeNode>(*this);
 }
 
-void MergeNode::Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) {
+void MergeNode::Process(const std::vector<GLuint>& image_inputs, const std::map<int, std::any>& data_inputs, const EffectContext& ctx) {
     // A merge node requires exactly two inputs to function.
-    if (!enabled || inputs.size() < 2 || inputs[0] == 0 || inputs[1] == 0) {
+    if (!enabled || image_inputs.size() < 2 || image_inputs[0] == 0 || image_inputs[1] == 0) {
         // If inputs are missing, we can choose to output black, or passthrough one of the inputs.
         // Let's passthrough the 'B' input if it exists.
-        if (!inputs.empty() && inputs[0] != 0) {
-            // (Code to copy inputs[0] to ctx.output_fbo)
+        if (!image_inputs.empty() && image_inputs[0] != 0) {
+            // (Code to copy image_inputs[0] to ctx.output_fbo)
         }
         return;
     }
     
-    GLuint tex_b = inputs[0]; // Background
-    GLuint tex_a = inputs[1]; // Foreground
+    GLuint tex_b = image_inputs[0]; // Background
+    GLuint tex_a = image_inputs[1]; // Foreground
 
     static GLuint merge_shader = 0;
     if (merge_shader == 0) merge_shader = LoadShaderProgram("shaders/passthrough.vert", "shaders/merge.frag");
@@ -1521,15 +1534,38 @@ std::shared_ptr<EffectNode> TransformNode::clone() const {
     return std::make_shared<TransformNode>(*this);
 }
 
-void TransformNode::Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) {
-    if (!enabled || inputs.empty() || inputs[0] == 0) {
+void TransformNode::Process(const std::vector<GLuint>& image_inputs, const std::map<int, std::any>& data_inputs, const EffectContext& ctx) {
+    if (!enabled || image_inputs.empty() || image_inputs[0] == 0) {
         // Passthrough if disabled or no input
-        if (!inputs.empty() && inputs[0] != 0) {
-            // (You should have a helper function to copy inputs[0] to ctx.output_fbo)
+        if (!image_inputs.empty() && image_inputs[0] != 0) {
+            // (You should have a helper function to copy image_inputs[0] to ctx.output_fbo)
         }
         return;
     }
-    GLuint input_texture = inputs[0];
+    GLuint input_texture = image_inputs[0];
+
+    glm::vec2 final_translate = this->translate;
+    glm::vec2 final_scale = this->scale;
+    float final_rotation = this->rotation;
+    
+    // Find the pin ID for our "Transform Data" input.
+    // Assuming it's the second input pin (index 1).
+    if (input_pins.size() > 1) {
+        int data_pin_id = input_pins[1].id;
+        auto it = data_inputs.find(data_pin_id);
+        if (it != data_inputs.end()) {
+            try {
+                // Try to cast the std::any to our TransformData type
+                const TransformData& tracked_data = std::any_cast<const TransformData&>(it->second);
+                // If successful, override our internal values
+                final_translate = tracked_data.translate;
+                final_scale = tracked_data.scale;
+                final_rotation = tracked_data.rotation;
+            } catch (const std::bad_any_cast& e) {
+                // This link is invalid, do nothing
+            }
+        }
+    }
 
     static GLuint transform_shader = 0;
     if (transform_shader == 0) transform_shader = LoadShaderProgram("shaders/passthrough.vert", "shaders/transform.frag");
@@ -1553,13 +1589,136 @@ void TransformNode::Process(const std::vector<GLuint>& inputs, const EffectConte
         aspect_ratio = ctx.resolution.x / ctx.resolution.y;
     }
     glUniform1f(glGetUniformLocation(transform_shader, "u_AspectRatio"), aspect_ratio);
-    glUniform2f(glGetUniformLocation(transform_shader, "u_Translate"), translate.x, translate.y);
-    glUniform2f(glGetUniformLocation(transform_shader, "u_Scale"), scale.x, scale.y);
-    glUniform1f(glGetUniformLocation(transform_shader, "u_Rotation"), glm::radians(rotation)); // Convert degrees to radians
+    glUniform2f(glGetUniformLocation(transform_shader, "u_Translate"), final_translate.x, final_translate.y);
+    glUniform2f(glGetUniformLocation(transform_shader, "u_Scale"), final_scale.x, final_scale.y);
+    glUniform1f(glGetUniformLocation(transform_shader, "u_Rotation"), glm::radians(final_rotation));
 
     RenderFullscreenQuad();
 
     // Cleanup
     glUseProgram(0);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+std::shared_ptr<EffectNode> TrackerNode::clone() const {
+    // For a true deep copy, you'd need to re-initialize the tracker.
+    // A shallow copy is fine for now.
+    return std::make_shared<TrackerNode>(*this);
+}
+
+// The render-thread Process function is just a passthrough.
+void TrackerNode::Process(const std::vector<GLuint>& image_inputs,
+                          const std::map<int, std::any>& data_inputs,
+                          const EffectContext& ctx) {
+    if (image_inputs.empty() || image_inputs[0] == 0) {
+        this->result_texture = 0;
+        return;
+    }
+    // Just pass the input image directly to our output texture.
+    this->result_texture = image_inputs[0];
+}
+
+// This function is called by the UI when the user finishes drawing the ROI.
+void TrackerNode::InitializeAt(const DecodedFrame& frame) {
+    if (initial_roi_norm.width <= 0 || initial_roi_norm.height <= 0) {
+        is_initialized = false;
+        return;
+    }
+
+    cv::Mat cv_frame = DecodedFrameToCvMat(frame);
+    if (cv_frame.empty()) return;
+
+    // Denormalize the ROI to pixel coordinates
+    cv::Rect2f roi_pixels(
+        initial_roi_norm.x * cv_frame.cols,
+        initial_roi_norm.y * cv_frame.rows,
+        initial_roi_norm.width * cv_frame.cols,
+        initial_roi_norm.height * cv_frame.rows
+    );
+
+    tracker = InitializeTrackerByName("CSRT");
+    tracker->init(cv_frame, roi_pixels);
+    
+    tracking_data_cache.clear();
+    is_initialized = true;
+    is_selecting_roi = false;
+    std::cout << "Tracker initialized at ROI: " << roi_pixels.x << ", " << roi_pixels.y << std::endl;
+}
+
+void TrackerNode::TrackRange(const Clip& clip, GLResources& res, int start_frame, int end_frame, int export_fps) {
+    if (!is_initialized || !tracker) {
+        std::cerr << "TrackRange called on uninitialized tracker." << std::endl;
+        return;
+    }
+
+    auto vid_it = res.video_cache.find(clip.path);
+    if (vid_it == res.video_cache.end()) {
+        std::cerr << "Could not find video data for clip path: " << clip.path << std::endl;
+        return;
+    }
+    VideoData& video = vid_it->second;
+    
+    cv::Rect2f initial_box_pixels(
+        initial_roi_norm.x * video.width,
+        initial_roi_norm.y * video.height,
+        initial_roi_norm.width * video.width,
+        initial_roi_norm.height * video.height
+    );
+
+    cv::Rect2f current_box = initial_box_pixels;
+
+    std::cout << "Starting tracking from frame " << start_frame << " to " << end_frame << "..." << std::endl;
+
+    for (int frame_idx = start_frame; frame_idx <= end_frame; ++frame_idx) {
+        // Calculate the precise media time for the center of the frame
+        float time_sec = (float)frame_idx / export_fps;
+        float media_time = (time_sec - clip.start_time) + clip.media_start;
+        if (media_time < 0) continue;
+
+        // --- THIS IS THE CORRECTED FRAME FETCHING LOGIC ---
+
+        // 1. Ensure the background decoder has processed frames up to this point.
+        // This is a blocking call, which is acceptable for an offline process like tracking.
+        ensure_video_decoded_upto(video, media_time);
+        
+        // 2. Find the best (closest) matching frame in the cache.
+        const DecodedFrame* frame_data = nullptr;
+        double min_diff = std::numeric_limits<double>::max();
+        for (const auto& cached_f : video.frame_cache) {
+            double diff = std::abs(cached_f.pts - media_time);
+            if (diff < min_diff) {
+                min_diff = diff;
+                frame_data = &cached_f;
+            }
+        }
+
+        // 3. Check if a frame was found. If not, we cannot proceed for this frame_idx.
+        if (!frame_data) {
+            std::cerr << "Warning: Could not find decoded frame for time " << media_time << "s (frame " << frame_idx << ")" << std::endl;
+            continue; // Skip to the next frame
+        }
+        
+        // 4. Convert the found frame to a cv::Mat.
+        cv::Mat cv_frame = DecodedFrameToCvMat(*frame_data);
+        if (cv_frame.empty()) {
+            std::cerr << "Warning: Failed to convert frame to cv::Mat for time " << media_time << "s" << std::endl;
+            continue; // Skip to the next frame
+        }
+        // --- END OF CORRECTED LOGIC ---
+        
+        if (UpdateTracker(tracker, cv_frame, current_box)) {
+            TransformData t_data = CalculateTransformFromBoxes(initial_box_pixels, current_box);
+            
+            // Normalize translation for the shader, inverting Y for OpenGL's coordinate system
+            t_data.translate.x /= video.width;
+            t_data.translate.y /= -video.height; 
+            
+            // Store the data in our cache, keyed by the TIMELINE frame number
+            tracking_data_cache[frame_idx] = t_data;
+        } else {
+            std::cerr << "Tracking failed at frame " << frame_idx << std::endl;
+            break; // Stop tracking on failure
+        }
+    }
+    std::cout << "Finished tracking range." << std::endl;
 }

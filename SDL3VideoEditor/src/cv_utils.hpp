@@ -2,6 +2,8 @@
 #pragma once
 
 #include <opencv2/opencv.hpp> // Main OpenCV header
+#include <opencv2/tracking/tracking.hpp>
+#include <opencv2/opencv_modules.hpp>
 #include <vector>
 #include <string>
 
@@ -11,6 +13,17 @@
                             // Or, if DecodedFrame is in shared.hpp, include that.
                             // Make sure the path is correct relative to cv_utils.hpp
 
+struct TransformData;
+
 // Function Declarations
 cv::Mat DecodedFrameToCvMat(const DecodedFrame& frame_data);
 GLuint GrabCutMaskToRGBTexture(const cv::Mat& grabcut_mask_cv, int& out_width, int& out_height, bool make_fg_white = true);
+
+// Initializes a specific OpenCV tracker
+cv::Ptr<cv::Tracker> InitializeTrackerByName(const std::string& tracker_name = "CSRT");
+
+// Updates the tracker with a new frame and returns the tracked position
+bool UpdateTracker(cv::Ptr<cv::Tracker> tracker, const cv::Mat& frame, cv::Rect2f& tracked_box);
+
+// Calculates the transformation between the initial and current box
+TransformData CalculateTransformFromBoxes(const cv::Rect2f& initial_box, const cv::Rect2f& current_box);
