@@ -167,6 +167,7 @@ void InitializeNodeRegistry() {
     node_registry["Text"] = []() { return std::make_shared<TextEffectNode>(); };
     node_registry["Empty Source"] = []() { return std::make_shared<EmptySourceNode>(); };
     node_registry["Merge"] = []() { return std::make_shared<MergeNode>(); };
+    node_registry["Transform"] = []() { return std::make_shared<TransformNode>(); };
     // Add any new nodes here in the future.
 }
 
@@ -2847,6 +2848,9 @@ void DrawEffectUIForClip(Clip& clip, GLResources& gl_resources) {
         if (ImGui::Button("Add Text")) {
             clip.effect_graph->insert_node_before_output(std::make_shared<TextEffectNode>());
         }
+        if (ImGui::Button("Add Transform")) {
+            clip.effect_graph->insert_node_before_output(std::make_shared<TransformNode>());
+        }
 
         ImGui::Separator();
         ImGui::Text("Effect Stack (Drag to Reorder)");
@@ -3804,6 +3808,15 @@ void DrawNodeInspectorWindow(Clip* clip, GLResources& gl_resources) {
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("Controls the opacity of the Foreground (A) input.");
         }
+    } else if (auto transform_node = std::dynamic_pointer_cast<TransformNode>(node)) {
+        ImGui::Text("Translation");
+        ImGui::DragFloat2("##translate", &transform_node->translate.x, 0.005f);
+
+        ImGui::Text("Scale");
+        ImGui::DragFloat2("##scale", &transform_node->scale.x, 0.01f);
+
+        ImGui::Text("Rotation");
+        ImGui::SliderFloat("##rotation", &transform_node->rotation, -180.0f, 180.0f, "%.1f deg");
     }
 
     else if (std::dynamic_pointer_cast<SourceClipNode>(node) || 

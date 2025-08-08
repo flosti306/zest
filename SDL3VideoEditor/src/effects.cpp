@@ -1516,3 +1516,50 @@ void MergeNode::Process(const std::vector<GLuint>& inputs, const EffectContext& 
     glBindTexture(GL_TEXTURE_2D, 0);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }
+
+std::shared_ptr<EffectNode> TransformNode::clone() const {
+    return std::make_shared<TransformNode>(*this);
+}
+
+void TransformNode::Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) {
+    if (!enabled || inputs.empty() || inputs[0] == 0) {
+        // Passthrough if disabled or no input
+        if (!inputs.empty() && inputs[0] != 0) {
+            // (You should have a helper function to copy inputs[0] to ctx.output_fbo)
+        }
+        return;
+    }
+    GLuint input_texture = inputs[0];
+
+    static GLuint transform_shader = 0;
+    if (transform_shader == 0) transform_shader = LoadShaderProgram("shaders/passthrough.vert", "shaders/transform.frag");
+    if (transform_shader == 0) return;
+
+    glBindFramebuffer(GL_FRAMEBUFFER, ctx.output_fbo);
+    glViewport(0, 0, (int)ctx.resolution.x, (int)ctx.resolution.y);
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    glUseProgram(transform_shader);
+
+    // Bind the input texture
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, input_texture);
+    glUniform1i(glGetUniformLocation(transform_shader, "u_Texture"), 0);
+
+    // Send the transformation uniforms to the shader
+    float aspect_ratio = 1.0f;
+    if (ctx.resolution.y > 0) {
+        aspect_ratio = ctx.resolution.x / ctx.resolution.y;
+    }
+    glUniform1f(glGetUniformLocation(transform_shader, "u_AspectRatio"), aspect_ratio);
+    glUniform2f(glGetUniformLocation(transform_shader, "u_Translate"), translate.x, translate.y);
+    glUniform2f(glGetUniformLocation(transform_shader, "u_Scale"), scale.x, scale.y);
+    glUniform1f(glGetUniformLocation(transform_shader, "u_Rotation"), glm::radians(rotation)); // Convert degrees to radians
+
+    RenderFullscreenQuad();
+
+    // Cleanup
+    glUseProgram(0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}

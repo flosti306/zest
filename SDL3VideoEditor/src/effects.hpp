@@ -574,3 +574,20 @@ struct MergeNode : public EffectNode {
     void Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) override;
     std::shared_ptr<EffectNode> clone() const override;
 };
+
+struct TransformNode : public EffectNode {
+    // --- Properties ---
+    // Using normalized coordinates where (0,0) is center, (-0.5, -0.5) is bottom-left
+    glm::vec2 translate = {0.0f, 0.0f};
+    glm::vec2 scale = {1.0f, 1.0f}; // 1.0 is original size
+    float rotation = 0.0f; // In degrees
+
+    TransformNode() {
+        name = "Transform";
+        add_pin(true, "Image");
+        add_pin(false, "Image");
+    }
+
+    void Process(const std::vector<GLuint>& inputs, const EffectContext& ctx) override;
+    std::shared_ptr<EffectNode> clone() const override;
+};
