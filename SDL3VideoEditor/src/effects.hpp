@@ -57,6 +57,7 @@ struct EffectContext {
     GLuint output_fbo = 0;    // Where to render result
     float time = 0.0f;        // Timeline time
     glm::vec2 resolution;     // Frame resolution
+    int fps = 30;
 };
 
 inline Pin* find_pin_by_id(EffectNode* node, int pin_id);
@@ -188,7 +189,7 @@ struct EffectGraph {
     void insert_node_before_output(std::shared_ptr<EffectNode> new_node);
     
     // ... (deep copy constructor and processing methods)
-    void ProcessNodeGraph(GLuint source_clip_texture, GLuint final_output_fbo, float time, glm::vec2 resolution);
+    void ProcessNodeGraph(GLuint source_clip_texture, GLuint final_output_fbo, float time, glm::vec2 resolution, int fps);
 private:
     void evaluate_node(int node_id, const EffectContext& base_ctx, GLuint source_clip_texture);
 };
@@ -627,7 +628,7 @@ struct TrackerNode : public EffectNode {
     bool is_selecting_roi = false; // Is the user currently drawing the box?
 
     int track_start_frame = 0;
-    int track_end_frame = 100;
+    int track_end_frame = 0;
 
     // --- Internal State ---
     cv::Ptr<cv::Tracker> tracker;

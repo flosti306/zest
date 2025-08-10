@@ -233,7 +233,7 @@ bool ensure_video_decoded_upto(VideoData& video, double target_time_seconds);
 bool update_texture_from_cache(VideoData& video, double target_time_seconds);
 
 // Renders the final composited frame using *existing* textures
-void render_frame(GLResources& res, float current_time, const std::vector<Clip>& sorted_clips, int width, int height);
+void render_frame(GLResources& res, float current_time, const std::vector<Clip>& sorted_clips, int width, int height, int fps);
 
 void cleanup_video_resources(GLResources& res); // Cleans FFmpeg video resources
 void cleanup_gl_resources(GLResources& res);    // Cleans OpenGL textures/FBO

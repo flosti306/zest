@@ -1646,7 +1646,7 @@ int main(int argc, char* argv[]) {
     // 6. Render the final composite frame to the FBO.
     std::vector<Clip> sorted_clips = clips;
     std::sort(sorted_clips.begin(), sorted_clips.end(), [](const Clip& a, const Clip& b) { return a.layer < b.layer; });
-    render_frame(gl_resources, playhead_time, sorted_clips, preview_width, preview_height);
+    render_frame(gl_resources, playhead_time, sorted_clips, preview_width, preview_height, export_fps);
 
         // --- End of Centralized Preview Update Logic ---
 
@@ -1921,7 +1921,7 @@ int main(int argc, char* argv[]) {
 
 // --- Updated UpdatePreview Function ---
 void UpdatePreview(GLResources& res, const std::vector<Clip>& sorted_clips, int width, int height, float playhead_time, bool force_update) {
-    render_frame(res, playhead_time, sorted_clips, width, height);
+    render_frame(res, playhead_time, sorted_clips, width, height, export_fps);
 }
 
 // --- RenderFullscreenQuad Function ---
@@ -3930,13 +3930,15 @@ void DrawNodeInspectorWindow(Clip* clip, GLResources& gl_resources) {
                 clip_duration_in_frames = static_cast<int>(selected_clip->duration * export_fps);
             }
 
-            // UI for setting the frame range
-            ImGui::InputInt("Start Frame", &tracker_node->track_start_frame);
-            ImGui::InputInt("End Frame", &tracker_node->track_end_frame);
+            if (tracker_node->track_end_frame <= 0) tracker_node->track_end_frame = clip_duration_in_frames;
 
             // Clamp values to be within the clip's bounds
             tracker_node->track_start_frame = std::max(0, tracker_node->track_start_frame);
             tracker_node->track_end_frame = std::min(clip_duration_in_frames, tracker_node->track_end_frame);
+
+            // UI for setting the frame range
+            ImGui::InputInt("Start Frame", &tracker_node->track_start_frame);
+            ImGui::InputInt("End Frame", &tracker_node->track_end_frame);
 
             // The main "Track" button
             if (ImGui::Button("Track Forward")) {

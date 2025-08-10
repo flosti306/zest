@@ -441,7 +441,7 @@ void EffectGraph::insert_node_before_output(std::shared_ptr<EffectNode> new_node
     rebuild_order_from_links();
 }
 
-void EffectGraph::ProcessNodeGraph(GLuint source_clip_texture, GLuint final_output_fbo, float time, glm::vec2 resolution) {
+void EffectGraph::ProcessNodeGraph(GLuint source_clip_texture, GLuint final_output_fbo, float time, glm::vec2 resolution, int fps) {
     if (nodes.empty() || output_node_id == 0) return;
 
     // --- Step 2 becomes Step 1: Reset the evaluation state for the CURRENT frame ---
@@ -451,7 +451,7 @@ void EffectGraph::ProcessNodeGraph(GLuint source_clip_texture, GLuint final_outp
     }
 
     // --- Step 4 becomes Step 3: Start the recursive evaluation ---
-    EffectContext base_ctx = { 0, 0, time, resolution };
+    EffectContext base_ctx = { 0, 0, time, resolution, fps };
     evaluate_node(output_node_id, base_ctx, source_clip_texture);
 
     // --- 5. Copy the final result to the destination FBO ---
@@ -1606,16 +1606,40 @@ std::shared_ptr<EffectNode> TrackerNode::clone() const {
     return std::make_shared<TrackerNode>(*this);
 }
 
-// The render-thread Process function is just a passthrough.
 void TrackerNode::Process(const std::vector<GLuint>& image_inputs,
                           const std::map<int, std::any>& data_inputs,
                           const EffectContext& ctx) {
+    // --- Part 1: Passthrough the input image (unchanged) ---
     if (image_inputs.empty() || image_inputs[0] == 0) {
         this->result_texture = 0;
+    } else {
+        this->result_texture = image_inputs[0];
+    }
+
+    // --- Part 2: Output the correct tracking data for the current frame ---
+    // Ensure this node actually has a transform output pin.
+    if (output_pins.empty() || output_pins[0].type != PinType::Transform) {
         return;
     }
-    // Just pass the input image directly to our output texture.
-    this->result_texture = image_inputs[0];
+    
+    // Calculate the current timeline frame based on the playhead time.
+    // Note: We need access to export_fps here. We will pass it via EffectContext.
+    int current_frame = static_cast<int>(ctx.time * ctx.fps);
+
+    TransformData output_transform; // Default to an identity transform
+
+    // Find the tracking data for the current frame in our cache.
+    auto cache_it = tracking_data_cache.find(current_frame);
+    if (cache_it != tracking_data_cache.end()) {
+        // We found data! Use it.
+        output_transform = cache_it->second;
+    }
+    // If no data is found, it will just use the default (no-op) transform, which is correct.
+    
+    // Publish the data to our output pin.
+    // The key is the pin's ID, the value is the std::any-wrapped data.
+    int output_pin_id = output_pins[0].id;
+    this->data_outputs[output_pin_id] = output_transform;
 }
 
 // This function is called by the UI when the user finishes drawing the ROI.
