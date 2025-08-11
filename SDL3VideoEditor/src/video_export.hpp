@@ -22,6 +22,7 @@ extern "C" {
 #include <atomic> // For atomic flags
 #include <thread>
 #include <condition_variable>
+#include <future>
 #include <queue> // Can use queue or deque
 #include <set> // For tracking requested frames
 #include <SDL.h>
@@ -190,6 +191,7 @@ struct DecodedFrameRequest {
     std::string clip_path;
     double timestamp = 0.0f; // The media timestamp to decode
     RequestPriority priority = RequestPriority::Normal;
+    std::shared_ptr<std::promise<DecodedFrame>> sync_promise;
 };
 
 struct DecodedFrameResult {
@@ -233,7 +235,7 @@ bool ensure_video_decoded_upto(VideoData& video, double target_time_seconds);
 bool update_texture_from_cache(VideoData& video, double target_time_seconds);
 
 // Renders the final composited frame using *existing* textures
-void render_frame(GLResources& res, float current_time, const std::vector<Clip>& sorted_clips, int width, int height);
+void render_frame(GLResources& res, float current_time, const std::vector<Clip>& sorted_clips, int width, int height, int fps);
 
 void cleanup_video_resources(GLResources& res); // Cleans FFmpeg video resources
 void cleanup_gl_resources(GLResources& res);    // Cleans OpenGL textures/FBO

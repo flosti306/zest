@@ -562,7 +562,7 @@ void load_textures(GLResources& res, const std::vector<Clip>& clips) {
 // Renders using *existing* textures. Does NO decoding.
 void render_frame(GLResources& res, float current_time,
     const std::vector<Clip>& sorted_clips,
-    int width, int height) {
+    int width, int height, int fps) {
 
     glBindFramebuffer(GL_FRAMEBUFFER, res.fbo);
     glViewport(0, 0, width, height);
@@ -698,7 +698,7 @@ void render_frame(GLResources& res, float current_time,
                 // --- STAGE 2: Process the effect chain ---
                 GLuint final_effect_tex;
                 GLuint final_effect_fbo = create_temp_fbo(glm::vec2(width, height), final_effect_tex);
-                clip.effect_graph->ProcessNodeGraph(transformed_tex, final_effect_fbo, current_time, glm::vec2(width, height));
+                clip.effect_graph->ProcessNodeGraph(transformed_tex, final_effect_fbo, current_time, glm::vec2(width, height), fps);
 
                 // --- STAGE 3: Composite the result onto the main FBO ---
                 
@@ -1105,7 +1105,7 @@ bool start_video_export(const std::string& output_path, int width, int height, i
         }
 
         // 2. Render the composited frame to FBO
-        render_frame(export_res, current_time, sorted_clips, width, height);
+        render_frame(export_res, current_time, sorted_clips, width, height, fps);
 
         // 3. Read back pixels
         glBindFramebuffer(GL_FRAMEBUFFER, export_res.fbo);
@@ -1643,8 +1643,14 @@ void decoder_worker_func() {
         }
 
 
-        // Send result back to the main thread
-        {
+        if (request.sync_promise) {
+            // This is a synchronous request from another thread (like the tracker).
+            // Fulfill the promise, which will unblock the waiting thread.
+            // We move the frame to avoid copying pixel data.
+            request.sync_promise->set_value(std::move(result.frame));
+        } else {
+            // This is a standard async request from the main render thread.
+            // Push the result to the global queue.
             std::lock_guard<std::mutex> lock(decoder_result_mutex);
             decoder_result_queue.push(std::move(result));
         }

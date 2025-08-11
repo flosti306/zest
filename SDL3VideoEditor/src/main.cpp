@@ -131,6 +131,9 @@ static SDL_Cursor* eyedropper_cursor = nullptr;
 
 static int selected_node_id = -1; // -1 means no node is selected
 
+static TrackerNode* currently_selecting_roi_for_node = nullptr;
+static ImVec2 roi_start_pos_screen;
+
 std::stack<std::string> undo_stack;
 std::stack<std::string> redo_stack;
 
@@ -168,6 +171,7 @@ void InitializeNodeRegistry() {
     node_registry["Empty Source"] = []() { return std::make_shared<EmptySourceNode>(); };
     node_registry["Merge"] = []() { return std::make_shared<MergeNode>(); };
     node_registry["Transform"] = []() { return std::make_shared<TransformNode>(); };
+    node_registry["Tracker"] = []() { return std::make_shared<TrackerNode>(); };
     // Add any new nodes here in the future.
 }
 
@@ -479,6 +483,8 @@ void AddNewClip(std::vector<Clip>& clips, const std::string& input_path, float v
     video_clip.pos_y = 0.0f;
     video_clip.selected = false;
 
+    video_clip.effect_graph = std::make_shared<EffectGraph>();
+
     if(show_thumbs) QueueClipThumbnails(res, video_clip);
 
     auto audio_it = res.preloaded_audio.find(input_path);
@@ -569,6 +575,8 @@ void AddNewImageClip(std::vector<Clip>& clips, const std::string& input_path, in
     image_clip.pos_x = 0.0f;
     image_clip.pos_y = 0.0f;
     image_clip.selected = false;
+
+    image_clip.effect_graph = std::make_shared<EffectGraph>();
 
     std::cout << "Added Image clip: " << image_clip.name << " with duration " << DEFAULT_IMAGE_DURATION << "s" << std::endl;
 }
@@ -1238,7 +1246,7 @@ template<typename T>
 void DrawKeyframeTrackEditor(const std::string& label, KeyframeTrack<T>& track);
 void DrawTimelineEditor(std::vector<Clip>& clips, float& playhead_time, float& max_duration, float& zoom_factor, std::atomic<bool>& layers_changed, Clip*& selected_clip, GLResources& res, float& last_playhead_time_for_velocity);
 void UpdatePreview(GLResources& res, const std::vector<Clip>& sorted_clips, int width, int height, float playhead_time, bool force_update);
-void RenderPreviewWindow(GLResources& res, int preview_width, int preview_height);
+void RenderPreviewWindow(GLResources& res, Clip* selected_clip, int preview_width, int preview_height);
 void DrawEffectUIForClip(Clip& clip, GLResources& gl_resources);
 void OpenSmartMaskEditor(MaskEffectNode* node, GLuint clip_texture_for_background, const DecodedFrame& decoded_frame_for_cv);
 void DrawSmartMaskEditorWindow();
@@ -1642,7 +1650,7 @@ int main(int argc, char* argv[]) {
     // 6. Render the final composite frame to the FBO.
     std::vector<Clip> sorted_clips = clips;
     std::sort(sorted_clips.begin(), sorted_clips.end(), [](const Clip& a, const Clip& b) { return a.layer < b.layer; });
-    render_frame(gl_resources, playhead_time, sorted_clips, preview_width, preview_height);
+    render_frame(gl_resources, playhead_time, sorted_clips, preview_width, preview_height, export_fps);
 
         // --- End of Centralized Preview Update Logic ---
 
@@ -1737,7 +1745,7 @@ int main(int argc, char* argv[]) {
         ImGui::End(); // End Controls
 
         DrawTimelineEditor(clips, playhead_time, max_duration, zoom_factor, layers_changed, selected_clip, gl_resources, last_playhead_time_for_velocity);
-        RenderPreviewWindow(gl_resources, preview_width, preview_height);
+        RenderPreviewWindow(gl_resources, selected_clip, preview_width, preview_height);
         DrawNodeEditorWindow(selected_clip);
         DrawNodeInspectorWindow(selected_clip, gl_resources);
         DrawAddMediaWindow(clips, zoom_factor, layers_changed);
@@ -1917,7 +1925,7 @@ int main(int argc, char* argv[]) {
 
 // --- Updated UpdatePreview Function ---
 void UpdatePreview(GLResources& res, const std::vector<Clip>& sorted_clips, int width, int height, float playhead_time, bool force_update) {
-    render_frame(res, playhead_time, sorted_clips, width, height);
+    render_frame(res, playhead_time, sorted_clips, width, height, export_fps);
 }
 
 // --- RenderFullscreenQuad Function ---
@@ -1942,7 +1950,7 @@ void RenderFullscreenQuad(float width, float height) {
 }
 
 // --- RenderPreviewWindow ---
-void RenderPreviewWindow(GLResources& res, int preview_width, int preview_height) {
+void RenderPreviewWindow(GLResources& res, Clip* selected_clip, int preview_width, int preview_height) {
     ImGui::Begin("Video Preview");
     ApplyWindowBackgroundGradients();
     ImVec2 available_size = ImGui::GetContentRegionAvail();
@@ -2033,6 +2041,78 @@ void RenderPreviewWindow(GLResources& res, int preview_width, int preview_height
         ImGui::GetWindowDrawList()->AddRectFilled(rect_min, rect_max, placeholder_col);
         ImGui::GetWindowDrawList()->AddText(rect_min, IM_COL32(200, 200, 200, 255), "Preview Unavailable");
     }
+
+    ImDrawList* draw_list = ImGui::GetWindowDrawList();
+    ImVec2 rect_min = ImGui::GetItemRectMin(); // Top-left of the displayed image
+    ImVec2 rect_max = ImGui::GetItemRectMax(); // Bottom-right of the displayed image
+
+    // This block runs only when a TrackerNode has put the UI into "selection mode".
+    if (currently_selecting_roi_for_node != nullptr) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand); // Give user visual feedback
+
+        // Use an invisible button over the image to reliably capture hover state
+        ImGui::SetCursorScreenPos(rect_min);
+        ImGui::InvisibleButton("##preview_canvas", display_size);
+        const bool is_hovered = ImGui::IsItemHovered();
+
+        if (is_hovered) {
+            if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                if (roi_start_pos_screen.x == 0 && roi_start_pos_screen.y == 0) { // First click
+                    roi_start_pos_screen = ImGui::GetMousePos();
+                }
+                // Draw live feedback rectangle while dragging
+                draw_list->AddRect(roi_start_pos_screen, ImGui::GetMousePos(), IM_COL32(255, 220, 0, 255), 4.0f, 0, 2.0f);
+            } 
+            else if (ImGui::IsMouseReleased(ImGuiMouseButton_Left) && (roi_start_pos_screen.x != 0 || roi_start_pos_screen.y != 0)) {
+                // --- User has finished drawing the box ---
+                ImVec2 roi_end_pos_screen = ImGui::GetMousePos();
+
+                // Convert screen-space rectangle to normalized [0,1] image coordinates
+                cv::Rect2f roi_norm;
+                roi_norm.x = (std::min(roi_start_pos_screen.x, roi_end_pos_screen.x) - rect_min.x) / display_size.x;
+                roi_norm.y = (std::min(roi_start_pos_screen.y, roi_end_pos_screen.y) - rect_min.y) / display_size.y;
+                roi_norm.width = std::abs(roi_end_pos_screen.x - roi_start_pos_screen.x) / display_size.x;
+                roi_norm.height = std::abs(roi_end_pos_screen.y - roi_start_pos_screen.y) / display_size.y;
+                
+                // Store the normalized ROI in the target node
+                currently_selecting_roi_for_node->initial_roi_norm = roi_norm;
+                
+                // --- Now, get the current video frame to initialize the tracker ---
+                const DecodedFrame* current_frame_for_init = nullptr;
+                if (selected_clip && is_video_file(selected_clip->path)) {
+                    auto it = res.video_cache.find(selected_clip->path);
+                    if (it != res.video_cache.end()) {
+                        VideoData& vid_data = it->second;
+                        float media_time = (playhead_time - selected_clip->start_time) + selected_clip->media_start;
+                        
+                        // Find the closest available frame in the cache to the current playhead time
+                        double min_diff = std::numeric_limits<double>::max();
+                        for (const auto& cached_f : vid_data.frame_cache) {
+                            double diff = std::abs(cached_f.pts - media_time);
+                            if (diff < min_diff) {
+                                min_diff = diff;
+                                current_frame_for_init = &cached_f;
+                            }
+                        }
+                    }
+                }
+
+                if (current_frame_for_init) {
+                    // Call the node's initialization method with the found frame
+                    currently_selecting_roi_for_node->InitializeAt(*current_frame_for_init);
+                } else {
+                    tinyfd_messageBox("Tracker Error", "Could not get current video frame to initialize tracker.", "ok", "error", 1);
+                    currently_selecting_roi_for_node->is_initialized = false;
+                }
+
+                // Reset state to exit selection mode
+                currently_selecting_roi_for_node->is_selecting_roi = false;
+                currently_selecting_roi_for_node = nullptr;
+                roi_start_pos_screen = {0,0};
+            }
+        }
+    }
+
     ImGui::End();
 }
 
@@ -3825,6 +3905,77 @@ void DrawNodeInspectorWindow(Clip* clip, GLResources& gl_resources) {
     {
         // Special source/output nodes have no user-editable properties
         ImGui::TextDisabled("This is a special node with no editable properties.");
+    } else if (auto tracker_node = std::dynamic_pointer_cast<TrackerNode>(node)) {
+        
+        // --- Disable UI elements while tracking is in progress ---
+        ImGui::BeginDisabled(tracker_node->is_tracking);
+        {
+            if (!tracker_node->is_selecting_roi) {
+                if (ImGui::Button("Set ROI & Initialize Tracker")) {
+                    tracker_node->is_selecting_roi = true;
+                    currently_selecting_roi_for_node = tracker_node.get();
+                    selected_node_id = -1;
+                }
+            } else {
+                ImGui::TextColored(ImVec4(1.f, 0.8f, 0.2f, 1.f), "Click and drag in the Video Preview...");
+                if (ImGui::Button("Cancel")) {
+                    tracker_node->is_selecting_roi = false;
+                    currently_selecting_roi_for_node = nullptr;
+                }
+            }
+
+            if (tracker_node->is_initialized) {
+                ImGui::Separator();
+                ImGui::Text("Tracking Controls");
+                
+                int clip_duration_in_frames = selected_clip ? static_cast<int>(selected_clip->duration * export_fps) : 0;
+                if (tracker_node->track_end_frame <= 0) tracker_node->track_end_frame = clip_duration_in_frames;
+                ImGui::InputInt("Start Frame", &tracker_node->track_start_frame);
+                ImGui::InputInt("End Frame", &tracker_node->track_end_frame);
+                tracker_node->track_start_frame = std::max(0, tracker_node->track_start_frame);
+                tracker_node->track_end_frame = std::min(clip_duration_in_frames, tracker_node->track_end_frame);
+
+                if (ImGui::Button("Track Forward")) {
+                    if (selected_clip) {
+                        // --- LAUNCH THE WORKER THREAD ---
+                        tracker_node->is_tracking = true;
+                        tracker_node->cancel_tracking = false;
+                        
+                        // Launch a detached thread. The lambda captures what it needs.
+                        // We capture pointers, which is safe because these objects (clip, node, resources)
+                        // will outlive the thread.
+                        std::thread([=, &gl_resources]() {
+                            tracker_node->TrackRange(*selected_clip, gl_resources,
+                                                     tracker_node->track_start_frame,
+                                                     tracker_node->track_end_frame,
+                                                     export_fps);
+                        }).detach();
+                    }
+                }
+            }
+        }
+        ImGui::EndDisabled();
+        // --- END UI Disabling ---
+
+        // --- NEW: Progress Indicator UI ---
+        if (tracker_node->is_tracking) {
+            ImGui::Separator();
+            
+            // Lock the mutex to safely read the status string
+            tracker_node->tracking_mutex.lock();
+            std::string status = tracker_node->tracking_status;
+            tracker_node->tracking_mutex.unlock();
+            
+            ImGui::Text("%s", status.c_str());
+
+            // The progress bar reads the atomic float, which is safe without a lock
+            ImGui::ProgressBar(tracker_node->tracking_progress, ImVec2(-1.0f, 0.0f));
+            
+            if (ImGui::Button("Cancel Tracking")) {
+                tracker_node->cancel_tracking = true;
+            }
+        }
+        // --- END NEW ---
     }
 
     // You can also add a common "Enabled" checkbox here if you like
