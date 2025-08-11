@@ -22,6 +22,7 @@ extern "C" {
 #include <atomic> // For atomic flags
 #include <thread>
 #include <condition_variable>
+#include <future>
 #include <queue> // Can use queue or deque
 #include <set> // For tracking requested frames
 #include <SDL.h>
@@ -190,6 +191,7 @@ struct DecodedFrameRequest {
     std::string clip_path;
     double timestamp = 0.0f; // The media timestamp to decode
     RequestPriority priority = RequestPriority::Normal;
+    std::shared_ptr<std::promise<DecodedFrame>> sync_promise;
 };
 
 struct DecodedFrameResult {

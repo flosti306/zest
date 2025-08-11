@@ -8,6 +8,8 @@
 #include <sstream>
 #include <map>
 #include <any>
+#include <atomic>
+#include <mutex>
 #include <glm/glm.hpp>
 #include <glad/glad.h> // Include glad for OpenGL function loading
 #include <SDL3/SDL.h>
@@ -630,6 +632,12 @@ struct TrackerNode : public EffectNode {
     int track_start_frame = 0;
     int track_end_frame = 0;
 
+    std::atomic<bool> is_tracking = false;      // True while the worker thread is running
+    std::atomic<float> tracking_progress = 0.0f; // A value from 0.0 to 1.0
+    std::atomic<bool> cancel_tracking = false;    // Flag to stop the worker thread
+    std::string tracking_status = "Idle";       // A message for the UI
+    std::mutex tracking_mutex;
+
     // --- Internal State ---
     cv::Ptr<cv::Tracker> tracker;
     // Cache of found transforms, mapping frame number to TransformData
@@ -639,6 +647,10 @@ struct TrackerNode : public EffectNode {
         name = "Tracker";
         add_pin(true, "Image", PinType::Image);
         add_pin(false, "Transform", PinType::Transform);
+        is_tracking = false;
+        tracking_progress = 0.0f;
+        cancel_tracking = false;
+        tracking_status = "Idle";
     }
 
     void Process(const std::vector<GLuint>& image_inputs,
@@ -649,5 +661,33 @@ struct TrackerNode : public EffectNode {
     void InitializeAt(const DecodedFrame& frame);
     void TrackRange(const Clip& clip, GLResources& res, int start_frame, int end_frame, int export_fps);
 
-    std::shared_ptr<EffectNode> clone() const override;
+    TrackerNode(const TrackerNode& other) {
+        // --- Copy the simple properties ---
+        this->name = other.name;
+        this->enabled = other.enabled;
+        this->editor_pos = other.editor_pos;
+        this->input_pins = other.input_pins;
+        this->output_pins = other.output_pins;
+        this->initial_roi_norm = other.initial_roi_norm;
+        this->track_start_frame = other.track_start_frame;
+        this->track_end_frame = other.track_end_frame;
+
+        // --- DO NOT copy atomics/mutex. Re-initialize them. ---
+        this->is_tracking = false;
+        this->tracking_progress = 0.0f;
+        this->cancel_tracking = false;
+        this->tracking_status = "Idle";
+        
+        // --- Re-create unique resources ---
+        // The cloned node should start fresh, without the old tracking data or tracker.
+        this->is_initialized = false;
+        this->tracker = nullptr;
+        this->tracking_data_cache.clear();
+    }
+
+    // --- UPDATED: The clone method now works correctly ---
+    std::shared_ptr<EffectNode> clone() const override {
+        // This now correctly calls our new, valid copy constructor.
+        return std::make_shared<TrackerNode>(*this);
+    }
 };

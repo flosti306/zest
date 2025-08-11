@@ -1643,8 +1643,14 @@ void decoder_worker_func() {
         }
 
 
-        // Send result back to the main thread
-        {
+        if (request.sync_promise) {
+            // This is a synchronous request from another thread (like the tracker).
+            // Fulfill the promise, which will unblock the waiting thread.
+            // We move the frame to avoid copying pixel data.
+            request.sync_promise->set_value(std::move(result.frame));
+        } else {
+            // This is a standard async request from the main render thread.
+            // Push the result to the global queue.
             std::lock_guard<std::mutex> lock(decoder_result_mutex);
             decoder_result_queue.push(std::move(result));
         }

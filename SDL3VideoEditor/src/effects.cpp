@@ -1600,10 +1600,29 @@ void TransformNode::Process(const std::vector<GLuint>& image_inputs, const std::
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }
 
-std::shared_ptr<EffectNode> TrackerNode::clone() const {
-    // For a true deep copy, you'd need to re-initialize the tracker.
-    // A shallow copy is fine for now.
-    return std::make_shared<TrackerNode>(*this);
+DecodedFrame GetFrameSynchronously(const std::string& clip_path, float media_time) {
+    // 1. Create a promise that will be fulfilled by the decoder thread.
+    auto promise = std::make_shared<std::promise<DecodedFrame>>();
+    
+    // 2. Get the corresponding future. The tracker thread will wait on this.
+    std::future<DecodedFrame> future = promise->get_future();
+
+    // 3. Create and dispatch the request.
+    DecodedFrameRequest request;
+    request.clip_path = clip_path;
+    request.timestamp = media_time;
+    request.priority = RequestPriority::High; // Tracking frames are high priority
+    request.sync_promise = promise;
+
+    { // Lock the global queue to push the request
+        std::lock_guard<std::mutex> lock(decoder_request_mutex);
+        decoder_request_queue.push_back(std::move(request));
+    }
+    decoder_worker_cv.notify_one(); // Wake up the decoder thread
+
+    // 4. Wait for the result. This blocks THIS (tracker) thread, but not the UI thread.
+    // It will automatically unblock when the decoder calls set_value().
+    return future.get();
 }
 
 void TrackerNode::Process(const std::vector<GLuint>& image_inputs,
@@ -1669,15 +1688,29 @@ void TrackerNode::InitializeAt(const DecodedFrame& frame) {
     std::cout << "Tracker initialized at ROI: " << roi_pixels.x << ", " << roi_pixels.y << std::endl;
 }
 
-void TrackerNode::TrackRange(const Clip& clip, GLResources& res, int start_frame, int end_frame, int export_fps) {
+/* void TrackerNode::TrackRange(const Clip& clip, GLResources& res, int start_frame, int end_frame, int export_fps) {
+    // This function now runs on a worker thread.
+    // It must not touch UI elements directly.
+
+    // --- 1. Initialization ---
+    { // Use a scope for the lock_guard
+        std::lock_guard<std::mutex> lock(tracking_mutex);
+        tracking_status = "Initializing...";
+    }
+    tracking_progress = 0.0f;
+
     if (!is_initialized || !tracker) {
-        std::cerr << "TrackRange called on uninitialized tracker." << std::endl;
+        std::lock_guard<std::mutex> lock(tracking_mutex);
+        tracking_status = "Error: Tracker not initialized.";
+        is_tracking = false;
         return;
     }
 
     auto vid_it = res.video_cache.find(clip.path);
     if (vid_it == res.video_cache.end()) {
-        std::cerr << "Could not find video data for clip path: " << clip.path << std::endl;
+        std::lock_guard<std::mutex> lock(tracking_mutex);
+        tracking_status = "Error: Video data not found.";
+        is_tracking = false;
         return;
     }
     VideoData& video = vid_it->second;
@@ -1690,22 +1723,32 @@ void TrackerNode::TrackRange(const Clip& clip, GLResources& res, int start_frame
     );
 
     cv::Rect2f current_box = initial_box_pixels;
+    
+    // Create a temporary map to store results. We'll transfer it at the end.
+    std::map<int, TransformData> local_tracking_cache;
+    int total_frames_to_track = end_frame - start_frame;
 
-    std::cout << "Starting tracking from frame " << start_frame << " to " << end_frame << "..." << std::endl;
+    {
+        std::lock_guard<std::mutex> lock(tracking_mutex);
+        tracking_status = "Tracking...";
+    }
 
+    // --- 2. The Main Tracking Loop ---
     for (int frame_idx = start_frame; frame_idx <= end_frame; ++frame_idx) {
-        // Calculate the precise media time for the center of the frame
+        // Check for cancellation signal from the main thread
+        if (cancel_tracking) {
+            std::lock_guard<std::mutex> lock(tracking_mutex);
+            tracking_status = "Cancelled by user.";
+            is_tracking = false;
+            return;
+        }
+
         float time_sec = (float)frame_idx / export_fps;
         float media_time = (time_sec - clip.start_time) + clip.media_start;
         if (media_time < 0) continue;
 
-        // --- THIS IS THE CORRECTED FRAME FETCHING LOGIC ---
-
-        // 1. Ensure the background decoder has processed frames up to this point.
-        // This is a blocking call, which is acceptable for an offline process like tracking.
+        // Fetch the frame (this logic is now correct)
         ensure_video_decoded_upto(video, media_time);
-        
-        // 2. Find the best (closest) matching frame in the cache.
         const DecodedFrame* frame_data = nullptr;
         double min_diff = std::numeric_limits<double>::max();
         for (const auto& cached_f : video.frame_cache) {
@@ -1716,33 +1759,120 @@ void TrackerNode::TrackRange(const Clip& clip, GLResources& res, int start_frame
             }
         }
 
-        // 3. Check if a frame was found. If not, we cannot proceed for this frame_idx.
-        if (!frame_data) {
-            std::cerr << "Warning: Could not find decoded frame for time " << media_time << "s (frame " << frame_idx << ")" << std::endl;
-            continue; // Skip to the next frame
-        }
-        
-        // 4. Convert the found frame to a cv::Mat.
+        if (!frame_data) continue;
         cv::Mat cv_frame = DecodedFrameToCvMat(*frame_data);
-        if (cv_frame.empty()) {
-            std::cerr << "Warning: Failed to convert frame to cv::Mat for time " << media_time << "s" << std::endl;
-            continue; // Skip to the next frame
-        }
-        // --- END OF CORRECTED LOGIC ---
+        if (cv_frame.empty()) continue;
         
+        // Update the tracker
         if (UpdateTracker(tracker, cv_frame, current_box)) {
             TransformData t_data = CalculateTransformFromBoxes(initial_box_pixels, current_box);
-            
-            // Normalize translation for the shader, inverting Y for OpenGL's coordinate system
             t_data.translate.x /= video.width;
-            t_data.translate.y /= -video.height; 
-            
-            // Store the data in our cache, keyed by the TIMELINE frame number
-            tracking_data_cache[frame_idx] = t_data;
+            t_data.translate.y /= -video.height;
+            local_tracking_cache[frame_idx] = t_data;
         } else {
-            std::cerr << "Tracking failed at frame " << frame_idx << std::endl;
-            break; // Stop tracking on failure
+            std::lock_guard<std::mutex> lock(tracking_mutex);
+            tracking_status = "Tracking failed at frame " + std::to_string(frame_idx);
+            is_tracking = false;
+            return; // Stop on failure
+        }
+        
+        // Update progress
+        if (total_frames_to_track > 0) {
+            tracking_progress = (float)(frame_idx - start_frame + 1) / total_frames_to_track;
         }
     }
-    std::cout << "Finished tracking range." << std::endl;
+
+    // --- 3. Finalize and Transfer Data ---
+    {
+        std::lock_guard<std::mutex> lock(tracking_mutex);
+        tracking_status = "Finished successfully!";
+        // Safely swap the results from our local cache to the main node's cache
+        tracking_data_cache.swap(local_tracking_cache);
+    }
+    is_tracking = false; // Signal that we are done
+} */
+
+void TrackerNode::TrackRange(const Clip& clip, GLResources& res, int start_frame, int end_frame, int export_fps) {
+    // --- 1. Initialization ---
+    {
+        std::lock_guard<std::mutex> lock(tracking_mutex);
+        tracking_status = "Initializing...";
+    }
+    tracking_progress = 0.0f;
+
+    if (!is_initialized || !tracker) { 
+        std::lock_guard<std::mutex> lock(tracking_mutex);
+        tracking_status = "Error: Tracker not initialized.";
+        is_tracking = false;
+        return; 
+    }
+
+    // --- Safely READ video dimensions from the main thread's resources ---
+    auto vid_it = res.video_cache.find(clip.path);
+    if (vid_it == res.video_cache.end()) {
+        std::lock_guard<std::mutex> lock(tracking_mutex);
+        tracking_status = "Error: Video data not found in resources.";
+        is_tracking = false;
+        return;
+    }
+    const int frame_width = vid_it->second.width;
+    const int frame_height = vid_it->second.height;
+    // --- End safe read ---
+    
+    cv::Rect2f initial_box_pixels(
+        initial_roi_norm.x * frame_width,
+        initial_roi_norm.y * frame_height,
+        initial_roi_norm.width * frame_width,
+        initial_roi_norm.height * frame_height
+    );
+
+    cv::Rect2f current_box = initial_box_pixels;
+    std::map<int, TransformData> local_tracking_cache;
+    int total_frames_to_track = end_frame - start_frame + 1;
+
+    {
+        std::lock_guard<std::mutex> lock(tracking_mutex);
+        tracking_status = "Tracking...";
+    }
+
+    // --- 2. Main Tracking Loop ---
+    for (int frame_idx = start_frame; frame_idx <= end_frame; ++frame_idx) {
+        if (cancel_tracking) break;
+
+        float time_sec = (float)frame_idx / export_fps;
+        float media_time = (time_sec - clip.start_time) + clip.media_start;
+        if (media_time < 0) continue;
+
+        try {
+            // Request a frame from the central decoder service. This is thread-safe.
+            DecodedFrame frame = GetFrameSynchronously(clip.path, media_time);
+
+            cv::Mat cv_frame = DecodedFrameToCvMat(frame);
+            if (cv_frame.empty()) continue;
+
+            if (UpdateTracker(tracker, cv_frame, current_box)) {
+                TransformData t_data = CalculateTransformFromBoxes(initial_box_pixels, current_box);
+                t_data.translate.x /= frame_width;
+                t_data.translate.y /= -frame_height; // Invert Y for OpenGL
+                local_tracking_cache[frame_idx] = t_data;
+            } else {
+                throw std::runtime_error("UpdateTracker failed.");
+            }
+        } catch (...) { // Catch any exception from the decoder or tracker
+            std::lock_guard<std::mutex> lock(tracking_mutex);
+            tracking_status = "Error at frame " + std::to_string(frame_idx);
+            is_tracking = false;
+            return;
+        }
+        
+        tracking_progress = (float)(frame_idx - start_frame + 1) / total_frames_to_track;
+    }
+
+    // --- 3. Finalize ---
+    {
+        std::lock_guard<std::mutex> lock(tracking_mutex);
+        tracking_status = cancel_tracking ? "Cancelled by user." : "Finished successfully!";
+        tracking_data_cache.swap(local_tracking_cache);
+    }
+    is_tracking = false;
 }

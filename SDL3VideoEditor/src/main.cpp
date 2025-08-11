@@ -483,6 +483,8 @@ void AddNewClip(std::vector<Clip>& clips, const std::string& input_path, float v
     video_clip.pos_y = 0.0f;
     video_clip.selected = false;
 
+    video_clip.effect_graph = std::make_shared<EffectGraph>();
+
     if(show_thumbs) QueueClipThumbnails(res, video_clip);
 
     auto audio_it = res.preloaded_audio.find(input_path);
@@ -573,6 +575,8 @@ void AddNewImageClip(std::vector<Clip>& clips, const std::string& input_path, in
     image_clip.pos_x = 0.0f;
     image_clip.pos_y = 0.0f;
     image_clip.selected = false;
+
+    image_clip.effect_graph = std::make_shared<EffectGraph>();
 
     std::cout << "Added Image clip: " << image_clip.name << " with duration " << DEFAULT_IMAGE_DURATION << "s" << std::endl;
 }
@@ -3902,57 +3906,73 @@ void DrawNodeInspectorWindow(Clip* clip, GLResources& gl_resources) {
         // Special source/output nodes have no user-editable properties
         ImGui::TextDisabled("This is a special node with no editable properties.");
     } else if (auto tracker_node = std::dynamic_pointer_cast<TrackerNode>(node)) {
-        if (!tracker_node->is_selecting_roi) {
-            if (ImGui::Button("Set ROI & Initialize Tracker")) {
-                tracker_node->is_selecting_roi = true;
-                currently_selecting_roi_for_node = tracker_node.get();
-                // This will prevent the inspector from trying to show properties for a node
-                // while another is in a special UI state.
-                selected_node_id = -1;
-            }
-        } else {
-            ImGui::TextColored(ImVec4(1.f, 0.8f, 0.2f, 1.f), "Click and drag in the Video Preview...");
-            if (ImGui::Button("Cancel")) {
-                tracker_node->is_selecting_roi = false;
-                currently_selecting_roi_for_node = nullptr;
-            }
-        }
-
-        // --- NEW: UI for triggering the track ---
-        // This section only appears after the user has successfully set an ROI.
-        if (tracker_node->is_initialized) {
-            ImGui::Separator();
-            ImGui::Text("Tracking Controls");
-
-            // Get the total duration of the clip in frames
-            int clip_duration_in_frames = 0;
-            if (selected_clip) {
-                clip_duration_in_frames = static_cast<int>(selected_clip->duration * export_fps);
-            }
-
-            if (tracker_node->track_end_frame <= 0) tracker_node->track_end_frame = clip_duration_in_frames;
-
-            // Clamp values to be within the clip's bounds
-            tracker_node->track_start_frame = std::max(0, tracker_node->track_start_frame);
-            tracker_node->track_end_frame = std::min(clip_duration_in_frames, tracker_node->track_end_frame);
-
-            // UI for setting the frame range
-            ImGui::InputInt("Start Frame", &tracker_node->track_start_frame);
-            ImGui::InputInt("End Frame", &tracker_node->track_end_frame);
-
-            // The main "Track" button
-            if (ImGui::Button("Track Forward")) {
-                if (selected_clip) {
-                    // Call the function that does the heavy lifting.
-                    // This will block the UI while it processes, which is acceptable for now.
-                    // A more advanced implementation would use a separate thread and show a progress bar.
-                    tracker_node->TrackRange(*selected_clip, gl_resources, tracker_node->track_start_frame, tracker_node->track_end_frame, export_fps);
-                } else {
-                    tinyfd_messageBox("Tracker Error", "No clip selected to track.", "ok", "error", 1);
+        
+        // --- Disable UI elements while tracking is in progress ---
+        ImGui::BeginDisabled(tracker_node->is_tracking);
+        {
+            if (!tracker_node->is_selecting_roi) {
+                if (ImGui::Button("Set ROI & Initialize Tracker")) {
+                    tracker_node->is_selecting_roi = true;
+                    currently_selecting_roi_for_node = tracker_node.get();
+                    selected_node_id = -1;
+                }
+            } else {
+                ImGui::TextColored(ImVec4(1.f, 0.8f, 0.2f, 1.f), "Click and drag in the Video Preview...");
+                if (ImGui::Button("Cancel")) {
+                    tracker_node->is_selecting_roi = false;
+                    currently_selecting_roi_for_node = nullptr;
                 }
             }
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Analyzes the video between the start and end frames to generate tracking data. This may take a moment.");
+
+            if (tracker_node->is_initialized) {
+                ImGui::Separator();
+                ImGui::Text("Tracking Controls");
+                
+                int clip_duration_in_frames = selected_clip ? static_cast<int>(selected_clip->duration * export_fps) : 0;
+                if (tracker_node->track_end_frame <= 0) tracker_node->track_end_frame = clip_duration_in_frames;
+                ImGui::InputInt("Start Frame", &tracker_node->track_start_frame);
+                ImGui::InputInt("End Frame", &tracker_node->track_end_frame);
+                tracker_node->track_start_frame = std::max(0, tracker_node->track_start_frame);
+                tracker_node->track_end_frame = std::min(clip_duration_in_frames, tracker_node->track_end_frame);
+
+                if (ImGui::Button("Track Forward")) {
+                    if (selected_clip) {
+                        // --- LAUNCH THE WORKER THREAD ---
+                        tracker_node->is_tracking = true;
+                        tracker_node->cancel_tracking = false;
+                        
+                        // Launch a detached thread. The lambda captures what it needs.
+                        // We capture pointers, which is safe because these objects (clip, node, resources)
+                        // will outlive the thread.
+                        std::thread([=, &gl_resources]() {
+                            tracker_node->TrackRange(*selected_clip, gl_resources,
+                                                     tracker_node->track_start_frame,
+                                                     tracker_node->track_end_frame,
+                                                     export_fps);
+                        }).detach();
+                    }
+                }
+            }
+        }
+        ImGui::EndDisabled();
+        // --- END UI Disabling ---
+
+        // --- NEW: Progress Indicator UI ---
+        if (tracker_node->is_tracking) {
+            ImGui::Separator();
+            
+            // Lock the mutex to safely read the status string
+            tracker_node->tracking_mutex.lock();
+            std::string status = tracker_node->tracking_status;
+            tracker_node->tracking_mutex.unlock();
+            
+            ImGui::Text("%s", status.c_str());
+
+            // The progress bar reads the atomic float, which is safe without a lock
+            ImGui::ProgressBar(tracker_node->tracking_progress, ImVec2(-1.0f, 0.0f));
+            
+            if (ImGui::Button("Cancel Tracking")) {
+                tracker_node->cancel_tracking = true;
             }
         }
         // --- END NEW ---
