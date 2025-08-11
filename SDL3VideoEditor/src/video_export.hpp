@@ -209,10 +209,14 @@ struct DecoderState {
     AVRational time_base = {0, 1};
     double last_decoded_pts = -1.0; // State for this specific decoder
 
+    AVBufferRef* hw_device_ctx = nullptr;
+    AVPixelFormat hw_pix_fmt = AV_PIX_FMT_NONE;
+
     ~DecoderState() {
         sws_freeContext(sws_ctx);
         if (codec_ctx) avcodec_free_context(&codec_ctx);
         if (fmt_ctx) avformat_close_input(&fmt_ctx);
+        if (hw_device_ctx) av_buffer_unref(&hw_device_ctx);
     }
 };
 
