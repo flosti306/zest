@@ -3564,6 +3564,7 @@ void DrawAddMediaWindow(std::vector<Clip>& clips, float zoom_factor, bool layers
 
 void DrawNodeInspectorWindow(Clip* clip, GLResources& gl_resources) {
     ImGui::Begin("Node Inspector");
+    ApplyWindowBackgroundGradients();
 
     if (selected_node_id == -1 || !clip || !clip->effect_graph) {
         ImGui::TextDisabled("Select a node in the Node Editor to see its properties.");
