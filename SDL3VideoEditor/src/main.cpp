@@ -2297,6 +2297,8 @@ void DrawTimelineEditor(
 
     static int dragging_clip_index = -1;
     static float drag_offset_time = 0.0f;
+    static ImVec2 drag_start_mouse_pos_for_layer_change;
+    static int original_layer_on_drag_start = -1;
     static bool resizing_left = false;
     static bool resizing_right = false;
     bool clicked_on_clip = false;
@@ -2512,6 +2514,8 @@ void DrawTimelineEditor(
                 dragging_clip_index = i;
                 float mouse_x = ImGui::GetMousePos().x;
                 drag_offset_time = (mouse_x - clip_start_x) / pixels_per_second;
+                drag_start_mouse_pos_for_layer_change = ImGui::GetMousePos();
+                original_layer_on_drag_start = clip.layer;
             }
 
             if (dragging_clip_index == i) {
@@ -2525,6 +2529,26 @@ void DrawTimelineEditor(
                 if (clip.linked_clip && clip.linked_clip != selected_clip) {
                     float delta = new_start - old_start;
                     clip.linked_clip->start_time += delta;
+                }
+                // --- NEW: Real-time vertical dragging for layer change ---
+                float vertical_delta = ImGui::GetMousePos().y - drag_start_mouse_pos_for_layer_change.y;
+                int layer_delta = static_cast<int>(round(vertical_delta / (layer_height + layer_padding)));
+
+                int new_layer = original_layer_on_drag_start;
+                if (clip.type == ClipType::Video) {
+                    new_layer -= layer_delta; // Dragging down (positive Y delta) moves video to a higher visual track (lower layer index)
+                } else { // Audio
+                    new_layer += layer_delta; // Dragging down moves audio to a lower visual track (higher layer index)
+                }
+                new_layer = std::max(0, new_layer);
+
+                if (new_layer != clip.layer) {
+                    clip.layer = new_layer;
+                    if (clip.linked_clip) {
+                        clip.linked_clip->layer += (clip.linked_clip->type == ClipType::Video) ? layer_delta : -layer_delta; // doesnt work correctly
+                        clip.linked_clip->layer = std::max(0, clip.linked_clip->layer);
+                    }
+                    layers_changed = true; // Trigger immediate redraw for visual feedback
                 }
             }
         } else if (dragging_clip_index == i) {
