@@ -2299,6 +2299,7 @@ void DrawTimelineEditor(
     static float drag_offset_time = 0.0f;
     static ImVec2 drag_start_mouse_pos_for_layer_change;
     static int original_layer_on_drag_start = -1;
+    static int original_linked_layer_on_drag_start = -1;
     static bool resizing_left = false;
     static bool resizing_right = false;
     bool clicked_on_clip = false;
@@ -2510,45 +2511,65 @@ void DrawTimelineEditor(
 
         if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
             PushUndo(clips, playhead_time, zoom_factor);
+            
+            // --- 1. INITIALIZATION ---
             if (dragging_clip_index == -1) {
                 dragging_clip_index = i;
                 float mouse_x = ImGui::GetMousePos().x;
                 drag_offset_time = (mouse_x - clip_start_x) / pixels_per_second;
                 drag_start_mouse_pos_for_layer_change = ImGui::GetMousePos();
+                
+                // Store original indices
                 original_layer_on_drag_start = clip.layer;
+                if (clip.linked_clip) {
+                    original_linked_layer_on_drag_start = clip.linked_clip->layer;
+                } else {
+                    original_linked_layer_on_drag_start = -1;
+                }
             }
 
+            // --- 2. UPDATE LOGIC ---
             if (dragging_clip_index == i) {
+                // A. Horizontal Time Dragging
                 float mouse_x = ImGui::GetMousePos().x;
                 float new_start = (mouse_x - timeline_start.x + scroll_x) / pixels_per_second - drag_offset_time;
                 new_start = std::max(0.0f, new_start);
                 float old_start = clip.start_time;
                 clip.start_time = new_start;
 
-                // Sync linked clip's start_time if it's not actively being dragged or resized
                 if (clip.linked_clip && clip.linked_clip != selected_clip) {
                     float delta = new_start - old_start;
                     clip.linked_clip->start_time += delta;
                 }
-                // --- NEW: Real-time vertical dragging for layer change ---
+
+                // B. Vertical Layer Dragging (Fixed)
                 float vertical_delta = ImGui::GetMousePos().y - drag_start_mouse_pos_for_layer_change.y;
-                int layer_delta = static_cast<int>(round(vertical_delta / (layer_height + layer_padding)));
+                int track_steps = static_cast<int>(round(vertical_delta / (layer_height + layer_padding)));
 
-                int new_layer = original_layer_on_drag_start;
+                // Calculate the numerical change in layer index based ONLY on the dragged clip's type.
+                // - If dragging Video: Mouse Down (+Y) means Layer Index Decreases.
+                // - If dragging Audio: Mouse Down (+Y) means Layer Index Increases.
+                int layer_index_delta = 0;
+                
                 if (clip.type == ClipType::Video) {
-                    new_layer -= layer_delta; // Dragging down (positive Y delta) moves video to a higher visual track (lower layer index)
+                    layer_index_delta = -track_steps; 
                 } else { // Audio
-                    new_layer += layer_delta; // Dragging down moves audio to a lower visual track (higher layer index)
+                    layer_index_delta = track_steps;
                 }
-                new_layer = std::max(0, new_layer);
 
+                // Apply this SAME delta to the original indices of both clips
+                int new_layer = std::max(0, original_layer_on_drag_start + layer_index_delta);
+
+                // Only apply if the layer actually changed
                 if (new_layer != clip.layer) {
                     clip.layer = new_layer;
-                    if (clip.linked_clip) {
-                        clip.linked_clip->layer += (clip.linked_clip->type == ClipType::Video) ? layer_delta : -layer_delta; // doesnt work correctly
-                        clip.linked_clip->layer = std::max(0, clip.linked_clip->layer);
+
+                    // Update linked clip using the SAME numerical delta
+                    if (clip.linked_clip && original_linked_layer_on_drag_start != -1) {
+                        clip.linked_clip->layer = std::max(0, original_linked_layer_on_drag_start + layer_index_delta);
                     }
-                    layers_changed = true; // Trigger immediate redraw for visual feedback
+                    
+                    layers_changed = true; 
                 }
             }
         } else if (dragging_clip_index == i) {
