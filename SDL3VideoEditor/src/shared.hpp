@@ -57,9 +57,6 @@ struct KeyframeTrack {
     T Evaluate(float time) const;
 };
 
-float Lerp(float a, float b, float t);
-
-
 struct Clip {
     std::string name;
     
