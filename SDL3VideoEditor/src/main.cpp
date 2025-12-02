@@ -2901,54 +2901,11 @@ void DrawKeyframeTrackEditor(const std::string& label, KeyframeTrack<T>& track) 
         CurveEditorContext& ctx = g_CurveEditors[label];
 
         // =========================================================
-        // 1. INSPECTOR TOOLBAR (Visible if Keyframe Selected)
+        // 1. FIXED HEADER (Controls + Inspector)
         // =========================================================
-        if (ctx.selected_keyframe_idx >= 0 && ctx.selected_keyframe_idx < track.keyframes.size()) {
-            auto& sel_kf = track.keyframes[ctx.selected_keyframe_idx];
-            
-            ImGui::BeginGroup(); // Group for visual cohesion
-            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "Key [%d] Props:", ctx.selected_keyframe_idx);
-            ImGui::SameLine();
-            
-            // Time
-            ImGui::SetNextItemWidth(70);
-            ImGui::DragFloat("##sel_time", &sel_kf.time, 0.01f, 0.0f, 0.0f, "T: %.3f");
-            ImGui::SameLine();
-            
-            // Value (Float only for graph)
-            ImGui::SetNextItemWidth(70);
-            if constexpr (std::is_same_v<T, float>) {
-                ImGui::DragFloat("##sel_val", &sel_kf.value, 0.01f, 0.0f, 0.0f, "V: %.3f");
-            }
-            ImGui::SameLine();
-
-            // Interpolation
-            ImGui::SetNextItemWidth(90);
-            const char* interp_labels[] = { "Linear", "Ease", "Hold", "Bezier" };
-            int current_interp = static_cast<int>(sel_kf.interp);
-            if (ImGui::Combo("##sel_type", &current_interp, interp_labels, IM_ARRAYSIZE(interp_labels))) {
-                sel_kf.interp = static_cast<InterpolationType>(current_interp);
-                // Reset handles on switch to Bezier
-                if (sel_kf.interp == InterpolationType::Bezier) {
-                    sel_kf.handle_right = { 0.25f, 0.0f };
-                    if (ctx.selected_keyframe_idx + 1 < track.keyframes.size()) {
-                         track.keyframes[ctx.selected_keyframe_idx+1].handle_left = { -0.25f, 0.0f };
-                    }
-                }
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("Delete Key")) {
-                track.keyframes.erase(track.keyframes.begin() + ctx.selected_keyframe_idx);
-                ctx.selected_keyframe_idx = -1;
-                ctx.dragging_keyframe_idx = -1;
-            }
-            ImGui::EndGroup();
-            ImGui::Separator();
-        }
-
-        // =========================================================
-        // 2. GLOBAL CONTROLS
-        // =========================================================
+        // We use a Group to ensure this area always exists and keeps layout stable.
+        
+        // Row 1: Global Actions
         if (ImGui::Button("Add Key")) {
              Keyframe<T> kf;
              kf.time = track.keyframes.empty() ? 0.0f : track.keyframes.back().time + 1.0f;
@@ -2960,25 +2917,69 @@ void DrawKeyframeTrackEditor(const std::string& label, KeyframeTrack<T>& track) 
              std::sort(track.keyframes.begin(), track.keyframes.end(), [](const auto& a, const auto& b) { return a.time < b.time; });
         }
         ImGui::SameLine();
-        if (ImGui::Button("Fit")) {
-            ctx.zoom_x = 1.0f; ctx.zoom_y = 1.0f; ctx.pan = ImVec2(0,0);
-        }
+        if (ImGui::Button("Fit View")) { ctx.zoom_x = 1.0f; ctx.zoom_y = 1.0f; ctx.pan = ImVec2(0,0); }
         ImGui::SameLine();
         ImGui::Checkbox("Snap", &ctx.snap_enabled);
         ImGui::SameLine();
-        ImGui::TextDisabled("(Alt+Drag: Pan, Scroll: Zoom)");
+        ImGui::TextDisabled("|");
+        ImGui::SameLine();
+
+        // Row 1 (Continued) or Row 2: Selection Inspector
+        // We render this unconditionally. If no selection, we render dummy/disabled text
+        // to reserve the exact vertical height and prevent "jumping".
+        bool has_selection = (ctx.selected_keyframe_idx >= 0 && ctx.selected_keyframe_idx < track.keyframes.size());
+        
+        if (has_selection) {
+            auto& sel_kf = track.keyframes[ctx.selected_keyframe_idx];
+            
+            ImGui::SetNextItemWidth(60);
+            ImGui::DragFloat("##sel_time", &sel_kf.time, 0.01f, 0.0f, 0.0f, "T:%.3f");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Keyframe Time");
+            ImGui::SameLine();
+            
+            ImGui::SetNextItemWidth(60);
+            if constexpr (std::is_same_v<T, float>) {
+                ImGui::DragFloat("##sel_val", &sel_kf.value, 0.01f, 0.0f, 0.0f, "V:%.3f");
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Keyframe Value");
+            }
+            ImGui::SameLine();
+
+            ImGui::SetNextItemWidth(80);
+            const char* interp_labels[] = { "Linear", "Ease", "Hold", "Bezier" };
+            int current_interp = static_cast<int>(sel_kf.interp);
+            if (ImGui::Combo("##sel_type", &current_interp, interp_labels, IM_ARRAYSIZE(interp_labels))) {
+                sel_kf.interp = static_cast<InterpolationType>(current_interp);
+                if (sel_kf.interp == InterpolationType::Bezier) {
+                    sel_kf.handle_right = { 0.25f, 0.0f };
+                    if (ctx.selected_keyframe_idx + 1 < track.keyframes.size()) 
+                         track.keyframes[ctx.selected_keyframe_idx+1].handle_left = { -0.25f, 0.0f };
+                }
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Delete")) { 
+                track.keyframes.erase(track.keyframes.begin() + ctx.selected_keyframe_idx);
+                ctx.selected_keyframe_idx = -1;
+                ctx.dragging_keyframe_idx = -1;
+            }
+        } else {
+            // Render spacers that match the height of the inputs above
+            // This keeps the graph from jumping up when you deselect.
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextDisabled("No Keyframe Selected");
+            // Add a dummy button size to match the trash icon height if needed
+            ImGui::SameLine(); ImGui::Dummy(ImVec2(1, ImGui::GetFrameHeight())); 
+        }
 
         // =========================================================
-        // 3. CANVAS SETUP
+        // 2. CANVAS SETUP
         // =========================================================
         ImGui::Spacing();
-        // Reserve space for the graph
         ImVec2 canvas_sz(ImGui::GetContentRegionAvail().x, 300.0f);
         ImVec2 canvas_p0 = ImGui::GetCursorScreenPos();
         ImVec2 canvas_p1 = ImVec2(canvas_p0.x + canvas_sz.x, canvas_p0.y + canvas_sz.y);
         ImDrawList* draw = ImGui::GetWindowDrawList();
 
-        // Layout Constants
+        // Layout: Gutter for axes
         const float AXIS_LEFT_WIDTH = 50.0f;
         const float AXIS_BOTTOM_HEIGHT = 30.0f;
         ImVec2 graph_p0 = ImVec2(canvas_p0.x + AXIS_LEFT_WIDTH, canvas_p0.y);
@@ -2991,11 +2992,10 @@ void DrawKeyframeTrackEditor(const std::string& label, KeyframeTrack<T>& track) 
         ImU32 col_text = IM_COL32(180, 180, 180, 255);
         ImU32 col_border = IM_COL32(60, 60, 70, 255);
 
-        // Draw Backgrounds
-        draw->AddRectFilled(canvas_p0, canvas_p1, col_axis_bg); // Global bg (axis color)
-        draw->AddRectFilled(graph_p0, graph_p1, col_bg);        // Graph bg
+        draw->AddRectFilled(canvas_p0, canvas_p1, col_axis_bg);
+        draw->AddRectFilled(graph_p0, graph_p1, col_bg);
 
-        // Coordinate Transforms (Relative to Graph Area)
+        // Transforms
         float time_scale = 100.0f * ctx.zoom_x;
         float val_scale = 50.0f * ctx.zoom_y;
         float graph_h = graph_p1.y - graph_p0.y;
@@ -3005,41 +3005,36 @@ void DrawKeyframeTrackEditor(const std::string& label, KeyframeTrack<T>& track) 
         auto ScreenToTime = [&](float x) { return (x - graph_p0.x - ctx.pan.x) / time_scale; };
         auto ScreenToVal  = [&](float y) { return -((y - graph_p0.y - ctx.pan.y) - (graph_h * 0.5f)) / val_scale; };
 
-        // Clip to Graph Area for Grid & Curves
         draw->PushClipRect(graph_p0, graph_p1, true);
 
-        // =========================================================
-        // 4. GRID DRAWING
-        // =========================================================
+        // --- Grid ---
         float t_min = ScreenToTime(graph_p0.x), t_max = ScreenToTime(graph_p1.x);
         float v_min = ScreenToVal(graph_p1.y), v_max = ScreenToVal(graph_p0.y);
-        
         float t_step = GetNiceStep(t_max - t_min, graph_p1.x - graph_p0.x);
         float v_step = GetNiceStep(v_max - v_min, graph_p1.y - graph_p0.y);
 
-        // Vertical Grid (Time)
         for (float t = floor(t_min / t_step) * t_step; t < t_max + t_step; t += t_step) {
             float x = TimeToScreen(t);
             draw->AddLine(ImVec2(x, graph_p0.y), ImVec2(x, graph_p1.y), col_grid);
         }
-        // Horizontal Grid (Value)
         for (float v = floor(v_min / v_step) * v_step; v < v_max + v_step; v += v_step) {
             float y = ValToScreen(v);
             draw->AddLine(ImVec2(graph_p0.x, y), ImVec2(graph_p1.x, y), col_grid);
         }
-        // Zero Line
+        
         float y_zero = ValToScreen(0.0f);
         if(y_zero > graph_p0.y && y_zero < graph_p1.y)
             draw->AddLine(ImVec2(graph_p0.x, y_zero), ImVec2(graph_p1.x, y_zero), IM_COL32(100, 200, 255, 40));
 
-        // Invisible Button for Input on Canvas
+        // Input Handling
         ImGui::SetCursorScreenPos(graph_p0);
         ImGui::InvisibleButton("##graph_input", ImVec2(graph_p1.x - graph_p0.x, graph_p1.y - graph_p0.y));
         bool is_hovered = ImGui::IsItemHovered();
         bool is_active = ImGui::IsItemActive();
+        bool is_mouse_clicked = ImGui::IsMouseClicked(0);
         ImVec2 mouse_pos = ImGui::GetMousePos();
 
-        // Pan & Zoom
+        // Pan/Zoom
         if (is_active && (ImGui::IsMouseDragging(ImGuiMouseButton_Middle) || (ImGui::IsMouseDragging(ImGuiMouseButton_Left) && ImGui::GetIO().KeyAlt))) {
             ctx.pan.x += ImGui::GetIO().MouseDelta.x;
             ctx.pan.y += ImGui::GetIO().MouseDelta.y;
@@ -3050,15 +3045,16 @@ void DrawKeyframeTrackEditor(const std::string& label, KeyframeTrack<T>& track) 
         }
 
         // =========================================================
-        // 5. CURVE DRAWING & HANDLING
+        // 3. DRAW CURVES & HIT TESTING
         // =========================================================
+        bool clicked_any_item = false; // Track if we hit anything this frame
+
         if constexpr (std::is_same_v<T, float>) {
             for (size_t i = 0; i < track.keyframes.size(); ++i) {
                 auto& kf = track.keyframes[i];
                 ImVec2 p_kf(TimeToScreen(kf.time), ValToScreen(kf.value));
                 bool is_selected = (static_cast<int>(i) == ctx.selected_keyframe_idx);
 
-                // Draw Curve Segment
                 if (i < track.keyframes.size() - 1) {
                     auto& next_kf = track.keyframes[i+1];
                     ImVec2 p_next(TimeToScreen(next_kf.time), ValToScreen(next_kf.value));
@@ -3074,12 +3070,11 @@ void DrawKeyframeTrackEditor(const std::string& label, KeyframeTrack<T>& track) 
                             draw->AddCircleFilled(p_h1, 4.0f, IM_COL32(255,255,255,200));
                             draw->AddCircleFilled(p_h2, 4.0f, IM_COL32(255,255,255,200));
 
-                            // Handle Hit Test
-                            if (is_active && ImGui::IsMouseClicked(0)) {
+                            if (is_active && is_mouse_clicked) {
                                 float d1 = pow(mouse_pos.x - p_h1.x, 2) + pow(mouse_pos.y - p_h1.y, 2);
                                 float d2 = pow(mouse_pos.x - p_h2.x, 2) + pow(mouse_pos.y - p_h2.y, 2);
-                                if (d1 < 64) { ctx.dragging_keyframe_idx = i; ctx.dragging_handle_id = 2; } 
-                                else if (d2 < 64) { ctx.dragging_keyframe_idx = i+1; ctx.dragging_handle_id = 1; } 
+                                if (d1 < 64) { ctx.dragging_keyframe_idx = i; ctx.dragging_handle_id = 2; clicked_any_item = true; } 
+                                else if (d2 < 64) { ctx.dragging_keyframe_idx = i+1; ctx.dragging_handle_id = 1; clicked_any_item = true; } 
                             }
                         }
                     } else if (kf.interp == InterpolationType::Linear) {
@@ -3091,30 +3086,32 @@ void DrawKeyframeTrackEditor(const std::string& label, KeyframeTrack<T>& track) 
                     }
                 }
 
-                // Draw Point
                 draw->AddCircleFilled(p_kf, 5.0f, is_selected ? IM_COL32(255,255,255,255) : IM_COL32(255,180,0,255));
                 draw->AddCircle(p_kf, 6.0f, IM_COL32(0,0,0,255));
 
-                // Keyframe Hit Test
-                if (is_active && ImGui::IsMouseClicked(0)) {
+                if (is_active && is_mouse_clicked) {
                     float dist = pow(mouse_pos.x - p_kf.x, 2) + pow(mouse_pos.y - p_kf.y, 2);
                     if (dist < 64) { 
                         ctx.dragging_keyframe_idx = i; 
                         ctx.dragging_handle_id = 0; 
-                        ctx.selected_keyframe_idx = i; // Select on click
+                        ctx.selected_keyframe_idx = i; // Select
+                        clicked_any_item = true; 
                     }
                 }
             }
         }
 
-        // Unclip Graph
         draw->PopClipRect();
 
+        // --- DESELECT LOGIC ---
+        // If we clicked inside the graph but NOT on any item, deselect.
+        if (is_hovered && is_mouse_clicked && !clicked_any_item && !ImGui::GetIO().KeyAlt) {
+            ctx.selected_keyframe_idx = -1;
+        }
+
         // =========================================================
-        // 6. AXES DRAWING (Outside Clip Rect)
+        // 4. DRAW AXES LABELS (Outside Clip)
         // =========================================================
-        
-        // Left Axis (Value)
         draw->PushClipRect(ImVec2(canvas_p0.x, canvas_p0.y), ImVec2(graph_p0.x, graph_p1.y), true);
         for (float v = floor(v_min / v_step) * v_step; v < v_max + v_step; v += v_step) {
             float y = ValToScreen(v);
@@ -3127,7 +3124,6 @@ void DrawKeyframeTrackEditor(const std::string& label, KeyframeTrack<T>& track) 
         }
         draw->PopClipRect();
 
-        // Bottom Axis (Time)
         draw->PushClipRect(ImVec2(graph_p0.x, graph_p1.y), ImVec2(graph_p1.x, canvas_p1.y), true);
         for (float t = floor(t_min / t_step) * t_step; t < t_max + t_step; t += t_step) {
             float x = TimeToScreen(t);
@@ -3138,78 +3134,52 @@ void DrawKeyframeTrackEditor(const std::string& label, KeyframeTrack<T>& track) 
             }
         }
         draw->PopClipRect();
-
-        // Draw Borders
-        draw->AddRect(canvas_p0, canvas_p1, col_border); // Outer
-        draw->AddLine(ImVec2(graph_p0.x, graph_p0.y), ImVec2(graph_p0.x, graph_p1.y), col_border); // Left Sep
-        draw->AddLine(ImVec2(graph_p0.x, graph_p1.y), ImVec2(graph_p1.x, graph_p1.y), col_border); // Bottom Sep
+        
+        draw->AddRect(canvas_p0, canvas_p1, col_border);
+        draw->AddLine(ImVec2(graph_p0.x, graph_p0.y), ImVec2(graph_p0.x, graph_p1.y), col_border);
+        draw->AddLine(ImVec2(graph_p0.x, graph_p1.y), ImVec2(graph_p1.x, graph_p1.y), col_border);
 
         // =========================================================
-        // 7. DRAGGING LOGIC (With Snapping)
+        // 5. DRAGGING & SNAPPING
         // =========================================================
         if (ImGui::IsMouseDown(0) && ctx.dragging_keyframe_idx != -1 && !ImGui::GetIO().KeyAlt) {
             int idx = ctx.dragging_keyframe_idx;
             if (idx >= 0 && idx < track.keyframes.size()) {
                 auto& kf = track.keyframes[idx];
-                
-                // Snapping Helper
-                auto ApplySnap = [&](float val, float step) {
-                    return ctx.snap_enabled ? round(val / step) * step : val;
-                };
+                auto ApplySnap = [&](float val, float step) { return ctx.snap_enabled ? round(val / step) * step : val; };
 
-                if (ctx.dragging_handle_id == 0) { // Move Keyframe
-                    float new_t = ScreenToTime(mouse_pos.x);
-                    float new_v = ScreenToVal(mouse_pos.y);
-                    
-                    new_t = ApplySnap(new_t, 0.1f); // Snap time to 0.1s
-                    new_v = ApplySnap(new_v, 0.1f); // Snap value to 0.1
+                if (ctx.dragging_handle_id == 0) { // Keyframe
+                    float new_t = ApplySnap(ScreenToTime(mouse_pos.x), 0.1f);
+                    float new_v = ApplySnap(ScreenToVal(mouse_pos.y), 0.1f);
                     
                     if(new_t < 0.0f) new_t = 0.0f;
                     kf.time = new_t;
                     if constexpr (std::is_same_v<T, float>) kf.value = new_v;
                 }
-                else if (ctx.dragging_handle_id == 1) { // Left Handle
-                    float raw_dx = ScreenToTime(mouse_pos.x) - kf.time;
-                    float raw_dy = ScreenToVal(mouse_pos.y) - kf.value;
-                    
-                    if (ctx.snap_enabled) {
-                        raw_dx = round(raw_dx / 0.05f) * 0.05f;
-                        raw_dy = round(raw_dy / 0.05f) * 0.05f;
-                    }
-                    
-                    kf.handle_left.x = raw_dx;
-                    kf.handle_left.y = raw_dy;
+                else if (ctx.dragging_handle_id == 1) { // Left
+                    float dx = ScreenToTime(mouse_pos.x) - kf.time;
+                    float dy = ScreenToVal(mouse_pos.y) - kf.value;
+                    if(ctx.snap_enabled) { dx = ApplySnap(dx, 0.05f); dy = ApplySnap(dy, 0.05f); }
+                    kf.handle_left.x = dx; kf.handle_left.y = dy;
                     if (kf.handle_left.x > 0) kf.handle_left.x = 0; 
                 }
-                else if (ctx.dragging_handle_id == 2) { // Right Handle
-                    float raw_dx = ScreenToTime(mouse_pos.x) - kf.time;
-                    float raw_dy = ScreenToVal(mouse_pos.y) - kf.value;
-
-                    if (ctx.snap_enabled) {
-                        raw_dx = round(raw_dx / 0.05f) * 0.05f;
-                        raw_dy = round(raw_dy / 0.05f) * 0.05f;
-                    }
-
-                    kf.handle_right.x = raw_dx;
-                    kf.handle_right.y = raw_dy;
+                else if (ctx.dragging_handle_id == 2) { // Right
+                    float dx = ScreenToTime(mouse_pos.x) - kf.time;
+                    float dy = ScreenToVal(mouse_pos.y) - kf.value;
+                    if(ctx.snap_enabled) { dx = ApplySnap(dx, 0.05f); dy = ApplySnap(dy, 0.05f); }
+                    kf.handle_right.x = dx; kf.handle_right.y = dy;
                     if (kf.handle_right.x < 0) kf.handle_right.x = 0;
                 }
             }
         } 
         else if (ImGui::IsMouseReleased(0)) {
             if (ctx.dragging_keyframe_idx != -1 && ctx.dragging_handle_id == 0) {
-                // Find the keyframe we were dragging
                 auto* dragged_kf = &track.keyframes[ctx.dragging_keyframe_idx];
-                
-                // Sort based on time
                 std::sort(track.keyframes.begin(), track.keyframes.end(), [](const auto& a, const auto& b) { return a.time < b.time; });
-                
-                // Fix selection index by finding the keyframe with matching properties (address changed due to sort)
-                // Simple workaround: Find exact time match (unique enough usually)
+                // Re-find selection after sort
                 for(int i=0; i<track.keyframes.size(); ++i) {
                     if (track.keyframes[i].time == dragged_kf->time && track.keyframes[i].value == dragged_kf->value) {
-                        ctx.selected_keyframe_idx = i;
-                        break;
+                        ctx.selected_keyframe_idx = i; break;
                     }
                 }
             }
