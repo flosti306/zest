@@ -118,6 +118,7 @@ static GLuint mask_editor_dummy_vao = 0;       // VAO for fullscreen quad drawin
 
 static bool smart_mask_editor_open = false;
 static MaskEffectNode* current_editing_smart_mask_node = nullptr;
+static bool node_editor_active = false; // Added to prevent global clip deletion when editing nodes
 static GLuint smart_mask_editor_bg_clip_tex = 0; // Texture of the clip frame to show
 static GLuint smart_mask_editor_overlay_tex = 0; // Texture of the generated GrabCut mask
 static ImVec2 smart_mask_roi_start_pos; // For drawing the ROI rectangle
@@ -1547,7 +1548,11 @@ int main(int argc, char* argv[]) {
                 // --- End Blade Tool ---
             }
             // Use event.key.key and SDLK_DELETE (Fix 3 & 4)
-            else if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_DELETE && selected_clip && event.key.down) {
+            // Fix: Don't delete clips if we are interacting with the Node Editor or Smart Mask Editor
+            else if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_DELETE && 
+                     selected_clip && event.key.down && 
+                     !node_editor_active && 
+                     !smart_mask_editor_open) {
                 PushUndo(clips, playhead_time, zoom_factor);
                 ptrdiff_t selected_index = -1;
                 for(size_t i = 0; i < clips.size(); ++i) { if (&clips[i] == selected_clip) { selected_index = i; break; } }
@@ -3627,6 +3632,77 @@ void DrawNodeEditorWindow(Clip* clip) {
     if (clip && clip->effect_graph) {
         auto& graph = clip->effect_graph;
 
+        // --- DELETION LOGIC (Moved to start to avoid context issues) ---
+        // Handle deletion before drawing the editor to ensure valid context
+        
+        // Update global active state for the main loop to see
+        node_editor_active = ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows);
+
+        if (node_editor_active && ImGui::IsKeyReleased(ImGuiKey_Delete)) {
+             bool graph_changed = false;
+
+            // Delete selected links
+            int num_selected_links = ImNodes::NumSelectedLinks();
+            if (num_selected_links > 0) {
+                std::vector<int> selected_links(num_selected_links);
+                ImNodes::GetSelectedLinks(selected_links.data());
+                
+                auto& links_vec = graph->links;
+                for (int link_id : selected_links) {
+                    links_vec.erase(
+                        std::remove_if(links_vec.begin(), links_vec.end(), [link_id](const Link& link) {
+                            return link.id == link_id;
+                        }),
+                        links_vec.end()
+                    );
+                }
+                graph_changed = true;
+            }
+
+            // Delete selected nodes
+            int num_selected_nodes = ImNodes::NumSelectedNodes();
+            if (num_selected_nodes > 0) {
+                std::vector<int> selected_nodes(num_selected_nodes);
+                ImNodes::GetSelectedNodes(selected_nodes.data());
+                
+                for (int node_id : selected_nodes) {
+                    // Don't delete the Output Node!
+                    if (node_id == graph->output_node_id) continue;
+                    // Don't delete the Input Node!
+                    if (node_id == graph->input_node_id) continue;
+
+                    // Safety Check: If we are deleting the node currently being edited in Smart Mask Editor
+                    if (current_editing_smart_mask_node && current_editing_smart_mask_node->id == node_id) {
+                        current_editing_smart_mask_node = nullptr;
+                        smart_mask_editor_open = false;
+                    }
+
+                    // Remove all links connected to this node
+                    auto& links_vec = graph->links;
+                    links_vec.erase(
+                        std::remove_if(links_vec.begin(), links_vec.end(), [node_id](const Link& link) {
+                            return link.from_node_id == node_id || link.to_node_id == node_id;
+                        }),
+                        links_vec.end()
+                    );
+
+                    // Remove the node itself
+                    graph->nodes.erase(node_id);
+
+                    // Clear selection if needed
+                    if (selected_node_id == node_id) {
+                        selected_node_id = -1;
+                    }
+                }
+                graph_changed = true;
+            }
+
+            if (graph_changed) {
+                graph->rebuild_order_from_links();
+            }
+        }
+        // ----------------------------------------------------------------
+
         ImNodes::BeginNodeEditor();
 
         // Open the popup on Shift+A. We check IsWindowHovered to make sure
@@ -3693,7 +3769,7 @@ void DrawNodeEditorWindow(Clip* clip) {
             };
 
             // 3. Check for Enter key press on the top result.
-            if ((ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter)) && !scored_results.empty()) {
+            if ((ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter)) && !scored_results.empty() && !ImGui::IsAnyItemFocused()) {
                 add_selected_node(scored_results.front().name);
             }
 
@@ -3716,6 +3792,36 @@ void DrawNodeEditorWindow(Clip* clip) {
 
         // --- Render Nodes and Pins ---
         for (auto const& [node_id, node_ptr] : graph->nodes) {
+            // --- Node Coloring Logic ---
+            ImU32 title_color = IM_COL32(255, 143, 38, 255); // Default Orange (Effects)
+            ImU32 title_hovered = IM_COL32(255, 171, 64, 255);
+            ImU32 title_selected = IM_COL32(255, 107, 0, 255);
+
+            if (std::dynamic_pointer_cast<SourceClipNode>(node_ptr) || 
+                std::dynamic_pointer_cast<EmptySourceNode>(node_ptr)) {
+                // Source/Input: Green
+                title_color = IM_COL32(76, 175, 80, 255);
+                title_hovered = IM_COL32(102, 187, 106, 255);
+                title_selected = IM_COL32(56, 142, 60, 255);
+            } else if (std::dynamic_pointer_cast<FinalOutputNode>(node_ptr)) {
+                // Output: Red
+                title_color = IM_COL32(211, 47, 47, 255);
+                title_hovered = IM_COL32(229, 57, 53, 255);
+                title_selected = IM_COL32(183, 28, 28, 255);
+            } else if (std::dynamic_pointer_cast<MergeNode>(node_ptr) || 
+                       std::dynamic_pointer_cast<TransformNode>(node_ptr) ||
+                       std::dynamic_pointer_cast<TrackerNode>(node_ptr)) {
+                // Utility: Blue/Purple
+                title_color = IM_COL32(63, 81, 181, 255);
+                title_hovered = IM_COL32(92, 107, 192, 255);
+                title_selected = IM_COL32(48, 63, 159, 255);
+            }
+            // Else: Default Orange for Effects
+
+            ImNodes::PushColorStyle(ImNodesCol_TitleBar, title_color);
+            ImNodes::PushColorStyle(ImNodesCol_TitleBarHovered, title_hovered);
+            ImNodes::PushColorStyle(ImNodesCol_TitleBarSelected, title_selected);
+
             ImNodes::BeginNode(node_id);
             
             ImNodes::BeginNodeTitleBar();
@@ -3723,9 +3829,11 @@ void DrawNodeEditorWindow(Clip* clip) {
             ImNodes::EndNodeTitleBar();
 
             for (const auto& pin : node_ptr->input_pins) {
+                ImNodes::PushAttributeFlag(ImNodesAttributeFlags_EnableLinkDetachWithDragClick);
                 ImNodes::BeginInputAttribute(pin.id);
                 ImGui::TextUnformatted(pin.name.c_str());
                 ImNodes::EndInputAttribute();
+                ImNodes::PopAttributeFlag();
             }
 
             for (const auto& pin : node_ptr->output_pins) {
@@ -3735,6 +3843,10 @@ void DrawNodeEditorWindow(Clip* clip) {
             }
 
             ImNodes::EndNode();
+
+            ImNodes::PopColorStyle();
+            ImNodes::PopColorStyle();
+            ImNodes::PopColorStyle();
         }
 
         // --- Render Links ---
@@ -3743,6 +3855,8 @@ void DrawNodeEditorWindow(Clip* clip) {
         }
 
         ImNodes::EndNodeEditor();
+
+
 
         const int num_selected_nodes = ImNodes::NumSelectedNodes();
         if (num_selected_nodes == 1) {
@@ -3758,6 +3872,8 @@ void DrawNodeEditorWindow(Clip* clip) {
         for (auto const& [node_id, node_ptr] : graph->nodes) {
             node_ptr->editor_pos = ImNodes::GetNodeEditorSpacePos(node_id);
         }
+
+
 
         // --- NEW & CORRECTED Link Management for Intuitive UX ---
 
@@ -3797,6 +3913,17 @@ void DrawNodeEditorWindow(Clip* clip) {
         }
 
         // 2. Handle DELETING links by dragging them off a pin
+        int destroyed_link_id;
+        if (ImNodes::IsLinkDestroyed(&destroyed_link_id)) {
+            auto& links_vec = graph->links;
+            links_vec.erase(
+                std::remove_if(links_vec.begin(), links_vec.end(), [destroyed_link_id](const Link& link) {
+                    return link.id == destroyed_link_id;
+                }),
+                links_vec.end()
+            );
+            graph->rebuild_order_from_links();
+        }
         int dropped_pin_id;
         // The 'true' argument is crucial: it reports drops that started from an existing link.
         if (ImNodes::IsLinkDropped(&dropped_pin_id, true)) {
@@ -3814,6 +3941,8 @@ void DrawNodeEditorWindow(Clip* clip) {
             graph->rebuild_order_from_links();
         }
         // --- END NEW & CORRECTED LOGIC ---
+
+
     } else {
         ApplyWindowBackgroundGradients();
         // --- NEW: Display a helpful message when no clip is selected ---
