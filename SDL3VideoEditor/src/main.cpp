@@ -2222,6 +2222,10 @@ void DrawTimelineEditor(
         zoom_factor /= 1.1f;
         playhead_time = std::clamp(focus_ratio * project_duration, 0.0f, project_duration);
     }
+    
+    static bool snap_enabled = false;
+    ImGui::SameLine();
+    ImGui::Checkbox("Snap", &snap_enabled);
 
     // Get starting positions for labels and timeline
     ImVec2 cursor_pos = ImGui::GetCursorScreenPos();
@@ -2341,6 +2345,44 @@ void DrawTimelineEditor(
         : max_video_layer + clip.layer;
 
         float layer_y = timeline_start.y + y_index * (layer_height + layer_padding);
+
+        // --- VISUAL DRAG OVERRIDE ---
+        static int original_y_index_on_drag_start = 0;
+        static int original_max_video_layer_on_drag_start = 0;
+        
+        // If this is the clip being dragged, override its Y position to correspond to its Logical Layer shift relative to start.
+        // We calculate the row index dynamically relative to the CURRENT timeline_start to prevent "Layer 1.5" drift.
+        if (dragging_clip_index == i && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+            // --- RECALCULATE MAX LAYERS LOCALLY ---
+            // The global 'max_video_layer' is stale (computed before this frame's drag update).
+            // We need the state that *will be* true next frame to prevent 1-frame glitches.
+            int current_max_video = 0;
+            // int current_max_audio = 0; // Unused for now but good for completeness if needed
+            for (const auto& c : clips) {
+                if (c.type == ClipType::Video) current_max_video = std::max(current_max_video, c.layer);
+                // else if (c.type == ClipType::Audio) current_max_audio = std::max(current_max_audio, c.layer);
+            }
+            current_max_video += 1; // Always +1 for empty space
+            // current_max_audio += 1;
+
+            float row_pitch = layer_height + layer_padding;
+            int layer_delta = clip.layer - original_layer_on_drag_start;
+            int max_video_delta = current_max_video - original_max_video_layer_on_drag_start;
+
+            float y_offset_rows = 0.0f;
+            if (clip.type == ClipType::Video) {
+                // Video: Y_Index = Max - Layer - 1.
+                // Delta = DeltaMax - DeltaLayer.
+                y_offset_rows = (float)max_video_delta - (float)layer_delta;
+            } else {
+                // Audio: Y_Index = Max + Layer.
+                // Delta = DeltaMax + DeltaLayer.
+                y_offset_rows = (float)max_video_delta + (float)layer_delta;
+            }
+            
+            // Calculate pixel position based on current grid anchor and target integer row
+            layer_y = timeline_start.y + (original_y_index_on_drag_start + y_offset_rows) * row_pitch;
+        }
 
         ImVec2 clip_rect_min = ImVec2(clip_start_x, layer_y + layer_padding);
         ImVec2 clip_rect_max = ImVec2(clip_end_x, layer_y + layer_height);
@@ -2541,6 +2583,13 @@ void DrawTimelineEditor(
                 
                 // Store original indices
                 original_layer_on_drag_start = clip.layer;
+                original_max_video_layer_on_drag_start = max_video_layer;
+                
+                // --- CAPTURE START Y INDEX ---
+                original_y_index_on_drag_start = clip.type == ClipType::Video
+                    ? max_video_layer - clip.layer - 1
+                    : max_video_layer + clip.layer;
+
                 if (clip.linked_clip) {
                     original_linked_layer_on_drag_start = clip.linked_clip->layer;
                 } else {
@@ -2550,10 +2599,53 @@ void DrawTimelineEditor(
 
             // --- 2. UPDATE LOGIC ---
             if (dragging_clip_index == i) {
-                // A. Horizontal Time Dragging
+                // A. Horizontal Time Dragging with Snapping
                 float mouse_x = ImGui::GetMousePos().x;
-                float new_start = (mouse_x - timeline_start.x + scroll_x) / pixels_per_second - drag_offset_time;
-                new_start = std::max(0.0f, new_start);
+                float raw_new_start = (mouse_x - timeline_start.x + scroll_x) / pixels_per_second - drag_offset_time;
+                raw_new_start = std::max(0.0f, raw_new_start);
+                
+                float new_start = raw_new_start;
+                
+                if (snap_enabled) {
+                    float snap_threshold_pixels = 15.0f; // Snap distance in pixels
+                    float snap_threshold_time = snap_threshold_pixels / pixels_per_second;
+                    float best_snap_diff = snap_threshold_time; // Initialize with max allowed diff
+                    
+                    // Snap candidates: 0.0, Playhead, other clips start/end
+                    std::vector<float> snap_points;
+                    snap_points.push_back(0.0f);
+                    snap_points.push_back(playhead_time);
+                    
+                    // Add other clips' start/end
+                    for (size_t other_i = 0; other_i < clips.size(); ++other_i) {
+                        if (i == other_i) continue; // Don't snap to self
+                        if (clips[other_i].selected && clips[other_i].type == clip.type) continue; // Don't snap to other currently dragged clips
+
+                        snap_points.push_back(clips[other_i].start_time);
+                        snap_points.push_back(clips[other_i].start_time + clips[other_i].duration);
+                    }
+                    
+                    // Check for snap on Start
+                    for (float pt : snap_points) {
+                        float diff = std::abs(raw_new_start - pt);
+                        if (diff < best_snap_diff) {
+                            best_snap_diff = diff;
+                            new_start = pt;
+                        }
+                    }
+                    
+                    // Check for snap on End (align end to snap point)
+                    float duration = clip.duration;
+                    for (float pt : snap_points) {
+                        float end_time = raw_new_start + duration;
+                        float diff = std::abs(end_time - pt);
+                        if (diff < best_snap_diff) { // If this is closer than the start-snap
+                            best_snap_diff = diff;
+                            new_start = pt - duration;
+                        }
+                    }
+                }
+
                 float old_start = clip.start_time;
                 clip.start_time = new_start;
 
@@ -2562,19 +2654,51 @@ void DrawTimelineEditor(
                     clip.linked_clip->start_time += delta;
                 }
 
-                // B. Vertical Layer Dragging (Fixed)
+                // B. Vertical Layer Dragging with Resistance
                 float vertical_delta = ImGui::GetMousePos().y - drag_start_mouse_pos_for_layer_change.y;
-                int track_steps = static_cast<int>(round(vertical_delta / (layer_height + layer_padding)));
+                float row_pitch = layer_height + layer_padding;
+                float continuous_steps = vertical_delta / row_pitch;
 
-                // Calculate the numerical change in layer index based ONLY on the dragged clip's type.
-                // - If dragging Video: Mouse Down (+Y) means Layer Index Decreases.
-                // - If dragging Audio: Mouse Down (+Y) means Layer Index Increases.
+                // Determine current visual step offset 'k' based on clip type
+                // k represents "how many Visual Rows we moved down from original position"
+                int current_k = 0;
+                if (clip.type == ClipType::Video) {
+                    // Video: Drag Down (+Y) -> Layer Decreases. 
+                    // Visual Down = Lower Video Layer Index (physically lower in list, but usually visual representation depends on max_layer)
+                    // Let's rely on the previous logic: 
+                    // layer_index_delta = -track_steps
+                    // So track_steps (Visual Change) = -(layer_current - layer_original) = layer_original - layer_current
+                    current_k = original_layer_on_drag_start - clip.layer;
+                } else { // Audio
+                    // Audio: Drag Down (+Y) -> Layer Increases.
+                    // layer_index_delta = track_steps
+                    // track_steps = layer_current - layer_original
+                    current_k = clip.layer - original_layer_on_drag_start;
+                }
+                
+                // Apply Resistance (Hysteresis)
+                // Threshold of 0.6 means we must be 60% into the next/prev row's space to switch.
+                const float resistance_threshold = 0.6f;
+                
+                // Iteratively move k towards continuous_steps if threshold is exceeded
+                while (true) {
+                    float diff = continuous_steps - (float)current_k;
+                    if (diff > resistance_threshold) {
+                        current_k++;
+                    } else if (diff < -resistance_threshold) {
+                        current_k--;
+                    } else {
+                        break; // Stabilized within resistance zone
+                    }
+                }
+
+                // Calculate the layer index delta from the stabilized visual steps 'k'
                 int layer_index_delta = 0;
                 
                 if (clip.type == ClipType::Video) {
-                    layer_index_delta = -track_steps; 
+                    layer_index_delta = -current_k; 
                 } else { // Audio
-                    layer_index_delta = track_steps;
+                    layer_index_delta = current_k;
                 }
 
                 // Apply this SAME delta to the original indices of both clips
@@ -2610,7 +2734,32 @@ void DrawTimelineEditor(
                 PushUndo(clips, playhead_time, zoom_factor);
                 resizing_left = true;
                 float mouse_x = ImGui::GetMousePos().x;
-                float new_start = (mouse_x - timeline_start.x + scroll_x) / pixels_per_second;
+                float raw_new_start = (mouse_x - timeline_start.x + scroll_x) / pixels_per_second;
+                
+                float new_start = raw_new_start;
+                if (snap_enabled) {
+                    float snap_threshold_pixels = 15.0f;
+                    float snap_threshold_time = snap_threshold_pixels / pixels_per_second;
+                    float best_snap_diff = snap_threshold_time;
+
+                    std::vector<float> snap_points;
+                    snap_points.push_back(0.0f);
+                    snap_points.push_back(playhead_time);
+                    for (size_t other_i = 0; other_i < clips.size(); ++other_i) {
+                        if (i == other_i) continue;
+                        snap_points.push_back(clips[other_i].start_time);
+                        snap_points.push_back(clips[other_i].start_time + clips[other_i].duration);
+                    }
+
+                    for (float pt : snap_points) {
+                        float diff = std::abs(raw_new_start - pt);
+                        if (diff < best_snap_diff) {
+                            best_snap_diff = diff;
+                            new_start = pt;
+                        }
+                    }
+                }
+
                 float new_duration = clip.start_time + clip.duration - new_start;
                 float delta = new_start - clip.start_time;
                 if (delta > 0.0f) clip.media_start += delta;
@@ -2637,7 +2786,32 @@ void DrawTimelineEditor(
                 PushUndo(clips, playhead_time, zoom_factor);
                 resizing_right = true;
                 float mouse_x = ImGui::GetMousePos().x;
-                float new_end = (mouse_x - timeline_start.x + scroll_x) / pixels_per_second;
+                float raw_new_end = (mouse_x - timeline_start.x + scroll_x) / pixels_per_second;
+                
+                float new_end = raw_new_end;
+                if (snap_enabled) {
+                    float snap_threshold_pixels = 15.0f;
+                    float snap_threshold_time = snap_threshold_pixels / pixels_per_second;
+                    float best_snap_diff = snap_threshold_time;
+
+                    std::vector<float> snap_points;
+                    snap_points.push_back(0.0f);
+                    snap_points.push_back(playhead_time);
+                    for (size_t other_i = 0; other_i < clips.size(); ++other_i) {
+                        if (i == other_i) continue;
+                        snap_points.push_back(clips[other_i].start_time);
+                        snap_points.push_back(clips[other_i].start_time + clips[other_i].duration);
+                    }
+
+                    for (float pt : snap_points) {
+                        float diff = std::abs(raw_new_end - pt);
+                        if (diff < best_snap_diff) {
+                            best_snap_diff = diff;
+                            new_end = pt;
+                        }
+                    }
+                }
+
                 float old_duration = clip.duration;
                 clip.duration = std::max(0.1f, new_end - clip.start_time);
 
