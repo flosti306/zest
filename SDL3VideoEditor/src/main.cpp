@@ -4529,7 +4529,20 @@ void DrawNodeInspectorWindow(Clip* clip, GLResources& gl_resources) {
         }
         
         if (ImGui::DragFloat("Font Size", &text_node->font_size, 1.0f, 8.0f, 256.0f)) {
-            text_node->needs_rebake = true;
+            // text_node->needs_rebake = true; // Optimization: We now scale the SDF quads, so no rebake needed!
+        }
+        // --- NEW: Rebake on Release for Maximum Quality ---
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            // User finished dragging. Let's rebake at the new size if it's larger than our current baked size,
+            // or just always rebake to ensure crispness (SDFs are best when rendered at 1:1 or downscaled).
+            // Actually, for SDFs, having a fixed high-res (e.g. 96) is usually enough.
+            // But if the user drags to 200, 96 might look soft.
+            // So let's update baked_font_size to match current font_size (with a minimum of 96).
+            float new_baked_size = std::clamp(text_node->font_size, 64.0f, 128.0f); // Cap at 128 to ensure it fits in atlas
+            if (std::abs(text_node->baked_font_size - new_baked_size) > 1.0f) {
+                text_node->baked_font_size = new_baked_size;
+                text_node->needs_rebake = true; 
+            }
         }
 
         // --- NEW: Layout Controls ---

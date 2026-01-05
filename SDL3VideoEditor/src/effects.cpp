@@ -1320,16 +1320,7 @@ void TextEffectNode::RebakeFont() {
 
     const int ATLAS_WIDTH = 2048;
     const int ATLAS_HEIGHT = 2048;
-    const int NUM_CHARS = 96;
-
-    // SDF Parameters
-    const int SDF_PADDING = 8; // Enough for a nice outline
-    const unsigned char ON_EDGE_VALUE = 128;
-    // How many value units (0-255) correspond to 1 pixel distance?
-    // We want the falloff (0 to 128) to cover SDF_PADDING pixels.
-    // So 128 / 8 = 16.0f.
-    const float PIXEL_DIST_SCALE = (float)ON_EDGE_VALUE / (float)SDF_PADDING; 
-
+    // Variables formerly defined here (NUM_CHARS, PIXEL_DIST_SCALE) are now local or inlined
     unsigned char* sdf_atlas_data = new unsigned char[ATLAS_WIDTH * ATLAS_HEIGHT];
     // Clear to transparent (or 0 distance)
     std::memset(sdf_atlas_data, 0, ATLAS_WIDTH * ATLAS_HEIGHT);
@@ -1340,7 +1331,7 @@ void TextEffectNode::RebakeFont() {
         return;
     }
 
-    float scale = stbtt_ScaleForPixelHeight(&font_info, font_size);
+    float scale = stbtt_ScaleForPixelHeight(&font_info, baked_font_size);
 
     stbtt_pack_context spc;
     // Just 1 pixel padding between packed glyphs for safety
@@ -1348,107 +1339,104 @@ void TextEffectNode::RebakeFont() {
     
     stbtt_PackSetOversampling(&spc, 1, 1);
     
-    // 1. Manually prepare rects with padding for SDF
-    stbrp_rect rects[NUM_CHARS];
-    int glyph_indices[NUM_CHARS];
+    // We need a bitmap for the atlas. 
+    // SDFs are usually smaller than full raster, but with padding they take space.
+    // 512x512 might be enough for small sets, but let's go 1024x1024 for safety with 96px font.
+    int NEW_ATLAS_WIDTH = 2048;
+    int NEW_ATLAS_HEIGHT = 2048;
+    std::vector<unsigned char> atlas_pixels(NEW_ATLAS_WIDTH * NEW_ATLAS_HEIGHT);
+    
+    // We use stbrp logic to pack rects
+    stbtt_PackBegin(&spc, atlas_pixels.data(), NEW_ATLAS_WIDTH, NEW_ATLAS_HEIGHT, 0, 1, nullptr);
+    
+    // We need to gather rects for our char range (32-126)
+    // AND we must account for the padding required by SDF.
+    int padding = 5; // SDF padding
+    int onedge_value = 128; // 0-255 range, 128 is the edge
+    int pixel_dist_scale = onedge_value / padding; 
 
-    for (int i = 0; i < NUM_CHARS; ++i) {
-        int codepoint = 32 + i;
-        int glyph_index = stbtt_FindGlyphIndex(&font_info, codepoint);
-        glyph_indices[i] = glyph_index;
-        
+    // stbtt_PackFontRangesGatherRects is not enough because it doesn't know about SDF padding needs?
+    // Actually, we can just manually allocate stbrp_rects.
+    
+    int num_chars = 96; // 32 to 127
+    std::vector<stbrp_rect> rects(num_chars);
+    for (int i = 0; i < num_chars; ++i) {
+        int codepoint = i + 32;
+        int x0, y0, x1, y1;
+        stbtt_GetCodepointBitmapBox(&font_info, codepoint, scale, scale, &x0, &y0, &x1, &y1);
         rects[i].id = i;
-        rects[i].w = 0;
-        rects[i].h = 0;
-
-        if (glyph_index != 0) {
-            int ix0, iy0, ix1, iy1;
-            stbtt_GetGlyphBitmapBox(&font_info, glyph_index, scale, scale, &ix0, &iy0, &ix1, &iy1);
-            // We need space for the completion of the glyph plus the SDF padding on all sides
-            rects[i].w = (stbrp_coord)((ix1 - ix0) + SDF_PADDING * 2 + 2); // +2 for generous rounding safety
-            rects[i].h = (stbrp_coord)((iy1 - iy0) + SDF_PADDING * 2 + 2);
-        }
-    }
-
-    // 2. Pack the rects
-    stbtt_PackFontRangesPackRects(&spc, rects, NUM_CHARS);
-
-    // 3. Generate SDFs and populate pdata
-    for (int i = 0; i < NUM_CHARS; ++i) {
-        if (!rects[i].was_packed) {
-            // Fill pdata with zero if failed to pack
-            std::memset(&pdata[i], 0, sizeof(stbtt_packedchar));
-            continue;
-        }
-        
-        int glyph_index = glyph_indices[i];
-        if (glyph_index == 0) continue;
-
-        // Generate SDF
-        int w, h, xoff, yoff;
-        unsigned char* sdf_bitmap = stbtt_GetGlyphSDF(&font_info, scale, glyph_index, SDF_PADDING, 
-                                                      ON_EDGE_VALUE, PIXEL_DIST_SCALE, 
-                                                      &w, &h, &xoff, &yoff);
-        
-        if (sdf_bitmap) {
-            int atlas_x = rects[i].x; // Use the allocated position
-            int atlas_y = rects[i].y;
-            
-            // Write to atlas
-            // Determine dimensions to copy (clamp to rect size and atlas size)
-            int copy_w = std::min(w, (int)rects[i].w);
-            int copy_h = std::min(h, (int)rects[i].h);
-
-            for (int r = 0; r < copy_h; ++r) {
-                 int target_y = atlas_y + r;
-                 if (target_y >= ATLAS_HEIGHT) break;
-                 
-                 for (int c = 0; c < copy_w; ++c) {
-                     int target_x = atlas_x + c;
-                     if (target_x >= ATLAS_WIDTH) break;
-                     
-                     sdf_atlas_data[target_y * ATLAS_WIDTH + target_x] = sdf_bitmap[r * w + c];
-                 }
-            }
-            
-            stbtt_FreeSDF(sdf_bitmap, nullptr);
-
-            // Fill pdata for rendering
-            pdata[i].x0 = (unsigned short)atlas_x;
-            pdata[i].y0 = (unsigned short)atlas_y;
-            pdata[i].x1 = (unsigned short)(atlas_x + copy_w);
-            pdata[i].y1 = (unsigned short)(atlas_y + copy_h);
-            
-            // Offsets from SDF are relative to baseline
-            pdata[i].xoff = (float)xoff;
-            pdata[i].yoff = (float)yoff;
-            // IMPORTANT: We must also set the bottom-right relative coordinates!
-            pdata[i].xoff2 = (float)(xoff + copy_w);
-            pdata[i].yoff2 = (float)(yoff + copy_h);
-            
-            // Advance
-            int advance, lsb;
-            stbtt_GetCodepointHMetrics(&font_info, 32 + i, &advance, &lsb);
-            pdata[i].xadvance = advance * scale;
-        }
+        rects[i].w = (stbrp_coord)((x1 - x0) + 2 * padding);
+        rects[i].h = (stbrp_coord)((y1 - y0) + 2 * padding);
     }
     
+    stbtt_PackFontRangesPackRects(&spc, rects.data(), num_chars);
     stbtt_PackEnd(&spc);
+
+    // Now generated the SDFs into the allocated rects
+    // We need to manually fill the texture now using the rect info
+    // And populate pdata manually.
+    
+    for (int i = 0; i < num_chars; ++i) {
+        if (rects[i].was_packed) {
+            int codepoint = i + 32;
+            
+            // Generate SDF
+            int w_sdf, h_sdf, xoff_sdf, yoff_sdf;
+            unsigned char* sdf_bitmap = stbtt_GetGlyphSDF(&font_info, scale, stbtt_FindGlyphIndex(&font_info, codepoint), padding, onedge_value, pixel_dist_scale, &w_sdf, &h_sdf, &xoff_sdf, &yoff_sdf);
+            
+            if (sdf_bitmap) {
+                 // Copy to atlas
+                 int target_x = rects[i].x;
+                 int target_y = rects[i].y;
+                 
+                 for (int r = 0; r < h_sdf && (target_y + r) < NEW_ATLAS_HEIGHT; ++r) {
+                     for (int c = 0; c < w_sdf && (target_x + c) < NEW_ATLAS_WIDTH; ++c) {
+                         atlas_pixels[(target_y + r) * NEW_ATLAS_WIDTH + (target_x + c)] = sdf_bitmap[r * w_sdf + c];
+                     }
+                 }
+            
+                 stbtt_FreeSDF(sdf_bitmap, nullptr);
+                 
+                 // Fill pdata for rendering
+                 // pdata[i] is stbtt_packedchar
+                 // We need to adjust coordinates to be purely regarding the quad.
+                 // The SDF bitmap includes padding. The 'xoff' and 'yoff' returned by GetGlyphSDF are the offset from the pen position to the top-left of the bitmap.
+                 
+                 stbtt_packedchar& pc = pdata[i];
+                 pc.x0 = (unsigned short)rects[i].x;
+                 pc.y0 = (unsigned short)rects[i].y;
+                 pc.x1 = (unsigned short)(rects[i].x + w_sdf);
+                 pc.y1 = (unsigned short)(rects[i].y + h_sdf);
+                 
+                 pc.xoff = (float)xoff_sdf;
+                 pc.yoff = (float)yoff_sdf;
+                 pc.xoff2 = (float)(xoff_sdf + w_sdf);
+                 pc.yoff2 = (float)(yoff_sdf + h_sdf);
+                 
+                 int advance, lsb;
+                 stbtt_GetCodepointHMetrics(&font_info, codepoint, &advance, &lsb);
+                 pc.xadvance = advance * scale;
+            }
+        } else {
+            // If a character wasn't packed, clear its pdata entry
+            std::memset(&pdata[i], 0, sizeof(stbtt_packedchar));
+        }
+    }
     
     // (Optional) Save the atlas to disk to see what it looks like
-    // stbi_write_png("sdf_atlas.png", ATLAS_WIDTH, ATLAS_HEIGHT, 1, sdf_atlas_data, 0);
+    // stbi_write_png("sdf_atlas.png", NEW_ATLAS_WIDTH, NEW_ATLAS_HEIGHT, 1, atlas_pixels.data(), 0);
 
     if (font_atlas_tex != 0) glDeleteTextures(1, &font_atlas_tex);
     glGenTextures(1, &font_atlas_tex);
     glBindTexture(GL_TEXTURE_2D, font_atlas_tex);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RED, ATLAS_WIDTH, ATLAS_HEIGHT, 0, GL_RED, GL_UNSIGNED_BYTE, sdf_atlas_data);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RED, NEW_ATLAS_WIDTH, NEW_ATLAS_HEIGHT, 0, GL_RED, GL_UNSIGNED_BYTE, atlas_pixels.data());
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     // Needed for SDF to work well at edges
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
-    delete[] sdf_atlas_data;
+    // delete[] sdf_atlas_data; // No longer used/allocated
     needs_rebake = false;
     std::cout << "Re-baked SDF font: " << font_path << " at size " << font_size << std::endl;
 }
@@ -1532,11 +1520,13 @@ void TextEffectNode::Process(const std::vector<GLuint>& image_inputs, const std:
     std::vector<float> vertices;
     
     // 1. Calculate Total Width for Alignment
+    float render_scale = font_size / baked_font_size;
     float total_width = 0.0f;
     for (const char* text_ptr = text_content.c_str(); *text_ptr; text_ptr++) {
         if (*text_ptr >= 32 && *text_ptr < 128) {
-            // xadvance is pre-scaled by RebakeFont
-            total_width += pdata[*text_ptr - 32].xadvance;
+            // xadvance is pre-scaled by RebakeFont (to baked_font_size)
+            // We must scale it to render_font_size
+            total_width += pdata[*text_ptr - 32].xadvance * render_scale;
             // Add custom letter spacing (if not at the very end, though standard is to just add it)
             if (*(text_ptr + 1)) total_width += letter_spacing;
         }
@@ -1553,13 +1543,39 @@ void TextEffectNode::Process(const std::vector<GLuint>& image_inputs, const std:
     }
 
     // 3. Draw Loop
+    // render_scale is already calculated above
+    float start_x = x; // Keep track of line start if we add multiline later.
+
     for (const char* text_ptr = text_content.c_str(); *text_ptr; text_ptr++) {
         if (*text_ptr >= 32 && *text_ptr < 128) {
             stbtt_aligned_quad q;
-            // stbtt_GetPackedQuad advances 'x' by xadvance automatically
-            stbtt_GetPackedQuad(pdata, 2048, 2048, *text_ptr - 32, &x, &y, &q, 0);
+            // GetPackedQuad uses the BAKED size coordinates.
+            float dummy_x = 0; float dummy_y = 0;
+            stbtt_GetPackedQuad(pdata, 2048, 2048, *text_ptr - 32, &dummy_x, &dummy_y, &q, 0);
             
-            // Apply Manual Letter Spacing
+            // We need to scale the LOCAL quad coordinates and add them to global position
+            // q.x0, y0, etc are relative to (0,0) of the 'pen' because we passed dummy_x=0.
+            
+            float q_width = (q.x1 - q.x0) * render_scale;
+            float q_height = (q.y1 - q.y0) * render_scale;
+            
+            float q_x0_scaled = (q.x0) * render_scale;
+            float q_y0_scaled = (q.y0) * render_scale;
+            
+            // Final positions
+            // x is the current pen position.
+            // q.x0 is the offset from the pen.
+            float cur_x0 = x + q_x0_scaled;
+            float cur_y0 = y + q_y0_scaled;
+            float cur_x1 = cur_x0 + q_width;
+            float cur_y1 = cur_y0 + q_height;
+            
+            // Advance x manually because we detached it from GetPackedQuad for scaling
+            // pdata.xadvance is also baked size, so scale it.
+            float advance = pdata[*text_ptr - 32].xadvance * render_scale;
+            x += advance;
+            
+            // Apply Manual Letter Spacing (already scaled? No, letter_spacing is pixels)
             x += letter_spacing;
 
             // For now, we ignore rotation for simplicity with VBOs
@@ -1567,13 +1583,14 @@ void TextEffectNode::Process(const std::vector<GLuint>& image_inputs, const std:
 
             float quad_verts[] = {
                 // pos.x, pos.y, tex.u, tex.v
-                q.x0, q.y0, q.s0, q.t0,
-                q.x1, q.y0, q.s1, q.t0,
-                q.x1, q.y1, q.s1, q.t1,
+                // Standard quad triangle strip order usually, but here we use triangles
+                cur_x0, cur_y0, q.s0, q.t0,
+                cur_x1, cur_y0, q.s1, q.t0,
+                cur_x1, cur_y1, q.s1, q.t1,
 
-                q.x0, q.y0, q.s0, q.t0,
-                q.x1, q.y1, q.s1, q.t1,
-                q.x0, q.y1, q.s0, q.t1
+                cur_x0, cur_y0, q.s0, q.t0,
+                cur_x1, cur_y1, q.s1, q.t1,
+                cur_x0, cur_y1, q.s0, q.t1
             };
             
             // Upload quad data to VBO and draw
