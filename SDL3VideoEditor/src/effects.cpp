@@ -1323,19 +1323,115 @@ void TextEffectNode::RebakeFont() {
     const int NUM_CHARS = 96;
 
     // SDF Parameters
-    const int PADDING = 5;
+    const int SDF_PADDING = 8; // Enough for a nice outline
     const unsigned char ON_EDGE_VALUE = 128;
-    const float PIXEL_DIST_SCALE = 32.0f; // A lower value can sometimes be better
+    // How many value units (0-255) correspond to 1 pixel distance?
+    // We want the falloff (0 to 128) to cover SDF_PADDING pixels.
+    // So 128 / 8 = 16.0f.
+    const float PIXEL_DIST_SCALE = (float)ON_EDGE_VALUE / (float)SDF_PADDING; 
 
     unsigned char* sdf_atlas_data = new unsigned char[ATLAS_WIDTH * ATLAS_HEIGHT];
+    // Clear to transparent (or 0 distance)
+    std::memset(sdf_atlas_data, 0, ATLAS_WIDTH * ATLAS_HEIGHT);
     
+    stbtt_fontinfo font_info;
+    if (!stbtt_InitFont(&font_info, (const unsigned char*)font_buffer.data(), 0)) {
+        delete[] sdf_atlas_data;
+        return;
+    }
+
+    float scale = stbtt_ScaleForPixelHeight(&font_info, font_size);
+
     stbtt_pack_context spc;
+    // Just 1 pixel padding between packed glyphs for safety
     stbtt_PackBegin(&spc, sdf_atlas_data, ATLAS_WIDTH, ATLAS_HEIGHT, 0, 1, nullptr);
     
-    // This is the correct 10-argument version of the function that generates SDFs
-    // and is exposed by stb_truetype when correctly configured.
-    stbtt_PackFontRange(&spc, (const unsigned char*)font_buffer.data(), 0,
-        font_size, 32, NUM_CHARS, pdata);
+    stbtt_PackSetOversampling(&spc, 1, 1);
+    
+    // 1. Manually prepare rects with padding for SDF
+    stbrp_rect rects[NUM_CHARS];
+    int glyph_indices[NUM_CHARS];
+
+    for (int i = 0; i < NUM_CHARS; ++i) {
+        int codepoint = 32 + i;
+        int glyph_index = stbtt_FindGlyphIndex(&font_info, codepoint);
+        glyph_indices[i] = glyph_index;
+        
+        rects[i].id = i;
+        rects[i].w = 0;
+        rects[i].h = 0;
+
+        if (glyph_index != 0) {
+            int ix0, iy0, ix1, iy1;
+            stbtt_GetGlyphBitmapBox(&font_info, glyph_index, scale, scale, &ix0, &iy0, &ix1, &iy1);
+            // We need space for the completion of the glyph plus the SDF padding on all sides
+            rects[i].w = (stbrp_coord)((ix1 - ix0) + SDF_PADDING * 2 + 2); // +2 for generous rounding safety
+            rects[i].h = (stbrp_coord)((iy1 - iy0) + SDF_PADDING * 2 + 2);
+        }
+    }
+
+    // 2. Pack the rects
+    stbtt_PackFontRangesPackRects(&spc, rects, NUM_CHARS);
+
+    // 3. Generate SDFs and populate pdata
+    for (int i = 0; i < NUM_CHARS; ++i) {
+        if (!rects[i].was_packed) {
+            // Fill pdata with zero if failed to pack
+            std::memset(&pdata[i], 0, sizeof(stbtt_packedchar));
+            continue;
+        }
+        
+        int glyph_index = glyph_indices[i];
+        if (glyph_index == 0) continue;
+
+        // Generate SDF
+        int w, h, xoff, yoff;
+        unsigned char* sdf_bitmap = stbtt_GetGlyphSDF(&font_info, scale, glyph_index, SDF_PADDING, 
+                                                      ON_EDGE_VALUE, PIXEL_DIST_SCALE, 
+                                                      &w, &h, &xoff, &yoff);
+        
+        if (sdf_bitmap) {
+            int atlas_x = rects[i].x; // Use the allocated position
+            int atlas_y = rects[i].y;
+            
+            // Write to atlas
+            // Determine dimensions to copy (clamp to rect size and atlas size)
+            int copy_w = std::min(w, (int)rects[i].w);
+            int copy_h = std::min(h, (int)rects[i].h);
+
+            for (int r = 0; r < copy_h; ++r) {
+                 int target_y = atlas_y + r;
+                 if (target_y >= ATLAS_HEIGHT) break;
+                 
+                 for (int c = 0; c < copy_w; ++c) {
+                     int target_x = atlas_x + c;
+                     if (target_x >= ATLAS_WIDTH) break;
+                     
+                     sdf_atlas_data[target_y * ATLAS_WIDTH + target_x] = sdf_bitmap[r * w + c];
+                 }
+            }
+            
+            stbtt_FreeSDF(sdf_bitmap, nullptr);
+
+            // Fill pdata for rendering
+            pdata[i].x0 = (unsigned short)atlas_x;
+            pdata[i].y0 = (unsigned short)atlas_y;
+            pdata[i].x1 = (unsigned short)(atlas_x + copy_w);
+            pdata[i].y1 = (unsigned short)(atlas_y + copy_h);
+            
+            // Offsets from SDF are relative to baseline
+            pdata[i].xoff = (float)xoff;
+            pdata[i].yoff = (float)yoff;
+            // IMPORTANT: We must also set the bottom-right relative coordinates!
+            pdata[i].xoff2 = (float)(xoff + copy_w);
+            pdata[i].yoff2 = (float)(yoff + copy_h);
+            
+            // Advance
+            int advance, lsb;
+            stbtt_GetCodepointHMetrics(&font_info, 32 + i, &advance, &lsb);
+            pdata[i].xadvance = advance * scale;
+        }
+    }
     
     stbtt_PackEnd(&spc);
     
@@ -1348,6 +1444,9 @@ void TextEffectNode::RebakeFont() {
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RED, ATLAS_WIDTH, ATLAS_HEIGHT, 0, GL_RED, GL_UNSIGNED_BYTE, sdf_atlas_data);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    // Needed for SDF to work well at edges
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
     delete[] sdf_atlas_data;
     needs_rebake = false;
