@@ -4554,122 +4554,229 @@ void DrawNodeInspectorWindow(Clip* clip, GLResources& gl_resources) {
             text_node->alignment = static_cast<TextEffectNode::Alignment>(current_align);
         }
 
-        // --- NEW: Font Dropdown with Friendly Names ---
+        // --- NEW: Font Dropdown with Previews (Lazy Loaded) ---
         struct FontMetadata {
             std::string path;
             std::string name;
-            // std::string family; // Optional for sorting
         };
         static std::vector<FontMetadata> system_fonts;
         static bool fonts_scanned = false;
         
+        // Cache for previews: Path -> TextureID
+        static std::map<std::string, GLuint> font_preview_cache;
+
         if (ImGui::TreeNode("Font Selection")) {
+            // 1. Scan fonts if needed
             if (!fonts_scanned) {
                 // Determine system font directory (Windows)
                 // We could use SHGetFolderPath but hardcoded is okay for now given constraints.
                 std::string font_dir = "C:\\Windows\\Fonts";
-                if (std::filesystem::exists(font_dir)) {
-                    for (const auto& entry : std::filesystem::directory_iterator(font_dir)) {
-                        if (entry.is_regular_file()) {
-                            std::string ext = entry.path().extension().string();
-                            // Convert to lowercase for check
-                            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-                            if (ext == ".ttf" || ext == ".otf") {
-                                std::string file_path = entry.path().string();
-                                std::string friendly_name = entry.path().filename().string(); // Default fallback
-                                
-                                // Try to extract real name using stb_truetype
-                                std::ifstream f(file_path, std::ios::binary | std::ios::ate);
-                                if (f.is_open()) { // Only process if we can open it
-                                    std::streamsize size = f.tellg();
-                                    // Optimization: Reading the whole file is slow for all fonts.
-                                    // The name table is usually near the beginning. 
-                                    // But stbtt_GetFontNameString needs the 'info' struct which generally just needs the start of the file.
-                                    // Let's read a reasonable chunk, e.g., 256KB? Or just read it all for simplicity/correctness now.
-                                    // Reading all 500+ fonts might be slow.
-                                    // Actually, stbtt functions take the buffer pointer.
-                                    // Let's try reading header only? No, offsets can be anywhere.
-                                    // We will read the full file but only ONCE.
+                try {
+                    if (std::filesystem::exists(font_dir)) {
+                        for (const auto& entry : std::filesystem::directory_iterator(font_dir)) {
+                            if (entry.is_regular_file()) {
+                                std::string ext = entry.path().extension().string();
+                                std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+                                if (ext == ".ttf" || ext == ".otf") {
+                                    std::string file_path = entry.path().string();
+                                    std::string friendly_name = entry.path().filename().string(); 
                                     
-                                    // Limit scan to first 200 fonts or similar if too slow? No, user wants choice.
-                                    // Let's do lazy loading? No, dropdown needs list.
-                                    
-                                    // COMPROMISE: We will assume standard Windows fonts are reasonable size.
-                                    // And we won't crash if memory fails.
-                                    
-                                    f.seekg(0, std::ios::beg);
-                                    std::vector<unsigned char> data(size);
-                                    if (f.read((char*)data.data(), size)) {
-                                        stbtt_fontinfo info;
-                                        // Standard fonts usually at offset 0
-                                        if (stbtt_InitFont(&info, data.data(), 0)) {
-                                            int length = 0;
-                                            const char* name_ptr = nullptr;
-                                            
-                                            // 1. Try Mac Roman (Platform 1, Encoding 0) - Usually straight ASCII
-                                            name_ptr = stbtt_GetFontNameString(&info, &length, 1, 0, 0, 4);
-                                            
-                                            if (name_ptr && length > 0) {
-                                                friendly_name = std::string(name_ptr, length);
-                                            } else {
-                                                // 2. Try Microsoft Unicode (Platform 3, Encoding 1) - UTF-16BE
-                                                name_ptr = stbtt_GetFontNameString(&info, &length, 3, 1, 0x409, 4); // Full Name
-                                                if (!name_ptr) {
-                                                     // Fallback to Family Name
-                                                     name_ptr = stbtt_GetFontNameString(&info, &length, 3, 1, 0x409, 1);
-                                                }
-
-                                                if (name_ptr && length > 0) {
-                                                    // Convert UTF-16BE to ASCII (basic)
-                                                    std::string ascii_name;
-                                                    for (int i = 0; i < length; i += 2) {
-                                                        // High byte at [i], Low byte at [i+1]
-                                                        if (name_ptr[i] == 0) { // Basic Latin plane
-                                                            char c = name_ptr[i+1];
-                                                            if (c >= 32 && c <= 126) { // Printable ASCII
-                                                                ascii_name += c;
+                                    // Get friendly name (re-using previous logic essentially)
+                                    // Use explicit error handling
+                                    std::ifstream f(file_path, std::ios::binary | std::ios::ate);
+                                    if (f.is_open()) {
+                                        std::streamsize size = f.tellg();
+                                        if (size > 100) { // Safety check: file must be reasonably large for a font
+                                            f.seekg(0, std::ios::beg);
+                                            std::vector<unsigned char> data(size);
+                                            if (f.read((char*)data.data(), size)) {
+                                                // VALIDATE MAGIC NUMBER to prevent crashes on collections or junk
+                                                uint32_t magic = ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) | ((uint32_t)data[2] << 8) | (uint32_t)data[3];
+                                                bool valid_header = (magic == 0x00010000) || (magic == 0x4F54544F) || (magic == 0x74727565); // 1.0, OTTO, true
+                                                
+                                                if (valid_header) {
+                                                    stbtt_fontinfo info;
+                                                    if (stbtt_InitFont(&info, data.data(), 0)) {
+                                                        int length = 0;
+                                                        const char* name_ptr = stbtt_GetFontNameString(&info, &length, 1, 0, 0, 4); // Mac ID
+                                                        if (name_ptr && length > 0) friendly_name = std::string(name_ptr, length);
+                                                        else {
+                                                            name_ptr = stbtt_GetFontNameString(&info, &length, 3, 1, 0x409, 4); // Win ID
+                                                            if (!name_ptr) name_ptr = stbtt_GetFontNameString(&info, &length, 3, 1, 0x409, 1);
+                                                            if (name_ptr && length > 0) {
+                                                                std::string ascii_name;
+                                                                for (int i = 0; i < length; i += 2) if (name_ptr[i] == 0 && name_ptr[i+1] >= 32 && name_ptr[i+1] <= 126) ascii_name += name_ptr[i+1];
+                                                                if (!ascii_name.empty()) friendly_name = ascii_name;
                                                             }
                                                         }
-                                                    }
-                                                    if (!ascii_name.empty()) {
-                                                        friendly_name = ascii_name;
                                                     }
                                                 }
                                             }
                                         }
                                     }
+                                    system_fonts.push_back({file_path, friendly_name});
                                 }
-                                
-                                system_fonts.push_back({file_path, friendly_name});
                             }
                         }
+                        
+                        std::sort(system_fonts.begin(), system_fonts.end(), [](const FontMetadata& a, const FontMetadata& b) { return a.name < b.name; });
                     }
-                    
-                    // Sort alphabetically by name
-                    std::sort(system_fonts.begin(), system_fonts.end(), [](const FontMetadata& a, const FontMetadata& b) {
-                        return a.name < b.name;
-                    });
-                    
-                    fonts_scanned = true;
+                } catch (...) {
+                    // Ignore errors during enumeration (e.g. permission denied)
                 }
+                fonts_scanned = true;
             }
 
-            if (ImGui::BeginCombo("System Fonts", "Select a font...")) {
-                for (size_t i = 0; i < system_fonts.size(); i++) {
-                    bool is_selected = (text_node->font_path == system_fonts[i].path);
-                    
-                    // Create unique label for ImGui to prevent ID collisions
-                    std::string label = system_fonts[i].name + "##" + std::to_string(i);
-                    
-                    if (ImGui::Selectable(label.c_str(), is_selected)) {
-                         text_node->font_path = system_fonts[i].path;
-                         text_node->needs_rebake = true;
-                    }
-                    if (is_selected) ImGui::SetItemDefaultFocus();
-                    
-                    // Simple tooltip on hover showing the path (since we don't have visual preview for all)
-                    if (ImGui::IsItemHovered()) {
-                        ImGui::SetTooltip("%s", system_fonts[i].path.c_str());
+            // 2. Display Combo with Clipper
+            // We use a custom PreviewValue for the combo box itself
+            std::string preview_text = "Select a font...";
+            for(const auto& f : system_fonts) if(f.path == text_node->font_path) preview_text = f.name;
+
+            if (ImGui::BeginCombo("System Fonts", preview_text.c_str())) {
+                
+                ImGuiListClipper clipper;
+                clipper.Begin(system_fonts.size());
+                
+                while (clipper.Step()) {
+                    for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; i++) {
+                        const auto& font_md = system_fonts[i];
+                        bool is_selected = (text_node->font_path == font_md.path);
+                        
+                        // Lazy Load Preview Texture
+                        GLuint tex_id = 0;
+                        if (font_preview_cache.find(font_md.path) == font_preview_cache.end()) {
+                            // Generate texture (Fail-safe)
+                             font_preview_cache[font_md.path] = 0; // Mark as visited/failed by default. Only update if success.
+                             try {
+                                 std::ifstream f(font_md.path, std::ios::binary | std::ios::ate);
+                                 if (f.is_open()) {
+                                     std::streamsize size = f.tellg();
+                                     if (size > 100) { // Safety check
+                                         f.seekg(0, std::ios::beg);
+                                         std::vector<unsigned char> data(size);
+                                         if (f.read((char*)data.data(), size)) {
+                                             // VALIDATE MAGIC NUMBER to prevent crashes on collections or junk
+                                             uint32_t magic = ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) | ((uint32_t)data[2] << 8) | (uint32_t)data[3];
+                                             bool valid_header = (magic == 0x00010000) || (magic == 0x4F54544F) || (magic == 0x74727565); // 1.0, OTTO, true
+                                             
+                                             if (valid_header) {
+                                                 stbtt_fontinfo info;
+                                                 if (stbtt_InitFont(&info, data.data(), 0)) {
+                                                     float height = 24.0f; // Preview height
+                                                     float scale = stbtt_ScaleForPixelHeight(&info, height);
+                                                 
+                                                    int ascent, descent, lineGap;
+                                                    stbtt_GetFontVMetrics(&info, &ascent, &descent, &lineGap);
+                                                    int baseline = (int)(ascent * scale);
+                                                    
+                                                    // Sanitize text to ASCII only to avoid signed char/UTF-8 issues causing crashes in stbtt
+                                                    std::string raw_name = font_md.name;
+                                                    std::string text = "";
+                                                    for (unsigned char c : raw_name) {
+                                                        if (c >= 32 && c <= 126) text += (char)c;
+                                                    }
+                                                    if (text.empty()) text = "Abc"; // Fallback if name is all weird symbols
+
+                                                    int width = 0;
+                                                    for(char c : text) {
+                                                        int adv, lsb;
+                                                        stbtt_GetCodepointHMetrics(&info, c, &adv, &lsb);
+                                                        // Sanity clamp to prevent massive widths from bad fonts
+                                                        float scaled_adv = adv * scale;
+                                                        if (scaled_adv < 0 || scaled_adv > 200) scaled_adv = 20; 
+                                                        width += (int)(scaled_adv);
+                                                    }
+                                                
+                                                    // Create bitmap
+                                                    if (width > 0 && width < 2048) { // Capped at 2048 for safety
+                                                        std::vector<unsigned char> bitmap(width * (int)height, 0);
+                                                        int x = 0;
+                                                        for(char c : text) {
+                                                            int ax, lsb;
+                                                            stbtt_GetCodepointHMetrics(&info, c, &ax, &lsb);
+                                                            int c_w, c_h, c_xoff, c_yoff;
+                                                            unsigned char* c_bitmap = stbtt_GetCodepointBitmap(&info, scale, scale, c, &c_w, &c_h, &c_xoff, &c_yoff);
+                                                            
+                                                            if (c_bitmap) {
+                                                                for (int iy = 0; iy < c_h; ++iy) {
+                                                                    for (int ix = 0; ix < c_w; ++ix) {
+                                                                        int target_x = x + c_xoff + ix;
+                                                                        int target_y = baseline + c_yoff + iy;
+                                                                        if (target_x >= 0 && target_x < width && target_y >= 0 && target_y < height) {
+                                                                            bitmap[target_y * width + target_x] = c_bitmap[iy * c_w + ix];
+                                                                        }
+                                                                    }
+                                                                }
+                                                                stbtt_FreeBitmap(c_bitmap, nullptr);
+                                                            }
+                                                            // Clamp advance here too to match width calculation!
+                                                            float scaled_adv = ax * scale;
+                                                            if (scaled_adv < 0 || scaled_adv > 200) scaled_adv = 20;
+                                                            x += (int)(scaled_adv);
+                                                        }
+                                                        
+                                                        // Convert 8-bit alpha to 32-bit RGBA (White text)
+                                                        std::vector<unsigned char> rgba(width * (int)height * 4, 0);
+                                                        for(int px=0; px < width * (int)height; ++px) {
+                                                            unsigned char alpha = bitmap[px];
+                                                            rgba[px*4 + 0] = 255;
+                                                            rgba[px*4 + 1] = 255;
+                                                            rgba[px*4 + 2] = 255;
+                                                            rgba[px*4 + 3] = alpha;
+                                                        }
+                                                        
+                                                        glGenTextures(1, &tex_id);
+                                                        glBindTexture(GL_TEXTURE_2D, tex_id);
+                                                        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, (int)height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+                                                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                                                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+                                                        // Store success
+                                                        font_preview_cache[font_md.path] = tex_id;
+                                                    }
+                                                }
+                                             }
+                                         }
+                                     }
+                                 }
+                                 // If invalid header or failed read, we leave cache as 0 (failed)
+                             } catch (...) {
+                                 // Catch all errors (including some SEH if compiler configured) and keep tex_id as 0
+                             } 
+                        } else {
+                            tex_id = font_preview_cache[font_md.path];
+                        }
+                        
+                        // Render Item using Selectable for functionality + Image/Text for display
+                        ImGui::PushID(i);
+                        // Get cursor pos for overlay
+                        ImVec2 p = ImGui::GetCursorScreenPos();
+                        
+                        if (ImGui::Selectable("##item", is_selected, 0, ImVec2(0, 30))) { 
+                            text_node->font_path = font_md.path;
+                            text_node->needs_rebake = true;
+                        }
+                        
+                        if (tex_id != 0) {
+                            int w = 0;
+                            glBindTexture(GL_TEXTURE_2D, tex_id);
+                            glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
+                            
+                            // Draw image overlay manually to avoid layout issues
+                            // p is top-left of the selectable item. 
+                            // Add slightly offset padding (e.g. 5px x, 3px y)
+                            ImGui::GetWindowDrawList()->AddImage((ImTextureID)(intptr_t)tex_id, 
+                                ImVec2(p.x + 5, p.y + 3), 
+                                ImVec2(p.x + 5 + (float)w, p.y + 3 + 24.0f));
+                        } else {
+                            // Draw text overlay if no preview
+                             ImGui::GetWindowDrawList()->AddText(ImVec2(p.x + 5, p.y + 5), ImGui::GetColorU32(ImGuiCol_Text), font_md.name.c_str());
+                        }
+
+                        if (is_selected) ImGui::SetItemDefaultFocus();
+                        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", font_md.path.c_str());
+                        
+                        ImGui::PopID();
                     }
                 }
                 ImGui::EndCombo();

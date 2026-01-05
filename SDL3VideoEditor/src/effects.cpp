@@ -1324,6 +1324,8 @@ void TextEffectNode::RebakeFont() {
     unsigned char* sdf_atlas_data = new unsigned char[ATLAS_WIDTH * ATLAS_HEIGHT];
     // Clear to transparent (or 0 distance)
     std::memset(sdf_atlas_data, 0, ATLAS_WIDTH * ATLAS_HEIGHT);
+    // Clear metrics array to prevent garbage values for invisible chars (like Space)
+    std::memset(pdata, 0, sizeof(pdata));
     
     stbtt_fontinfo font_info;
     if (!stbtt_InitFont(&font_info, (const unsigned char*)font_buffer.data(), 0)) {
@@ -1379,7 +1381,13 @@ void TextEffectNode::RebakeFont() {
     for (int i = 0; i < num_chars; ++i) {
         if (rects[i].was_packed) {
             int codepoint = i + 32;
+            stbtt_packedchar& pc = pdata[i];
             
+            // ALWAYS get metrics, even if no bitmap (SPACE char!)
+            int advance, lsb;
+            stbtt_GetCodepointHMetrics(&font_info, codepoint, &advance, &lsb);
+            pc.xadvance = advance * scale;
+
             // Generate SDF
             int w_sdf, h_sdf, xoff_sdf, yoff_sdf;
             unsigned char* sdf_bitmap = stbtt_GetGlyphSDF(&font_info, scale, stbtt_FindGlyphIndex(&font_info, codepoint), padding, onedge_value, pixel_dist_scale, &w_sdf, &h_sdf, &xoff_sdf, &yoff_sdf);
@@ -1397,12 +1405,7 @@ void TextEffectNode::RebakeFont() {
             
                  stbtt_FreeSDF(sdf_bitmap, nullptr);
                  
-                 // Fill pdata for rendering
-                 // pdata[i] is stbtt_packedchar
-                 // We need to adjust coordinates to be purely regarding the quad.
-                 // The SDF bitmap includes padding. The 'xoff' and 'yoff' returned by GetGlyphSDF are the offset from the pen position to the top-left of the bitmap.
-                 
-                 stbtt_packedchar& pc = pdata[i];
+                 // Fill pdata for visual quad
                  pc.x0 = (unsigned short)rects[i].x;
                  pc.y0 = (unsigned short)rects[i].y;
                  pc.x1 = (unsigned short)(rects[i].x + w_sdf);
@@ -1412,13 +1415,9 @@ void TextEffectNode::RebakeFont() {
                  pc.yoff = (float)yoff_sdf;
                  pc.xoff2 = (float)(xoff_sdf + w_sdf);
                  pc.yoff2 = (float)(yoff_sdf + h_sdf);
-                 
-                 int advance, lsb;
-                 stbtt_GetCodepointHMetrics(&font_info, codepoint, &advance, &lsb);
-                 pc.xadvance = advance * scale;
             }
         } else {
-            // If a character wasn't packed, clear its pdata entry
+            // Not packed
             std::memset(&pdata[i], 0, sizeof(stbtt_packedchar));
         }
     }
