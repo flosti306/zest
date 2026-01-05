@@ -53,6 +53,7 @@ extern "C" {
 #include "shared.hpp"
 #include "project_io.hpp"
 #include "effects.hpp"
+#include "keybinds.hpp"
 
 // Global gradient data storage (used by ApplyWindowBackgroundGradients)
 struct GradientData {
@@ -424,7 +425,7 @@ bool LoadTextureFromFile(const char* filename, GLuint* out_texture_id, int* out_
 }
 
 // --- Docking Setup ---
-void RenderDockSpace() {
+void RenderDockSpace(bool* show_keybinds) {
     static ImGuiDockNodeFlags dockspace_flags = ImGuiDockNodeFlags_PassthruCentralNode; // Allow background rendering
 
     ImGuiWindowFlags window_flags = ImGuiWindowFlags_MenuBar | ImGuiWindowFlags_NoDocking;
@@ -465,6 +466,9 @@ void RenderDockSpace() {
         if (ImGui::BeginMenu("Edit")) {
              ImGui::MenuItem("Undo", "CTRL+Z", nullptr, false);
              ImGui::MenuItem("Redo", "CTRL+Y", nullptr, false);
+             if (ImGui::MenuItem("Key Bindings...")) {
+                 *show_keybinds = true;
+             }
              ImGui::EndMenu();
         }
         ImGui::EndMenuBar();
@@ -1394,6 +1398,19 @@ int main(int argc, char* argv[]) {
         std::cout << "Audio playback initialized successfully." << std::endl;
     }
 
+    // --- Keybinds Initialization ---
+    KeybindManager keybind_manager;
+    keybind_manager.Register("Play/Pause", SDLK_SPACE, SDL_KMOD_NONE, "Toggle Playback");
+    keybind_manager.Register("Frame Step Left", SDLK_LEFT, SDL_KMOD_NONE, "Step One Frame Back");
+    keybind_manager.Register("Frame Step Right", SDLK_RIGHT, SDL_KMOD_NONE, "Step One Frame Forward");
+    keybind_manager.Register("Blade Tool", SDLK_B, SDL_KMOD_CTRL, "Split Clip at Playhead");
+    keybind_manager.Register("Delete Selected", SDLK_DELETE, SDL_KMOD_NONE, "Delete Selected Clip");
+    keybind_manager.Register("Undo", SDLK_Z, SDL_KMOD_CTRL, "Undo Last Action");
+    keybind_manager.Register("Redo", SDLK_Y, SDL_KMOD_CTRL, "Redo Last Action");
+    
+    keybind_manager.Load("keybinds.json");
+    bool show_keybind_settings = false;
+
     while (running) {
         Uint64 current_ticks = SDL_GetTicks();
         float delta_time = (current_ticks - last_frame_ticks) / 1000.0f;
@@ -1404,6 +1421,9 @@ int main(int argc, char* argv[]) {
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
             ImGui_ImplSDL3_ProcessEvent(&event);
+            
+            // Allow KeybindManager to intercept events for rebinding
+            if (keybind_manager.HandleRebindInput(event)) continue;
 
             if (event.type == SDL_EVENT_QUIT) running = false;
 
@@ -1411,10 +1431,10 @@ int main(int argc, char* argv[]) {
                  int w, h; SDL_GetWindowSizeInPixels(window, &w, &h); glViewport(0, 0, w, h);
             }
 
-            if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_SPACE && event.key.down) {
+            if (keybind_manager.IsTriggered(event, "Play/Pause")) {
                 playing = !playing.load();
                 std::cout << "Playback " << (playing ? "started" : "paused") << "\n";
-            } else if (event.type == SDL_EVENT_KEY_DOWN && (event.key.key == SDLK_LEFT || event.key.key == SDLK_RIGHT) && event.key.down) {
+            } else if (keybind_manager.IsTriggered(event, "Frame Step Left") || keybind_manager.IsTriggered(event, "Frame Step Right")) {
                 if (export_fps > 0) {
                     // 1. Calculate the duration of a single frame.
                     const float frame_duration = 1.0f / static_cast<float>(export_fps);
@@ -1426,7 +1446,7 @@ int main(int argc, char* argv[]) {
                     }
 
                     // 3. Adjust playhead time by one frame.
-                    if (event.key.key == SDLK_LEFT) {
+                    if (keybind_manager.IsTriggered(event, "Frame Step Left")) {
                         playhead_time -= frame_duration;
                     } else { // Right Arrow
                         playhead_time += frame_duration;
@@ -1437,7 +1457,7 @@ int main(int argc, char* argv[]) {
                 }
             }
             // Use event.key.key and SDLK_B (Fix 3 & 4)
-            else if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_B && (SDL_GetModState() & SDL_KMOD_CTRL) && selected_clip && event.key.down) {
+            else if (keybind_manager.IsTriggered(event, "Blade Tool") && selected_clip) {
                 // --- DEFINITIVE, POINTER-SAFE BLADE TOOL LOGIC ---
                 PushUndo(clips, playhead_time, zoom_factor);
 
@@ -1551,8 +1571,8 @@ int main(int argc, char* argv[]) {
             }
             // Use event.key.key and SDLK_DELETE (Fix 3 & 4)
             // Fix: Don't delete clips if we are interacting with the Node Editor or Smart Mask Editor
-            else if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_DELETE && 
-                     selected_clip && event.key.down && 
+            else if (keybind_manager.IsTriggered(event, "Delete Selected") && 
+                     selected_clip && 
                      !node_editor_active && 
                      !smart_mask_editor_open) {
                 PushUndo(clips, playhead_time, zoom_factor);
@@ -1567,16 +1587,14 @@ int main(int argc, char* argv[]) {
                         process_message = "Deleted clip.";
                         std::cout << "Deleted selected clip." << std::endl;
                 }
-            } else if (event.type == SDL_EVENT_KEY_DOWN && (SDL_GetModState() & SDL_KMOD_CTRL)) {
-                if (event.key.key == SDLK_Z) {
+            } else if (keybind_manager.IsTriggered(event, "Undo")) {
                     Undo(clips, playhead_time, zoom_factor, selected_clip);
                     layers_changed = true;
                     process_message = "Undo";
-                } else if (event.key.key == SDLK_Y) {
+            } else if (keybind_manager.IsTriggered(event, "Redo")) {
                     Redo(clips, playhead_time, zoom_factor, selected_clip);
                     layers_changed = true;
                     process_message = "Redo";
-                }
             }
 
             if (event.type == SDL_EVENT_DROP_FILE) {
@@ -1685,7 +1703,7 @@ int main(int argc, char* argv[]) {
         last_playhead_time_for_velocity = playhead_time;
 
         ImGui_ImplOpenGL3_NewFrame(); ImGui_ImplSDL3_NewFrame(); ImGui::NewFrame();
-        RenderDockSpace();
+        RenderDockSpace(&show_keybind_settings);
 
         ImGui::Begin("Controls");
         ApplyWindowBackgroundGradients();
@@ -1778,6 +1796,10 @@ int main(int argc, char* argv[]) {
 
         if (smart_mask_editor_open) {
             DrawSmartMaskEditorWindow(); // Call this similar to DrawMaskEditorWindow
+        }
+
+        if (show_keybind_settings) {
+            keybind_manager.DrawSettingsWindow(&show_keybind_settings);
         }
 
         ImGui::Begin("Inspector"); ApplyWindowBackgroundGradients();
