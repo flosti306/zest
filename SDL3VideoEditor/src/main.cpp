@@ -1239,22 +1239,24 @@ void PushUndo(const std::vector<Clip>& clips, float playhead_time, float zoom_fa
     while (!redo_stack.empty()) redo_stack.pop();
 }
 
-void Undo(std::vector<Clip>& clips, float& playhead_time, float& zoom_factor) {
+void Undo(std::vector<Clip>& clips, float& playhead_time, float& zoom_factor, Clip*& selected_clip) {
     if (undo_stack.empty()) return;
     // Push current state to redo stack
     redo_stack.push(SerializeProject(clips, playhead_time, zoom_factor));
     // Restore previous state
     std::string prev = undo_stack.top(); undo_stack.pop();
     DeserializeProject(prev, clips, playhead_time, zoom_factor);
+    selected_clip = nullptr;
 }
 
-void Redo(std::vector<Clip>& clips, float& playhead_time, float& zoom_factor) {
+void Redo(std::vector<Clip>& clips, float& playhead_time, float& zoom_factor, Clip*& selected_clip) {
     if (redo_stack.empty()) return;
     // Push current state to undo stack
     undo_stack.push(SerializeProject(clips, playhead_time, zoom_factor));
     // Restore next state
     std::string next = redo_stack.top(); redo_stack.pop();
     DeserializeProject(next, clips, playhead_time, zoom_factor);
+    selected_clip = nullptr;
 }
 
 // --- Forward Declarations ---
@@ -1567,11 +1569,11 @@ int main(int argc, char* argv[]) {
                 }
             } else if (event.type == SDL_EVENT_KEY_DOWN && (SDL_GetModState() & SDL_KMOD_CTRL)) {
                 if (event.key.key == SDLK_Z) {
-                    Undo(clips, playhead_time, zoom_factor);
+                    Undo(clips, playhead_time, zoom_factor, selected_clip);
                     layers_changed = true;
                     process_message = "Undo";
                 } else if (event.key.key == SDLK_Y) {
-                    Redo(clips, playhead_time, zoom_factor);
+                    Redo(clips, playhead_time, zoom_factor, selected_clip);
                     layers_changed = true;
                     process_message = "Redo";
                 }
@@ -2324,8 +2326,9 @@ void DrawTimelineEditor(
     static ImVec2 drag_start_mouse_pos_for_layer_change;
     static int original_layer_on_drag_start = -1;
     static int original_linked_layer_on_drag_start = -1;
-    static bool resizing_left = false;
-    static bool resizing_right = false;
+    static int resizing_left_index = -1;
+    static int resizing_right_index = -1;
+
     bool clicked_on_clip = false;
 
     for (size_t i = 0; i < clips.size(); ++i) {
@@ -2552,7 +2555,7 @@ void DrawTimelineEditor(
         }
 
         // Selection
-        if (!resizing_left && !resizing_right && dragging_clip_index == -1 &&
+        if (resizing_left_index == -1 && resizing_right_index == -1 && dragging_clip_index == -1 &&
             ImGui::IsMouseHoveringRect(clip_rect_min, clip_rect_max) && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
             selected_clip = &clip;
             clicked_on_clip = true;
@@ -2572,10 +2575,10 @@ void DrawTimelineEditor(
         if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
 
         if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
-            PushUndo(clips, playhead_time, zoom_factor);
-            
             // --- 1. INITIALIZATION ---
             if (dragging_clip_index == -1) {
+                PushUndo(clips, playhead_time, zoom_factor);
+
                 dragging_clip_index = i;
                 float mouse_x = ImGui::GetMousePos().x;
                 drag_offset_time = (mouse_x - clip_start_x) / pixels_per_second;
@@ -2730,10 +2733,13 @@ void DrawTimelineEditor(
         if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
 
         if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
-            if (!resizing_right) {
+            if (resizing_left_index == -1 && resizing_right_index == -1) {
                 PushUndo(clips, playhead_time, zoom_factor);
-                resizing_left = true;
-                float mouse_x = ImGui::GetMousePos().x;
+                resizing_left_index = i;
+            }
+            
+            if (resizing_left_index == i) {
+                 float mouse_x = ImGui::GetMousePos().x;
                 float raw_new_start = (mouse_x - timeline_start.x + scroll_x) / pixels_per_second;
                 
                 float new_start = raw_new_start;
@@ -2760,18 +2766,44 @@ void DrawTimelineEditor(
                     }
                 }
 
-                float new_duration = clip.start_time + clip.duration - new_start;
-                float delta = new_start - clip.start_time;
-                if (delta > 0.0f) clip.media_start += delta;
-                clip.start_time = std::max(0.0f, new_start);
-                clip.duration = std::max(0.1f, new_duration);
+                // Proposed Logic: Calculate delta
+                float current_start = clip.start_time;
+                float delta = new_start - current_start;
+                
+                // Constraints
+                // 1. Clip media_start + delta >= 0  => delta >= -clip.media_start
+                // 2. Clip start_time + delta >= 0   => delta >= -clip.start_time
+                // 3. Linked clip media_start + delta >= 0
+                // 4. Linked clip start_time + delta >= 0
+                
+                float max_neg_delta = -std::min(clip.media_start, clip.start_time);
+                if (clip.linked_clip && clip.linked_clip != selected_clip) {
+                     float linked_limit = -std::min(clip.linked_clip->media_start, clip.linked_clip->start_time);
+                     max_neg_delta = std::max(max_neg_delta, linked_limit);
+                }
+                
+                if (delta < max_neg_delta) {
+                    delta = max_neg_delta;
+                    new_start = current_start + delta;
+                }
+                
+                // Prevent negative duration
+                if (clip.duration - delta < 0.1f) {
+                     delta = clip.duration - 0.1f;
+                     new_start = current_start + delta;
+                }
+
+                clip.start_time = new_start;
+                clip.duration -= delta;
+                clip.media_start += delta;
 
                 if (clip.linked_clip && clip.linked_clip != selected_clip) {
                     clip.linked_clip->start_time += delta;
-                    clip.linked_clip->duration = clip.duration;
+                    clip.linked_clip->duration -= delta;
+                    clip.linked_clip->media_start += delta;
                 }
             }
-        } else if (resizing_left) resizing_left = false;
+        } else if (resizing_left_index == i) resizing_left_index = -1;
 
         // Right resizing
         ImVec2 right_min = ImVec2(clip_end_x - handle_w / 2, clip_rect_min.y);
@@ -2782,9 +2814,11 @@ void DrawTimelineEditor(
         if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
 
         if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
-            if (!resizing_left) {
+            if (resizing_left_index == -1 && resizing_right_index == -1) {
                 PushUndo(clips, playhead_time, zoom_factor);
-                resizing_right = true;
+                resizing_right_index = i;
+            }
+            if(resizing_right_index == i) {
                 float mouse_x = ImGui::GetMousePos().x;
                 float raw_new_end = (mouse_x - timeline_start.x + scroll_x) / pixels_per_second;
                 
@@ -2820,7 +2854,7 @@ void DrawTimelineEditor(
                     clip.linked_clip->duration += delta;
                 }
             }
-        } else if (resizing_right) resizing_right = false;
+        } else if (resizing_right_index == i) resizing_right_index = -1;
 
         // Create unique ID and hit area for context menu
         ImGui::SetCursorScreenPos(clip_rect_min);
