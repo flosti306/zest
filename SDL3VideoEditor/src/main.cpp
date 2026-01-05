@@ -47,6 +47,7 @@ extern "C" {
 #include <SDL3/SDL_image.h> // Use SDL_image for SDL3
 #include <glm/glm.hpp> // For vec2, vec3 etc.
 #include <glm/gtc/matrix_transform.hpp> // For ortho
+#include <nlohmann/json.hpp>
 
 // Project headers
 #include "video_export.hpp" // Include AFTER system headers and glad/imgui
@@ -54,6 +55,7 @@ extern "C" {
 #include "project_io.hpp"
 #include "effects.hpp"
 #include "keybinds.hpp"
+#include "stb_truetype.h" // Include API definition only
 
 // Global gradient data storage (used by ApplyWindowBackgroundGradients)
 struct GradientData {
@@ -4539,9 +4541,15 @@ void DrawNodeInspectorWindow(Clip* clip, GLResources& gl_resources) {
             text_node->alignment = static_cast<TextEffectNode::Alignment>(current_align);
         }
 
-        // --- NEW: Font Dropdown ---
-        static std::vector<std::string> system_fonts;
+        // --- NEW: Font Dropdown with Friendly Names ---
+        struct FontMetadata {
+            std::string path;
+            std::string name;
+            // std::string family; // Optional for sorting
+        };
+        static std::vector<FontMetadata> system_fonts;
         static bool fonts_scanned = false;
+        
         if (ImGui::TreeNode("Font Selection")) {
             if (!fonts_scanned) {
                 // Determine system font directory (Windows)
@@ -4554,30 +4562,102 @@ void DrawNodeInspectorWindow(Clip* clip, GLResources& gl_resources) {
                             // Convert to lowercase for check
                             std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
                             if (ext == ".ttf" || ext == ".otf") {
-                                system_fonts.push_back(entry.path().string());
+                                std::string file_path = entry.path().string();
+                                std::string friendly_name = entry.path().filename().string(); // Default fallback
+                                
+                                // Try to extract real name using stb_truetype
+                                std::ifstream f(file_path, std::ios::binary | std::ios::ate);
+                                if (f.is_open()) { // Only process if we can open it
+                                    std::streamsize size = f.tellg();
+                                    // Optimization: Reading the whole file is slow for all fonts.
+                                    // The name table is usually near the beginning. 
+                                    // But stbtt_GetFontNameString needs the 'info' struct which generally just needs the start of the file.
+                                    // Let's read a reasonable chunk, e.g., 256KB? Or just read it all for simplicity/correctness now.
+                                    // Reading all 500+ fonts might be slow.
+                                    // Actually, stbtt functions take the buffer pointer.
+                                    // Let's try reading header only? No, offsets can be anywhere.
+                                    // We will read the full file but only ONCE.
+                                    
+                                    // Limit scan to first 200 fonts or similar if too slow? No, user wants choice.
+                                    // Let's do lazy loading? No, dropdown needs list.
+                                    
+                                    // COMPROMISE: We will assume standard Windows fonts are reasonable size.
+                                    // And we won't crash if memory fails.
+                                    
+                                    f.seekg(0, std::ios::beg);
+                                    std::vector<unsigned char> data(size);
+                                    if (f.read((char*)data.data(), size)) {
+                                        stbtt_fontinfo info;
+                                        // Standard fonts usually at offset 0
+                                        if (stbtt_InitFont(&info, data.data(), 0)) {
+                                            int length = 0;
+                                            const char* name_ptr = nullptr;
+                                            
+                                            // 1. Try Mac Roman (Platform 1, Encoding 0) - Usually straight ASCII
+                                            name_ptr = stbtt_GetFontNameString(&info, &length, 1, 0, 0, 4);
+                                            
+                                            if (name_ptr && length > 0) {
+                                                friendly_name = std::string(name_ptr, length);
+                                            } else {
+                                                // 2. Try Microsoft Unicode (Platform 3, Encoding 1) - UTF-16BE
+                                                name_ptr = stbtt_GetFontNameString(&info, &length, 3, 1, 0x409, 4); // Full Name
+                                                if (!name_ptr) {
+                                                     // Fallback to Family Name
+                                                     name_ptr = stbtt_GetFontNameString(&info, &length, 3, 1, 0x409, 1);
+                                                }
+
+                                                if (name_ptr && length > 0) {
+                                                    // Convert UTF-16BE to ASCII (basic)
+                                                    std::string ascii_name;
+                                                    for (int i = 0; i < length; i += 2) {
+                                                        // High byte at [i], Low byte at [i+1]
+                                                        if (name_ptr[i] == 0) { // Basic Latin plane
+                                                            char c = name_ptr[i+1];
+                                                            if (c >= 32 && c <= 126) { // Printable ASCII
+                                                                ascii_name += c;
+                                                            }
+                                                        }
+                                                    }
+                                                    if (!ascii_name.empty()) {
+                                                        friendly_name = ascii_name;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                
+                                system_fonts.push_back({file_path, friendly_name});
                             }
                         }
                     }
+                    
+                    // Sort alphabetically by name
+                    std::sort(system_fonts.begin(), system_fonts.end(), [](const FontMetadata& a, const FontMetadata& b) {
+                        return a.name < b.name;
+                    });
+                    
                     fonts_scanned = true;
                 }
             }
 
-            static int selected_font_idx = -1;
-            // Show a list box/combo
-            // Use a Combo but it might be huge. A standard Combo with search would be better, but basic Combo is fine.
-            // Actually, let's just show a few lines or a filtered list?
-            // "BeginCombo" is best for custom lists.
-            
             if (ImGui::BeginCombo("System Fonts", "Select a font...")) {
-                for (int i = 0; i < system_fonts.size(); i++) {
-                    // Display just the filename, not full path
-                    std::string filename = std::filesystem::path(system_fonts[i]).filename().string();
-                    bool is_selected = (text_node->font_path == system_fonts[i]);
-                    if (ImGui::Selectable(filename.c_str(), is_selected)) {
-                         text_node->font_path = system_fonts[i];
+                for (size_t i = 0; i < system_fonts.size(); i++) {
+                    bool is_selected = (text_node->font_path == system_fonts[i].path);
+                    
+                    // Create unique label for ImGui to prevent ID collisions
+                    std::string label = system_fonts[i].name + "##" + std::to_string(i);
+                    
+                    if (ImGui::Selectable(label.c_str(), is_selected)) {
+                         text_node->font_path = system_fonts[i].path;
                          text_node->needs_rebake = true;
                     }
                     if (is_selected) ImGui::SetItemDefaultFocus();
+                    
+                    // Simple tooltip on hover showing the path (since we don't have visual preview for all)
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("%s", system_fonts[i].path.c_str());
+                    }
                 }
                 ImGui::EndCombo();
             }
