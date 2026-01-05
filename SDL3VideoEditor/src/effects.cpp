@@ -1530,16 +1530,38 @@ void TextEffectNode::Process(const std::vector<GLuint>& image_inputs, const std:
     
     // --- Generate vertex data for the text string ---
     std::vector<float> vertices;
+    
+    // 1. Calculate Total Width for Alignment
+    float total_width = 0.0f;
+    for (const char* text_ptr = text_content.c_str(); *text_ptr; text_ptr++) {
+        if (*text_ptr >= 32 && *text_ptr < 128) {
+            // xadvance is pre-scaled by RebakeFont
+            total_width += pdata[*text_ptr - 32].xadvance;
+            // Add custom letter spacing (if not at the very end, though standard is to just add it)
+            if (*(text_ptr + 1)) total_width += letter_spacing;
+        }
+    }
+
+    // 2. Determine Start X based on Alignment
     float x = position.x * ctx.resolution.x;
     float y = position.y * ctx.resolution.y;
 
-    // Note: This simple loop generates vertices for each character one by one.
-    // For extreme performance, you would generate a single buffer for the whole string.
+    if (alignment == Alignment::Center) {
+        x -= total_width * 0.5f;
+    } else if (alignment == Alignment::Right) {
+        x -= total_width;
+    }
+
+    // 3. Draw Loop
     for (const char* text_ptr = text_content.c_str(); *text_ptr; text_ptr++) {
         if (*text_ptr >= 32 && *text_ptr < 128) {
             stbtt_aligned_quad q;
+            // stbtt_GetPackedQuad advances 'x' by xadvance automatically
             stbtt_GetPackedQuad(pdata, 2048, 2048, *text_ptr - 32, &x, &y, &q, 0);
             
+            // Apply Manual Letter Spacing
+            x += letter_spacing;
+
             // For now, we ignore rotation for simplicity with VBOs
             // To add rotation, you would build a transformation matrix and apply it in the vertex shader
 

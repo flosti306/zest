@@ -4530,6 +4530,60 @@ void DrawNodeInspectorWindow(Clip* clip, GLResources& gl_resources) {
             text_node->needs_rebake = true;
         }
 
+        // --- NEW: Layout Controls ---
+        ImGui::DragFloat("Letter Spacing", &text_node->letter_spacing, 0.05f, -10.0f, 50.0f); // Pixels or relative? Let's treat as pixels for now, or maybe small float if relative.
+        
+        const char* align_names[] = { "Left", "Center", "Right" };
+        int current_align = static_cast<int>(text_node->alignment);
+        if (ImGui::Combo("Alignment", &current_align, align_names, IM_ARRAYSIZE(align_names))) {
+            text_node->alignment = static_cast<TextEffectNode::Alignment>(current_align);
+        }
+
+        // --- NEW: Font Dropdown ---
+        static std::vector<std::string> system_fonts;
+        static bool fonts_scanned = false;
+        if (ImGui::TreeNode("Font Selection")) {
+            if (!fonts_scanned) {
+                // Determine system font directory (Windows)
+                // We could use SHGetFolderPath but hardcoded is okay for now given constraints.
+                std::string font_dir = "C:\\Windows\\Fonts";
+                if (std::filesystem::exists(font_dir)) {
+                    for (const auto& entry : std::filesystem::directory_iterator(font_dir)) {
+                        if (entry.is_regular_file()) {
+                            std::string ext = entry.path().extension().string();
+                            // Convert to lowercase for check
+                            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+                            if (ext == ".ttf" || ext == ".otf") {
+                                system_fonts.push_back(entry.path().string());
+                            }
+                        }
+                    }
+                    fonts_scanned = true;
+                }
+            }
+
+            static int selected_font_idx = -1;
+            // Show a list box/combo
+            // Use a Combo but it might be huge. A standard Combo with search would be better, but basic Combo is fine.
+            // Actually, let's just show a few lines or a filtered list?
+            // "BeginCombo" is best for custom lists.
+            
+            if (ImGui::BeginCombo("System Fonts", "Select a font...")) {
+                for (int i = 0; i < system_fonts.size(); i++) {
+                    // Display just the filename, not full path
+                    std::string filename = std::filesystem::path(system_fonts[i]).filename().string();
+                    bool is_selected = (text_node->font_path == system_fonts[i]);
+                    if (ImGui::Selectable(filename.c_str(), is_selected)) {
+                         text_node->font_path = system_fonts[i];
+                         text_node->needs_rebake = true;
+                    }
+                    if (is_selected) ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::TreePop();
+        }
+
         ImGui::ColorEdit4("Color", &text_node->text_color.x);
         ImGui::SliderFloat2("Position", &text_node->position.x, 0.0f, 1.0f);
         ImGui::SliderFloat("Rotation", &text_node->rotation, -180.0f, 180.0f);

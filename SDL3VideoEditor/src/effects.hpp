@@ -538,6 +538,12 @@ struct TextEffectNode : public EffectNode {
     float outline_thickness = 0.1f; // Relative to font size
     glm::vec4 outline_color = {0.0f, 0.0f, 0.0f, 1.0f}; // Black
 
+    // --- Layout Properties ---
+    enum class Alignment { Left, Center, Right };
+    Alignment alignment = Alignment::Center;
+    float letter_spacing = 0.0f; // In pixels (relative to font size?) No, let's make it a multiplier or just raw pixels. Let's say raw pixels for now, or relative to scale.
+    // Making it relative to font size (em) is usually better. 0.0 = normal. 0.1 = 10% of font size extra space.
+
     // --- UPDATED: Internal Font Rendering State ---
     bool needs_rebake = true;
     GLuint font_atlas_tex = 0;
