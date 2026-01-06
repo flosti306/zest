@@ -2238,17 +2238,34 @@ void DrawTimelineEditor(
     float pixels_per_second = 100.0f * zoom_factor;
     float timeline_size = project_duration * pixels_per_second;
 
-    // Zoom buttons
-    float focus_ratio = playhead_time / max_duration;
+    // Zoom Logic
+    float zoom_multiplier = 0.0f;
 
     if (ImGui::Button("Zoom In")) {
-        zoom_factor *= 1.1f;
-        playhead_time = std::clamp(focus_ratio * project_duration, 0.0f, project_duration);
+        zoom_multiplier = 1.1f;
     }
     ImGui::SameLine();
     if (ImGui::Button("Zoom Out")) {
-        zoom_factor /= 1.1f;
-        playhead_time = std::clamp(focus_ratio * project_duration, 0.0f, project_duration);
+        zoom_multiplier = 0.90909f; // 1.0/1.1
+    }
+
+    // Ctrl + Mouse Wheel Zoom
+    if (ImGui::IsWindowHovered() && ImGui::GetIO().KeyCtrl && ImGui::GetIO().MouseWheel != 0.0f) {
+        zoom_multiplier = (ImGui::GetIO().MouseWheel > 0) ? 1.1f : 0.90909f;
+    }
+
+    if (zoom_multiplier != 0.0f) {
+        zoom_factor *= zoom_multiplier;
+        if (zoom_factor < 0.01f) zoom_factor = 0.01f;
+        if (zoom_factor > 100.0f) zoom_factor = 100.0f;
+
+        // Update local layout variables immediately so drawing this frame is correct
+        pixels_per_second = 100.0f * zoom_factor;
+        timeline_size = project_duration * pixels_per_second;
+
+        // "Scroll onto the playhead centeredly"
+        // Force the scroll position so the playhead sits in the middle of the timeline view
+        scroll_x = (playhead_time * pixels_per_second) - (timeline_width * 0.5f);
     }
     
     static bool snap_enabled = false;
