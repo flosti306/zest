@@ -1320,36 +1320,128 @@ void TextEffectNode::RebakeFont() {
 
     const int ATLAS_WIDTH = 2048;
     const int ATLAS_HEIGHT = 2048;
-    const int NUM_CHARS = 96;
-
-    // SDF Parameters
-    const int PADDING = 5;
-    const unsigned char ON_EDGE_VALUE = 128;
-    const float PIXEL_DIST_SCALE = 32.0f; // A lower value can sometimes be better
-
+    // Variables formerly defined here (NUM_CHARS, PIXEL_DIST_SCALE) are now local or inlined
     unsigned char* sdf_atlas_data = new unsigned char[ATLAS_WIDTH * ATLAS_HEIGHT];
+    // Clear to transparent (or 0 distance)
+    std::memset(sdf_atlas_data, 0, ATLAS_WIDTH * ATLAS_HEIGHT);
+    // Clear metrics array to prevent garbage values for invisible chars (like Space)
+    std::memset(pdata, 0, sizeof(pdata));
     
+    stbtt_fontinfo font_info;
+    if (!stbtt_InitFont(&font_info, (const unsigned char*)font_buffer.data(), 0)) {
+        delete[] sdf_atlas_data;
+        return;
+    }
+
+    float scale = stbtt_ScaleForPixelHeight(&font_info, baked_font_size);
+
+    int ascent, descent, lineGap;
+    stbtt_GetFontVMetrics(&font_info, &ascent, &descent, &lineGap);
+    baked_ascent = ascent * scale;
+    baked_descent = descent * scale;
+    baked_line_gap = lineGap * scale;
+
     stbtt_pack_context spc;
+    // Just 1 pixel padding between packed glyphs for safety
     stbtt_PackBegin(&spc, sdf_atlas_data, ATLAS_WIDTH, ATLAS_HEIGHT, 0, 1, nullptr);
     
-    // This is the correct 10-argument version of the function that generates SDFs
-    // and is exposed by stb_truetype when correctly configured.
-    stbtt_PackFontRange(&spc, (const unsigned char*)font_buffer.data(), 0,
-        font_size, 32, NUM_CHARS, pdata);
+    stbtt_PackSetOversampling(&spc, 1, 1);
     
+    // We need a bitmap for the atlas. 
+    // SDFs are usually smaller than full raster, but with padding they take space.
+    // 512x512 might be enough for small sets, but let's go 1024x1024 for safety with 96px font.
+    int NEW_ATLAS_WIDTH = 2048;
+    int NEW_ATLAS_HEIGHT = 2048;
+    std::vector<unsigned char> atlas_pixels(NEW_ATLAS_WIDTH * NEW_ATLAS_HEIGHT);
+    
+    // We use stbrp logic to pack rects
+    stbtt_PackBegin(&spc, atlas_pixels.data(), NEW_ATLAS_WIDTH, NEW_ATLAS_HEIGHT, 0, 1, nullptr);
+    
+    // We need to gather rects for our char range (32-126)
+    // AND we must account for the padding required by SDF.
+    int padding = 5; // SDF padding
+    int onedge_value = 128; // 0-255 range, 128 is the edge
+    int pixel_dist_scale = onedge_value / padding; 
+
+    // stbtt_PackFontRangesGatherRects is not enough because it doesn't know about SDF padding needs?
+    // Actually, we can just manually allocate stbrp_rects.
+    
+    int num_chars = 96; // 32 to 127
+    std::vector<stbrp_rect> rects(num_chars);
+    for (int i = 0; i < num_chars; ++i) {
+        int codepoint = i + 32;
+        int x0, y0, x1, y1;
+        stbtt_GetCodepointBitmapBox(&font_info, codepoint, scale, scale, &x0, &y0, &x1, &y1);
+        rects[i].id = i;
+        rects[i].w = (stbrp_coord)((x1 - x0) + 2 * padding);
+        rects[i].h = (stbrp_coord)((y1 - y0) + 2 * padding);
+    }
+    
+    stbtt_PackFontRangesPackRects(&spc, rects.data(), num_chars);
     stbtt_PackEnd(&spc);
+
+    // Now generated the SDFs into the allocated rects
+    // We need to manually fill the texture now using the rect info
+    // And populate pdata manually.
+    
+    for (int i = 0; i < num_chars; ++i) {
+        if (rects[i].was_packed) {
+            int codepoint = i + 32;
+            stbtt_packedchar& pc = pdata[i];
+            
+            // ALWAYS get metrics, even if no bitmap (SPACE char!)
+            int advance, lsb;
+            stbtt_GetCodepointHMetrics(&font_info, codepoint, &advance, &lsb);
+            pc.xadvance = advance * scale;
+
+            // Generate SDF
+            int w_sdf, h_sdf, xoff_sdf, yoff_sdf;
+            unsigned char* sdf_bitmap = stbtt_GetGlyphSDF(&font_info, scale, stbtt_FindGlyphIndex(&font_info, codepoint), padding, onedge_value, pixel_dist_scale, &w_sdf, &h_sdf, &xoff_sdf, &yoff_sdf);
+            
+            if (sdf_bitmap) {
+                 // Copy to atlas
+                 int target_x = rects[i].x;
+                 int target_y = rects[i].y;
+                 
+                 for (int r = 0; r < h_sdf && (target_y + r) < NEW_ATLAS_HEIGHT; ++r) {
+                     for (int c = 0; c < w_sdf && (target_x + c) < NEW_ATLAS_WIDTH; ++c) {
+                         atlas_pixels[(target_y + r) * NEW_ATLAS_WIDTH + (target_x + c)] = sdf_bitmap[r * w_sdf + c];
+                     }
+                 }
+            
+                 stbtt_FreeSDF(sdf_bitmap, nullptr);
+                 
+                 // Fill pdata for visual quad
+                 pc.x0 = (unsigned short)rects[i].x;
+                 pc.y0 = (unsigned short)rects[i].y;
+                 pc.x1 = (unsigned short)(rects[i].x + w_sdf);
+                 pc.y1 = (unsigned short)(rects[i].y + h_sdf);
+                 
+                 pc.xoff = (float)xoff_sdf;
+                 pc.yoff = (float)yoff_sdf;
+                 pc.xoff2 = (float)(xoff_sdf + w_sdf);
+                 pc.yoff2 = (float)(yoff_sdf + h_sdf);
+            }
+        } else {
+            // Not packed
+            std::memset(&pdata[i], 0, sizeof(stbtt_packedchar));
+        }
+    }
     
     // (Optional) Save the atlas to disk to see what it looks like
-    // stbi_write_png("sdf_atlas.png", ATLAS_WIDTH, ATLAS_HEIGHT, 1, sdf_atlas_data, 0);
+    // stbi_write_png("sdf_atlas.png", NEW_ATLAS_WIDTH, NEW_ATLAS_HEIGHT, 1, atlas_pixels.data(), 0);
 
     if (font_atlas_tex != 0) glDeleteTextures(1, &font_atlas_tex);
     glGenTextures(1, &font_atlas_tex);
     glBindTexture(GL_TEXTURE_2D, font_atlas_tex);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RED, ATLAS_WIDTH, ATLAS_HEIGHT, 0, GL_RED, GL_UNSIGNED_BYTE, sdf_atlas_data);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RED, NEW_ATLAS_WIDTH, NEW_ATLAS_HEIGHT, 0, GL_RED, GL_UNSIGNED_BYTE, atlas_pixels.data());
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    // Needed for SDF to work well at edges
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
-    delete[] sdf_atlas_data;
+    // delete[] sdf_atlas_data; // No longer used/allocated
     needs_rebake = false;
     std::cout << "Re-baked SDF font: " << font_path << " at size " << font_size << std::endl;
 }
@@ -1430,36 +1522,105 @@ void TextEffectNode::Process(const std::vector<GLuint>& image_inputs, const std:
     glBindVertexArray(vao);
     
     // --- Generate vertex data for the text string ---
+    // Handle Multiline Text
+    float render_scale = font_size / baked_font_size;
+    
+    // Calculate line height
+    // baked_ascent is positive, baked_descent is negative. 
+    // Standard line height = ascent - descent + lineGap
+    float line_height = (baked_ascent - baked_descent + baked_line_gap) * render_scale;
+    // Fallback if metrics are zero (shouldn't happen if font loaded)
+    if (line_height == 0) line_height = font_size;
+
+    std::vector<std::string> lines;
+    std::stringstream ss(text_content);
+    std::string segment;
+    while (std::getline(ss, segment, '\n')) {
+        lines.push_back(segment);
+    }
+    // If text ends with newline, add empty line (though invisible, maintains logic consistency if more text follows)
+    if (!text_content.empty() && text_content.back() == '\n') lines.push_back("");
+
+    // Start Y position
+    // As per user feedback, the system behaves like Y-Down (0 at Top).
+    // Center of block is at Y.
+    // Top of block is Y - TotalH/2.
+    // Line 0 is at Top.
+    
+    // Line 0 Offset from Center: -(N-1)/2 * LH.
+    float current_y = (position.y * ctx.resolution.y) - ((lines.size() - 1) * line_height * 0.5f);
+
     std::vector<float> vertices;
-    float x = position.x * ctx.resolution.x;
-    float y = position.y * ctx.resolution.y;
-
-    // Note: This simple loop generates vertices for each character one by one.
-    // For extreme performance, you would generate a single buffer for the whole string.
-    for (const char* text_ptr = text_content.c_str(); *text_ptr; text_ptr++) {
-        if (*text_ptr >= 32 && *text_ptr < 128) {
-            stbtt_aligned_quad q;
-            stbtt_GetPackedQuad(pdata, 2048, 2048, *text_ptr - 32, &x, &y, &q, 0);
-            
-            // For now, we ignore rotation for simplicity with VBOs
-            // To add rotation, you would build a transformation matrix and apply it in the vertex shader
-
-            float quad_verts[] = {
-                // pos.x, pos.y, tex.u, tex.v
-                q.x0, q.y0, q.s0, q.t0,
-                q.x1, q.y0, q.s1, q.t0,
-                q.x1, q.y1, q.s1, q.t1,
-
-                q.x0, q.y0, q.s0, q.t0,
-                q.x1, q.y1, q.s1, q.t1,
-                q.x0, q.y1, q.s0, q.t1
-            };
-            
-            // Upload quad data to VBO and draw
-            glBindBuffer(GL_ARRAY_BUFFER, vbo);
-            glBufferData(GL_ARRAY_BUFFER, sizeof(quad_verts), quad_verts, GL_DYNAMIC_DRAW);
-            glDrawArrays(GL_TRIANGLES, 0, 6);
+    
+    for (const auto& line : lines) {
+        // 1. Calculate Width for this line
+        float line_width = 0.0f;
+        for (char c : line) {
+            if (c >= 32 && c < 128) {
+                line_width += pdata[c - 32].xadvance * render_scale;
+                line_width += letter_spacing;
+            }
         }
+        if (line_width > 0 && !line.empty()) line_width -= letter_spacing; // Remove trailing spacing
+
+        // 2. Determine Start X for this line
+        float x = position.x * ctx.resolution.x;
+        if (alignment == Alignment::Center) {
+            x -= line_width * 0.5f;
+        } else if (alignment == Alignment::Right) {
+            x -= line_width;
+        }
+
+        // 3. Draw Loop for this line
+        for (char c : line) {
+            if (c >= 32 && c < 128) {
+                stbtt_aligned_quad q;
+                float dummy_x = 0; float dummy_y = 0;
+                stbtt_GetPackedQuad(pdata, 2048, 2048, c - 32, &dummy_x, &dummy_y, &q, 0);
+                
+                // Scale coordinates
+                float q_width = (q.x1 - q.x0) * render_scale;
+                float q_height = (q.y1 - q.y0) * render_scale;
+                
+                float q_x0_scaled = (q.x0) * render_scale;
+                float q_y0_scaled = (q.y0) * render_scale;
+                
+                // Final positions
+                // x is the current pen position.
+                // q.x0 is the offset from the pen.
+                float cur_x0 = x + q_x0_scaled;
+                // Revert to ADDITION for Y-Down coordinate system
+                float cur_y0 = current_y + q_y0_scaled;
+                float cur_x1 = cur_x0 + q_width;
+                float cur_y1 = current_y + (q.y1 * render_scale); // Or cur_y0 + q_height
+                
+                // Advance X
+                float advance = pdata[c - 32].xadvance * render_scale;
+                x += advance + letter_spacing;
+                
+                float quad_verts[] = {
+                    cur_x0, cur_y0, q.s0, q.t0,
+                    cur_x1, cur_y0, q.s1, q.t0,
+                    cur_x1, cur_y1, q.s1, q.t1,
+
+                    cur_x0, cur_y0, q.s0, q.t0,
+                    cur_x1, cur_y1, q.s1, q.t1,
+                    cur_x0, cur_y1, q.s0, q.t1
+                };
+                
+                vertices.insert(vertices.end(), std::begin(quad_verts), std::end(quad_verts));
+            }
+        }
+        
+        // Advance to next line (Downwards = Increase Y)
+        current_y += line_height;
+    }
+
+    // Upload quad data to VBO and draw
+    if (!vertices.empty()) {
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glBufferData(GL_ARRAY_BUFFER, vertices.size() * sizeof(float), vertices.data(), GL_DYNAMIC_DRAW);
+        glDrawArrays(GL_TRIANGLES, 0, vertices.size() / 4); // 4 floats per vertex
     }
 
     // --- Restore OpenGL state ---

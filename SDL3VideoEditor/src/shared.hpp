@@ -2,6 +2,8 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <algorithm>
+#include <glm/glm.hpp>
 
 struct EffectGraph; // Forward declaration
 
@@ -26,7 +28,13 @@ enum class BlendMode {
 enum class InterpolationType {
     Linear,
     EaseInOut,
-    Hold
+    Hold,
+    Bezier
+};
+
+struct BezierHandle {
+    float x = 0.0f;
+    float y = 0.0f;
 };
 
 template<typename T>
@@ -34,6 +42,11 @@ struct Keyframe {
     float time;               // Time in seconds
     T value;                  // The value at that time
     InterpolationType interp; // How to interpolate to next keyframe
+
+    // Safe storage handles
+    // Default to linear-ish: Left(-0.5, 0), Right(0.5, 0)
+    BezierHandle handle_left = { -0.5f, 0.0f }; 
+    BezierHandle handle_right = { 0.5f, 0.0f };
 };
 
 template<typename T>
@@ -43,9 +56,6 @@ struct KeyframeTrack {
     // Evaluate value at a given time
     T Evaluate(float time) const;
 };
-
-float Lerp(float a, float b, float t);
-
 
 struct Clip {
     std::string name;

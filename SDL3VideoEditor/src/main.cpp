@@ -36,7 +36,9 @@ extern "C" {
 }
 
 // C++ libraries (ImGui, SDL3)
+#define IMGUI_DEFINE_MATH_OPERATORS
 #include <imgui.h>
+#include <imgui_internal.h>
 #include <imgui_impl_sdl3.h>
 #include <imgui_impl_opengl3.h>
 #include <imnodes.h>
@@ -45,12 +47,15 @@ extern "C" {
 #include <SDL3/SDL_image.h> // Use SDL_image for SDL3
 #include <glm/glm.hpp> // For vec2, vec3 etc.
 #include <glm/gtc/matrix_transform.hpp> // For ortho
+#include <nlohmann/json.hpp>
 
 // Project headers
 #include "video_export.hpp" // Include AFTER system headers and glad/imgui
 #include "shared.hpp"
 #include "project_io.hpp"
 #include "effects.hpp"
+#include "keybinds.hpp"
+#include "stb_truetype.h" // Include API definition only
 
 // Global gradient data storage (used by ApplyWindowBackgroundGradients)
 struct GradientData {
@@ -67,6 +72,19 @@ struct ScoredNodeResult {
         return score < other.score;
     }
 };
+
+struct CurveEditorContext {
+    float zoom_x = 1.0f;
+    float zoom_y = 1.0f;
+    ImVec2 pan = ImVec2(0.0f, 0.0f);
+    int dragging_handle_id = -1; // -1:None, 0:Key, 1:Left, 2:Right
+    int dragging_keyframe_idx = -1;
+    int selected_keyframe_idx = -1;
+    bool snap_enabled = false; // New: Snapping toggle
+};
+
+// Global or persistent map to store editor state per track
+static std::map<std::string, CurveEditorContext> g_CurveEditors;
 
 // === Playback state ===
 std::atomic<bool> playing = false;
@@ -103,6 +121,7 @@ static GLuint mask_editor_dummy_vao = 0;       // VAO for fullscreen quad drawin
 
 static bool smart_mask_editor_open = false;
 static MaskEffectNode* current_editing_smart_mask_node = nullptr;
+static bool node_editor_active = false; // Added to prevent global clip deletion when editing nodes
 static GLuint smart_mask_editor_bg_clip_tex = 0; // Texture of the clip frame to show
 static GLuint smart_mask_editor_overlay_tex = 0; // Texture of the generated GrabCut mask
 static ImVec2 smart_mask_roi_start_pos; // For drawing the ROI rectangle
@@ -408,7 +427,7 @@ bool LoadTextureFromFile(const char* filename, GLuint* out_texture_id, int* out_
 }
 
 // --- Docking Setup ---
-void RenderDockSpace() {
+void RenderDockSpace(bool* show_keybinds) {
     static ImGuiDockNodeFlags dockspace_flags = ImGuiDockNodeFlags_PassthruCentralNode; // Allow background rendering
 
     ImGuiWindowFlags window_flags = ImGuiWindowFlags_MenuBar | ImGuiWindowFlags_NoDocking;
@@ -449,6 +468,9 @@ void RenderDockSpace() {
         if (ImGui::BeginMenu("Edit")) {
              ImGui::MenuItem("Undo", "CTRL+Z", nullptr, false);
              ImGui::MenuItem("Redo", "CTRL+Y", nullptr, false);
+             if (ImGui::MenuItem("Key Bindings...")) {
+                 *show_keybinds = true;
+             }
              ImGui::EndMenu();
         }
         ImGui::EndMenuBar();
@@ -1223,22 +1245,24 @@ void PushUndo(const std::vector<Clip>& clips, float playhead_time, float zoom_fa
     while (!redo_stack.empty()) redo_stack.pop();
 }
 
-void Undo(std::vector<Clip>& clips, float& playhead_time, float& zoom_factor) {
+void Undo(std::vector<Clip>& clips, float& playhead_time, float& zoom_factor, Clip*& selected_clip) {
     if (undo_stack.empty()) return;
     // Push current state to redo stack
     redo_stack.push(SerializeProject(clips, playhead_time, zoom_factor));
     // Restore previous state
     std::string prev = undo_stack.top(); undo_stack.pop();
     DeserializeProject(prev, clips, playhead_time, zoom_factor);
+    selected_clip = nullptr;
 }
 
-void Redo(std::vector<Clip>& clips, float& playhead_time, float& zoom_factor) {
+void Redo(std::vector<Clip>& clips, float& playhead_time, float& zoom_factor, Clip*& selected_clip) {
     if (redo_stack.empty()) return;
     // Push current state to undo stack
     undo_stack.push(SerializeProject(clips, playhead_time, zoom_factor));
     // Restore next state
     std::string next = redo_stack.top(); redo_stack.pop();
     DeserializeProject(next, clips, playhead_time, zoom_factor);
+    selected_clip = nullptr;
 }
 
 // --- Forward Declarations ---
@@ -1376,6 +1400,19 @@ int main(int argc, char* argv[]) {
         std::cout << "Audio playback initialized successfully." << std::endl;
     }
 
+    // --- Keybinds Initialization ---
+    KeybindManager keybind_manager;
+    keybind_manager.Register("Play/Pause", SDLK_SPACE, SDL_KMOD_NONE, "Toggle Playback");
+    keybind_manager.Register("Frame Step Left", SDLK_LEFT, SDL_KMOD_NONE, "Step One Frame Back");
+    keybind_manager.Register("Frame Step Right", SDLK_RIGHT, SDL_KMOD_NONE, "Step One Frame Forward");
+    keybind_manager.Register("Blade Tool", SDLK_B, SDL_KMOD_CTRL, "Split Clip at Playhead");
+    keybind_manager.Register("Delete Selected", SDLK_DELETE, SDL_KMOD_NONE, "Delete Selected Clip");
+    keybind_manager.Register("Undo", SDLK_Z, SDL_KMOD_CTRL, "Undo Last Action");
+    keybind_manager.Register("Redo", SDLK_Y, SDL_KMOD_CTRL, "Redo Last Action");
+    
+    keybind_manager.Load("keybinds.json");
+    bool show_keybind_settings = false;
+
     while (running) {
         Uint64 current_ticks = SDL_GetTicks();
         float delta_time = (current_ticks - last_frame_ticks) / 1000.0f;
@@ -1386,6 +1423,9 @@ int main(int argc, char* argv[]) {
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
             ImGui_ImplSDL3_ProcessEvent(&event);
+            
+            // Allow KeybindManager to intercept events for rebinding
+            if (keybind_manager.HandleRebindInput(event)) continue;
 
             if (event.type == SDL_EVENT_QUIT) running = false;
 
@@ -1393,10 +1433,12 @@ int main(int argc, char* argv[]) {
                  int w, h; SDL_GetWindowSizeInPixels(window, &w, &h); glViewport(0, 0, w, h);
             }
 
-            if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_SPACE && event.key.down) {
+            bool imgui_wants_keyboard = ImGui::GetIO().WantTextInput;
+
+            if (!imgui_wants_keyboard && keybind_manager.IsTriggered(event, "Play/Pause")) {
                 playing = !playing.load();
                 std::cout << "Playback " << (playing ? "started" : "paused") << "\n";
-            } else if (event.type == SDL_EVENT_KEY_DOWN && (event.key.key == SDLK_LEFT || event.key.key == SDLK_RIGHT) && event.key.down) {
+            } else if (!imgui_wants_keyboard && (keybind_manager.IsTriggered(event, "Frame Step Left") || keybind_manager.IsTriggered(event, "Frame Step Right"))) {
                 if (export_fps > 0) {
                     // 1. Calculate the duration of a single frame.
                     const float frame_duration = 1.0f / static_cast<float>(export_fps);
@@ -1408,7 +1450,7 @@ int main(int argc, char* argv[]) {
                     }
 
                     // 3. Adjust playhead time by one frame.
-                    if (event.key.key == SDLK_LEFT) {
+                    if (keybind_manager.IsTriggered(event, "Frame Step Left")) {
                         playhead_time -= frame_duration;
                     } else { // Right Arrow
                         playhead_time += frame_duration;
@@ -1419,7 +1461,7 @@ int main(int argc, char* argv[]) {
                 }
             }
             // Use event.key.key and SDLK_B (Fix 3 & 4)
-            else if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_B && (SDL_GetModState() & SDL_KMOD_CTRL) && selected_clip && event.key.down) {
+            else if (!imgui_wants_keyboard && keybind_manager.IsTriggered(event, "Blade Tool") && selected_clip) {
                 // --- DEFINITIVE, POINTER-SAFE BLADE TOOL LOGIC ---
                 PushUndo(clips, playhead_time, zoom_factor);
 
@@ -1532,7 +1574,11 @@ int main(int argc, char* argv[]) {
                 // --- End Blade Tool ---
             }
             // Use event.key.key and SDLK_DELETE (Fix 3 & 4)
-            else if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_DELETE && selected_clip && event.key.down) {
+            // Fix: Don't delete clips if we are interacting with the Node Editor or Smart Mask Editor
+            else if (!imgui_wants_keyboard && keybind_manager.IsTriggered(event, "Delete Selected") && 
+                     selected_clip && 
+                     !node_editor_active && 
+                     !smart_mask_editor_open) {
                 PushUndo(clips, playhead_time, zoom_factor);
                 ptrdiff_t selected_index = -1;
                 for(size_t i = 0; i < clips.size(); ++i) { if (&clips[i] == selected_clip) { selected_index = i; break; } }
@@ -1545,16 +1591,14 @@ int main(int argc, char* argv[]) {
                         process_message = "Deleted clip.";
                         std::cout << "Deleted selected clip." << std::endl;
                 }
-            } else if (event.type == SDL_EVENT_KEY_DOWN && (SDL_GetModState() & SDL_KMOD_CTRL)) {
-                if (event.key.key == SDLK_Z) {
-                    Undo(clips, playhead_time, zoom_factor);
+            } else if (!imgui_wants_keyboard && keybind_manager.IsTriggered(event, "Undo")) {
+                    Undo(clips, playhead_time, zoom_factor, selected_clip);
                     layers_changed = true;
                     process_message = "Undo";
-                } else if (event.key.key == SDLK_Y) {
-                    Redo(clips, playhead_time, zoom_factor);
+            } else if (!imgui_wants_keyboard && keybind_manager.IsTriggered(event, "Redo")) {
+                    Redo(clips, playhead_time, zoom_factor, selected_clip);
                     layers_changed = true;
                     process_message = "Redo";
-                }
             }
 
             if (event.type == SDL_EVENT_DROP_FILE) {
@@ -1663,7 +1707,7 @@ int main(int argc, char* argv[]) {
         last_playhead_time_for_velocity = playhead_time;
 
         ImGui_ImplOpenGL3_NewFrame(); ImGui_ImplSDL3_NewFrame(); ImGui::NewFrame();
-        RenderDockSpace();
+        RenderDockSpace(&show_keybind_settings);
 
         ImGui::Begin("Controls");
         ApplyWindowBackgroundGradients();
@@ -1756,6 +1800,10 @@ int main(int argc, char* argv[]) {
 
         if (smart_mask_editor_open) {
             DrawSmartMaskEditorWindow(); // Call this similar to DrawMaskEditorWindow
+        }
+
+        if (show_keybind_settings) {
+            keybind_manager.DrawSettingsWindow(&show_keybind_settings);
         }
 
         ImGui::Begin("Inspector"); ApplyWindowBackgroundGradients();
@@ -2190,18 +2238,39 @@ void DrawTimelineEditor(
     float pixels_per_second = 100.0f * zoom_factor;
     float timeline_size = project_duration * pixels_per_second;
 
-    // Zoom buttons
-    float focus_ratio = playhead_time / max_duration;
+    // Zoom Logic
+    float zoom_multiplier = 0.0f;
 
     if (ImGui::Button("Zoom In")) {
-        zoom_factor *= 1.1f;
-        playhead_time = std::clamp(focus_ratio * project_duration, 0.0f, project_duration);
+        zoom_multiplier = 1.1f;
     }
     ImGui::SameLine();
     if (ImGui::Button("Zoom Out")) {
-        zoom_factor /= 1.1f;
-        playhead_time = std::clamp(focus_ratio * project_duration, 0.0f, project_duration);
+        zoom_multiplier = 0.90909f; // 1.0/1.1
     }
+
+    // Ctrl + Mouse Wheel Zoom
+    if (ImGui::IsWindowHovered() && ImGui::GetIO().KeyCtrl && ImGui::GetIO().MouseWheel != 0.0f) {
+        zoom_multiplier = (ImGui::GetIO().MouseWheel > 0) ? 1.1f : 0.90909f;
+    }
+
+    if (zoom_multiplier != 0.0f) {
+        zoom_factor *= zoom_multiplier;
+        if (zoom_factor < 0.01f) zoom_factor = 0.01f;
+        if (zoom_factor > 100.0f) zoom_factor = 100.0f;
+
+        // Update local layout variables immediately so drawing this frame is correct
+        pixels_per_second = 100.0f * zoom_factor;
+        timeline_size = project_duration * pixels_per_second;
+
+        // "Scroll onto the playhead centeredly"
+        // Force the scroll position so the playhead sits in the middle of the timeline view
+        scroll_x = (playhead_time * pixels_per_second) - (timeline_width * 0.5f);
+    }
+    
+    static bool snap_enabled = false;
+    ImGui::SameLine();
+    ImGui::Checkbox("Snap", &snap_enabled);
 
     // Get starting positions for labels and timeline
     ImVec2 cursor_pos = ImGui::GetCursorScreenPos();
@@ -2297,8 +2366,12 @@ void DrawTimelineEditor(
 
     static int dragging_clip_index = -1;
     static float drag_offset_time = 0.0f;
-    static bool resizing_left = false;
-    static bool resizing_right = false;
+    static ImVec2 drag_start_mouse_pos_for_layer_change;
+    static int original_layer_on_drag_start = -1;
+    static int original_linked_layer_on_drag_start = -1;
+    static int resizing_left_index = -1;
+    static int resizing_right_index = -1;
+
     bool clicked_on_clip = false;
 
     for (size_t i = 0; i < clips.size(); ++i) {
@@ -2318,6 +2391,44 @@ void DrawTimelineEditor(
         : max_video_layer + clip.layer;
 
         float layer_y = timeline_start.y + y_index * (layer_height + layer_padding);
+
+        // --- VISUAL DRAG OVERRIDE ---
+        static int original_y_index_on_drag_start = 0;
+        static int original_max_video_layer_on_drag_start = 0;
+        
+        // If this is the clip being dragged, override its Y position to correspond to its Logical Layer shift relative to start.
+        // We calculate the row index dynamically relative to the CURRENT timeline_start to prevent "Layer 1.5" drift.
+        if (dragging_clip_index == i && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+            // --- RECALCULATE MAX LAYERS LOCALLY ---
+            // The global 'max_video_layer' is stale (computed before this frame's drag update).
+            // We need the state that *will be* true next frame to prevent 1-frame glitches.
+            int current_max_video = 0;
+            // int current_max_audio = 0; // Unused for now but good for completeness if needed
+            for (const auto& c : clips) {
+                if (c.type == ClipType::Video) current_max_video = std::max(current_max_video, c.layer);
+                // else if (c.type == ClipType::Audio) current_max_audio = std::max(current_max_audio, c.layer);
+            }
+            current_max_video += 1; // Always +1 for empty space
+            // current_max_audio += 1;
+
+            float row_pitch = layer_height + layer_padding;
+            int layer_delta = clip.layer - original_layer_on_drag_start;
+            int max_video_delta = current_max_video - original_max_video_layer_on_drag_start;
+
+            float y_offset_rows = 0.0f;
+            if (clip.type == ClipType::Video) {
+                // Video: Y_Index = Max - Layer - 1.
+                // Delta = DeltaMax - DeltaLayer.
+                y_offset_rows = (float)max_video_delta - (float)layer_delta;
+            } else {
+                // Audio: Y_Index = Max + Layer.
+                // Delta = DeltaMax + DeltaLayer.
+                y_offset_rows = (float)max_video_delta + (float)layer_delta;
+            }
+            
+            // Calculate pixel position based on current grid anchor and target integer row
+            layer_y = timeline_start.y + (original_y_index_on_drag_start + y_offset_rows) * row_pitch;
+        }
 
         ImVec2 clip_rect_min = ImVec2(clip_start_x, layer_y + layer_padding);
         ImVec2 clip_rect_max = ImVec2(clip_end_x, layer_y + layer_height);
@@ -2487,7 +2598,7 @@ void DrawTimelineEditor(
         }
 
         // Selection
-        if (!resizing_left && !resizing_right && dragging_clip_index == -1 &&
+        if (resizing_left_index == -1 && resizing_right_index == -1 && dragging_clip_index == -1 &&
             ImGui::IsMouseHoveringRect(clip_rect_min, clip_rect_max) && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
             selected_clip = &clip;
             clicked_on_clip = true;
@@ -2507,24 +2618,148 @@ void DrawTimelineEditor(
         if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
 
         if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
-            PushUndo(clips, playhead_time, zoom_factor);
+            // --- 1. INITIALIZATION ---
             if (dragging_clip_index == -1) {
+                PushUndo(clips, playhead_time, zoom_factor);
+
                 dragging_clip_index = i;
                 float mouse_x = ImGui::GetMousePos().x;
                 drag_offset_time = (mouse_x - clip_start_x) / pixels_per_second;
+                drag_start_mouse_pos_for_layer_change = ImGui::GetMousePos();
+                
+                // Store original indices
+                original_layer_on_drag_start = clip.layer;
+                original_max_video_layer_on_drag_start = max_video_layer;
+                
+                // --- CAPTURE START Y INDEX ---
+                original_y_index_on_drag_start = clip.type == ClipType::Video
+                    ? max_video_layer - clip.layer - 1
+                    : max_video_layer + clip.layer;
+
+                if (clip.linked_clip) {
+                    original_linked_layer_on_drag_start = clip.linked_clip->layer;
+                } else {
+                    original_linked_layer_on_drag_start = -1;
+                }
             }
 
+            // --- 2. UPDATE LOGIC ---
             if (dragging_clip_index == i) {
+                // A. Horizontal Time Dragging with Snapping
                 float mouse_x = ImGui::GetMousePos().x;
-                float new_start = (mouse_x - timeline_start.x + scroll_x) / pixels_per_second - drag_offset_time;
-                new_start = std::max(0.0f, new_start);
+                float raw_new_start = (mouse_x - timeline_start.x + scroll_x) / pixels_per_second - drag_offset_time;
+                raw_new_start = std::max(0.0f, raw_new_start);
+                
+                float new_start = raw_new_start;
+                
+                if (snap_enabled) {
+                    float snap_threshold_pixels = 15.0f; // Snap distance in pixels
+                    float snap_threshold_time = snap_threshold_pixels / pixels_per_second;
+                    float best_snap_diff = snap_threshold_time; // Initialize with max allowed diff
+                    
+                    // Snap candidates: 0.0, Playhead, other clips start/end
+                    std::vector<float> snap_points;
+                    snap_points.push_back(0.0f);
+                    snap_points.push_back(playhead_time);
+                    
+                    // Add other clips' start/end
+                    for (size_t other_i = 0; other_i < clips.size(); ++other_i) {
+                        if (i == other_i) continue; // Don't snap to self
+                        if (clips[other_i].selected && clips[other_i].type == clip.type) continue; // Don't snap to other currently dragged clips
+
+                        snap_points.push_back(clips[other_i].start_time);
+                        snap_points.push_back(clips[other_i].start_time + clips[other_i].duration);
+                    }
+                    
+                    // Check for snap on Start
+                    for (float pt : snap_points) {
+                        float diff = std::abs(raw_new_start - pt);
+                        if (diff < best_snap_diff) {
+                            best_snap_diff = diff;
+                            new_start = pt;
+                        }
+                    }
+                    
+                    // Check for snap on End (align end to snap point)
+                    float duration = clip.duration;
+                    for (float pt : snap_points) {
+                        float end_time = raw_new_start + duration;
+                        float diff = std::abs(end_time - pt);
+                        if (diff < best_snap_diff) { // If this is closer than the start-snap
+                            best_snap_diff = diff;
+                            new_start = pt - duration;
+                        }
+                    }
+                }
+
                 float old_start = clip.start_time;
                 clip.start_time = new_start;
 
-                // Sync linked clip's start_time if it's not actively being dragged or resized
                 if (clip.linked_clip && clip.linked_clip != selected_clip) {
                     float delta = new_start - old_start;
                     clip.linked_clip->start_time += delta;
+                }
+
+                // B. Vertical Layer Dragging with Resistance
+                float vertical_delta = ImGui::GetMousePos().y - drag_start_mouse_pos_for_layer_change.y;
+                float row_pitch = layer_height + layer_padding;
+                float continuous_steps = vertical_delta / row_pitch;
+
+                // Determine current visual step offset 'k' based on clip type
+                // k represents "how many Visual Rows we moved down from original position"
+                int current_k = 0;
+                if (clip.type == ClipType::Video) {
+                    // Video: Drag Down (+Y) -> Layer Decreases. 
+                    // Visual Down = Lower Video Layer Index (physically lower in list, but usually visual representation depends on max_layer)
+                    // Let's rely on the previous logic: 
+                    // layer_index_delta = -track_steps
+                    // So track_steps (Visual Change) = -(layer_current - layer_original) = layer_original - layer_current
+                    current_k = original_layer_on_drag_start - clip.layer;
+                } else { // Audio
+                    // Audio: Drag Down (+Y) -> Layer Increases.
+                    // layer_index_delta = track_steps
+                    // track_steps = layer_current - layer_original
+                    current_k = clip.layer - original_layer_on_drag_start;
+                }
+                
+                // Apply Resistance (Hysteresis)
+                // Threshold of 0.6 means we must be 60% into the next/prev row's space to switch.
+                const float resistance_threshold = 0.6f;
+                
+                // Iteratively move k towards continuous_steps if threshold is exceeded
+                while (true) {
+                    float diff = continuous_steps - (float)current_k;
+                    if (diff > resistance_threshold) {
+                        current_k++;
+                    } else if (diff < -resistance_threshold) {
+                        current_k--;
+                    } else {
+                        break; // Stabilized within resistance zone
+                    }
+                }
+
+                // Calculate the layer index delta from the stabilized visual steps 'k'
+                int layer_index_delta = 0;
+                
+                if (clip.type == ClipType::Video) {
+                    layer_index_delta = -current_k; 
+                } else { // Audio
+                    layer_index_delta = current_k;
+                }
+
+                // Apply this SAME delta to the original indices of both clips
+                int new_layer = std::max(0, original_layer_on_drag_start + layer_index_delta);
+
+                // Only apply if the layer actually changed
+                if (new_layer != clip.layer) {
+                    clip.layer = new_layer;
+
+                    // Update linked clip using the SAME numerical delta
+                    if (clip.linked_clip && original_linked_layer_on_drag_start != -1) {
+                        clip.linked_clip->layer = std::max(0, original_linked_layer_on_drag_start + layer_index_delta);
+                    }
+                    
+                    layers_changed = true; 
                 }
             }
         } else if (dragging_clip_index == i) {
@@ -2541,23 +2776,77 @@ void DrawTimelineEditor(
         if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
 
         if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
-            if (!resizing_right) {
+            if (resizing_left_index == -1 && resizing_right_index == -1) {
                 PushUndo(clips, playhead_time, zoom_factor);
-                resizing_left = true;
-                float mouse_x = ImGui::GetMousePos().x;
-                float new_start = (mouse_x - timeline_start.x + scroll_x) / pixels_per_second;
-                float new_duration = clip.start_time + clip.duration - new_start;
-                float delta = new_start - clip.start_time;
-                if (delta > 0.0f) clip.media_start += delta;
-                clip.start_time = std::max(0.0f, new_start);
-                clip.duration = std::max(0.1f, new_duration);
+                resizing_left_index = i;
+            }
+            
+            if (resizing_left_index == i) {
+                 float mouse_x = ImGui::GetMousePos().x;
+                float raw_new_start = (mouse_x - timeline_start.x + scroll_x) / pixels_per_second;
+                
+                float new_start = raw_new_start;
+                if (snap_enabled) {
+                    float snap_threshold_pixels = 15.0f;
+                    float snap_threshold_time = snap_threshold_pixels / pixels_per_second;
+                    float best_snap_diff = snap_threshold_time;
+
+                    std::vector<float> snap_points;
+                    snap_points.push_back(0.0f);
+                    snap_points.push_back(playhead_time);
+                    for (size_t other_i = 0; other_i < clips.size(); ++other_i) {
+                        if (i == other_i) continue;
+                        snap_points.push_back(clips[other_i].start_time);
+                        snap_points.push_back(clips[other_i].start_time + clips[other_i].duration);
+                    }
+
+                    for (float pt : snap_points) {
+                        float diff = std::abs(raw_new_start - pt);
+                        if (diff < best_snap_diff) {
+                            best_snap_diff = diff;
+                            new_start = pt;
+                        }
+                    }
+                }
+
+                // Proposed Logic: Calculate delta
+                float current_start = clip.start_time;
+                float delta = new_start - current_start;
+                
+                // Constraints
+                // 1. Clip media_start + delta >= 0  => delta >= -clip.media_start
+                // 2. Clip start_time + delta >= 0   => delta >= -clip.start_time
+                // 3. Linked clip media_start + delta >= 0
+                // 4. Linked clip start_time + delta >= 0
+                
+                float max_neg_delta = -std::min(clip.media_start, clip.start_time);
+                if (clip.linked_clip && clip.linked_clip != selected_clip) {
+                     float linked_limit = -std::min(clip.linked_clip->media_start, clip.linked_clip->start_time);
+                     max_neg_delta = std::max(max_neg_delta, linked_limit);
+                }
+                
+                if (delta < max_neg_delta) {
+                    delta = max_neg_delta;
+                    new_start = current_start + delta;
+                }
+                
+                // Prevent negative duration
+                if (clip.duration - delta < 0.1f) {
+                     delta = clip.duration - 0.1f;
+                     new_start = current_start + delta;
+                }
+
+                clip.start_time = new_start;
+                clip.duration -= delta;
+                clip.media_start += delta;
 
                 if (clip.linked_clip && clip.linked_clip != selected_clip) {
                     clip.linked_clip->start_time += delta;
-                    clip.linked_clip->duration = clip.duration;
+                    clip.linked_clip->duration -= delta;
+                    clip.linked_clip->media_start += delta;
                 }
             }
-        } else if (resizing_left) resizing_left = false;
+        } else if (resizing_left_index == i) resizing_left_index = -1;
 
         // Right resizing
         ImVec2 right_min = ImVec2(clip_end_x - handle_w / 2, clip_rect_min.y);
@@ -2568,11 +2857,38 @@ void DrawTimelineEditor(
         if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
 
         if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
-            if (!resizing_left) {
+            if (resizing_left_index == -1 && resizing_right_index == -1) {
                 PushUndo(clips, playhead_time, zoom_factor);
-                resizing_right = true;
+                resizing_right_index = i;
+            }
+            if(resizing_right_index == i) {
                 float mouse_x = ImGui::GetMousePos().x;
-                float new_end = (mouse_x - timeline_start.x + scroll_x) / pixels_per_second;
+                float raw_new_end = (mouse_x - timeline_start.x + scroll_x) / pixels_per_second;
+                
+                float new_end = raw_new_end;
+                if (snap_enabled) {
+                    float snap_threshold_pixels = 15.0f;
+                    float snap_threshold_time = snap_threshold_pixels / pixels_per_second;
+                    float best_snap_diff = snap_threshold_time;
+
+                    std::vector<float> snap_points;
+                    snap_points.push_back(0.0f);
+                    snap_points.push_back(playhead_time);
+                    for (size_t other_i = 0; other_i < clips.size(); ++other_i) {
+                        if (i == other_i) continue;
+                        snap_points.push_back(clips[other_i].start_time);
+                        snap_points.push_back(clips[other_i].start_time + clips[other_i].duration);
+                    }
+
+                    for (float pt : snap_points) {
+                        float diff = std::abs(raw_new_end - pt);
+                        if (diff < best_snap_diff) {
+                            best_snap_diff = diff;
+                            new_end = pt;
+                        }
+                    }
+                }
+
                 float old_duration = clip.duration;
                 clip.duration = std::max(0.1f, new_end - clip.start_time);
 
@@ -2581,7 +2897,7 @@ void DrawTimelineEditor(
                     clip.linked_clip->duration += delta;
                 }
             }
-        } else if (resizing_right) resizing_right = false;
+        } else if (resizing_right_index == i) resizing_right_index = -1;
 
         // Create unique ID and hit area for context menu
         ImGui::SetCursorScreenPos(clip_rect_min);
@@ -2826,54 +3142,305 @@ void DrawTimelineEditor(
     ImGui::End();
 }
 
+float GetNiceStep(float range, float pixel_width) {
+    float target_step = range / (pixel_width / 60.0f); // aim for tick every 60px
+    float magnitude = pow(10.0f, floor(log10(target_step)));
+    float normalized = target_step / magnitude;
+    if (normalized < 1.5f) return 1.0f * magnitude;
+    if (normalized < 3.5f) return 2.0f * magnitude;
+    return 5.0f * magnitude;
+}
+
 template<typename T>
 void DrawKeyframeTrackEditor(const std::string& label, KeyframeTrack<T>& track) {
     if (ImGui::TreeNode(label.c_str())) {
-        int to_remove = -1;
+        CurveEditorContext& ctx = g_CurveEditors[label];
 
-        for (size_t i = 0; i < track.keyframes.size(); ++i) {
-            auto& kf = track.keyframes[i];
+        // =========================================================
+        // 1. FIXED HEADER (Controls + Inspector)
+        // =========================================================
+        // We use a Group to ensure this area always exists and keeps layout stable.
+        
+        // Row 1: Global Actions
+        if (ImGui::Button("Add Key")) {
+             Keyframe<T> kf;
+             kf.time = track.keyframes.empty() ? 0.0f : track.keyframes.back().time + 1.0f;
+             kf.value = T{}; 
+             kf.interp = InterpolationType::Bezier;
+             kf.handle_left = { -0.25f, 0.0f };
+             kf.handle_right = { 0.25f, 0.0f };
+             track.keyframes.push_back(kf);
+             std::sort(track.keyframes.begin(), track.keyframes.end(), [](const auto& a, const auto& b) { return a.time < b.time; });
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Fit View")) { ctx.zoom_x = 1.0f; ctx.zoom_y = 1.0f; ctx.pan = ImVec2(0,0); }
+        ImGui::SameLine();
+        ImGui::Checkbox("Snap", &ctx.snap_enabled);
+        ImGui::SameLine();
+        ImGui::TextDisabled("|");
+        ImGui::SameLine();
 
-            ImGui::PushID(static_cast<int>(i));
-            ImGui::Separator();
+        // Row 1 (Continued) or Row 2: Selection Inspector
+        // We render this unconditionally. If no selection, we render dummy/disabled text
+        // to reserve the exact vertical height and prevent "jumping".
+        bool has_selection = (ctx.selected_keyframe_idx >= 0 && ctx.selected_keyframe_idx < track.keyframes.size());
+        
+        if (has_selection) {
+            auto& sel_kf = track.keyframes[ctx.selected_keyframe_idx];
+            
+            ImGui::SetNextItemWidth(60);
+            ImGui::DragFloat("##sel_time", &sel_kf.time, 0.01f, 0.0f, 0.0f, "T:%.3f");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Keyframe Time");
+            ImGui::SameLine();
+            
+            ImGui::SetNextItemWidth(60);
+            if constexpr (std::is_same_v<T, float>) {
+                ImGui::DragFloat("##sel_val", &sel_kf.value, 0.01f, 0.0f, 0.0f, "V:%.3f");
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Keyframe Value");
+            }
+            ImGui::SameLine();
 
-            // --- Editable Time
             ImGui::SetNextItemWidth(80);
-            ImGui::DragFloat("Time", &kf.time, 0.01f, 0.0f, 999.0f, "%.3f");
-
-            ImGui::SameLine();
-            // --- Editable Value
-            ImGui::SetNextItemWidth(120);
-            ImGui::DragScalar("Value", ImGuiDataType_Float, &kf.value, 0.01f);
-
-            ImGui::SameLine();
-            // --- Interpolation Type
-            const char* interp_labels[] = {"Linear", "EaseInOut", "Hold"};
-            int interp_idx = static_cast<int>(kf.interp);
-            ImGui::SetNextItemWidth(100);
-            if (ImGui::Combo("Interp", &interp_idx, interp_labels, IM_ARRAYSIZE(interp_labels))) {
-                kf.interp = static_cast<InterpolationType>(interp_idx);
+            const char* interp_labels[] = { "Linear", "Ease", "Hold", "Bezier" };
+            int current_interp = static_cast<int>(sel_kf.interp);
+            if (ImGui::Combo("##sel_type", &current_interp, interp_labels, IM_ARRAYSIZE(interp_labels))) {
+                sel_kf.interp = static_cast<InterpolationType>(current_interp);
+                if (sel_kf.interp == InterpolationType::Bezier) {
+                    sel_kf.handle_right = { 0.25f, 0.0f };
+                    if (ctx.selected_keyframe_idx + 1 < track.keyframes.size()) 
+                         track.keyframes[ctx.selected_keyframe_idx+1].handle_left = { -0.25f, 0.0f };
+                }
             }
-
             ImGui::SameLine();
-            if (ImGui::Button("Delete")) {
-                to_remove = static_cast<int>(i);
+            if (ImGui::Button("Delete")) { 
+                track.keyframes.erase(track.keyframes.begin() + ctx.selected_keyframe_idx);
+                ctx.selected_keyframe_idx = -1;
+                ctx.dragging_keyframe_idx = -1;
             }
-
-            ImGui::PopID();
+        } else {
+            // Render spacers that match the height of the inputs above
+            // This keeps the graph from jumping up when you deselect.
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextDisabled("No Keyframe Selected");
+            // Add a dummy button size to match the trash icon height if needed
+            ImGui::SameLine(); ImGui::Dummy(ImVec2(1, ImGui::GetFrameHeight())); 
         }
 
-        if (to_remove >= 0) {
-            track.keyframes.erase(track.keyframes.begin() + to_remove);
+        // =========================================================
+        // 2. CANVAS SETUP
+        // =========================================================
+        ImGui::Spacing();
+        ImVec2 canvas_sz(ImGui::GetContentRegionAvail().x, 300.0f);
+        ImVec2 canvas_p0 = ImGui::GetCursorScreenPos();
+        ImVec2 canvas_p1 = ImVec2(canvas_p0.x + canvas_sz.x, canvas_p0.y + canvas_sz.y);
+        ImDrawList* draw = ImGui::GetWindowDrawList();
+
+        // Layout: Gutter for axes
+        const float AXIS_LEFT_WIDTH = 50.0f;
+        const float AXIS_BOTTOM_HEIGHT = 30.0f;
+        ImVec2 graph_p0 = ImVec2(canvas_p0.x + AXIS_LEFT_WIDTH, canvas_p0.y);
+        ImVec2 graph_p1 = ImVec2(canvas_p1.x, canvas_p1.y - AXIS_BOTTOM_HEIGHT);
+
+        // Colors
+        ImU32 col_bg = IM_COL32(30, 30, 35, 255);
+        ImU32 col_axis_bg = IM_COL32(40, 40, 45, 255);
+        ImU32 col_grid = IM_COL32(255, 255, 255, 15);
+        ImU32 col_text = IM_COL32(180, 180, 180, 255);
+        ImU32 col_border = IM_COL32(60, 60, 70, 255);
+
+        draw->AddRectFilled(canvas_p0, canvas_p1, col_axis_bg);
+        draw->AddRectFilled(graph_p0, graph_p1, col_bg);
+
+        // Transforms
+        float time_scale = 100.0f * ctx.zoom_x;
+        float val_scale = 50.0f * ctx.zoom_y;
+        float graph_h = graph_p1.y - graph_p0.y;
+
+        auto TimeToScreen = [&](float t) { return graph_p0.x + (t * time_scale) + ctx.pan.x; };
+        auto ValToScreen  = [&](float v) { return graph_p0.y + (graph_h * 0.5f) - (v * val_scale) + ctx.pan.y; };
+        auto ScreenToTime = [&](float x) { return (x - graph_p0.x - ctx.pan.x) / time_scale; };
+        auto ScreenToVal  = [&](float y) { return -((y - graph_p0.y - ctx.pan.y) - (graph_h * 0.5f)) / val_scale; };
+
+        draw->PushClipRect(graph_p0, graph_p1, true);
+
+        // --- Grid ---
+        float t_min = ScreenToTime(graph_p0.x), t_max = ScreenToTime(graph_p1.x);
+        float v_min = ScreenToVal(graph_p1.y), v_max = ScreenToVal(graph_p0.y);
+        float t_step = GetNiceStep(t_max - t_min, graph_p1.x - graph_p0.x);
+        float v_step = GetNiceStep(v_max - v_min, graph_p1.y - graph_p0.y);
+
+        for (float t = floor(t_min / t_step) * t_step; t < t_max + t_step; t += t_step) {
+            float x = TimeToScreen(t);
+            draw->AddLine(ImVec2(x, graph_p0.y), ImVec2(x, graph_p1.y), col_grid);
+        }
+        for (float v = floor(v_min / v_step) * v_step; v < v_max + v_step; v += v_step) {
+            float y = ValToScreen(v);
+            draw->AddLine(ImVec2(graph_p0.x, y), ImVec2(graph_p1.x, y), col_grid);
+        }
+        
+        float y_zero = ValToScreen(0.0f);
+        if(y_zero > graph_p0.y && y_zero < graph_p1.y)
+            draw->AddLine(ImVec2(graph_p0.x, y_zero), ImVec2(graph_p1.x, y_zero), IM_COL32(100, 200, 255, 40));
+
+        // Input Handling
+        ImGui::SetCursorScreenPos(graph_p0);
+        ImGui::InvisibleButton("##graph_input", ImVec2(graph_p1.x - graph_p0.x, graph_p1.y - graph_p0.y));
+        bool is_hovered = ImGui::IsItemHovered();
+        bool is_active = ImGui::IsItemActive();
+        bool is_mouse_clicked = ImGui::IsMouseClicked(0);
+        ImVec2 mouse_pos = ImGui::GetMousePos();
+
+        // Pan/Zoom
+        if (is_active && (ImGui::IsMouseDragging(ImGuiMouseButton_Middle) || (ImGui::IsMouseDragging(ImGuiMouseButton_Left) && ImGui::GetIO().KeyAlt))) {
+            ctx.pan.x += ImGui::GetIO().MouseDelta.x;
+            ctx.pan.y += ImGui::GetIO().MouseDelta.y;
+        }
+        if (is_hovered && ImGui::GetIO().MouseWheel != 0.0f) {
+             if (ImGui::GetIO().KeyCtrl) ctx.zoom_y *= (ImGui::GetIO().MouseWheel > 0 ? 1.1f : 0.9f);
+             else ctx.zoom_x *= (ImGui::GetIO().MouseWheel > 0 ? 1.1f : 0.9f);
         }
 
-        // Add new keyframe button
-        if (ImGui::Button("Add Keyframe")) {
-            track.keyframes.push_back(Keyframe<T>{
-                0.0f,    // time
-                T{},     // value (default-constructed)
-                InterpolationType::Linear
-            });
+        // =========================================================
+        // 3. DRAW CURVES & HIT TESTING
+        // =========================================================
+        bool clicked_any_item = false; // Track if we hit anything this frame
+
+        if constexpr (std::is_same_v<T, float>) {
+            for (size_t i = 0; i < track.keyframes.size(); ++i) {
+                auto& kf = track.keyframes[i];
+                ImVec2 p_kf(TimeToScreen(kf.time), ValToScreen(kf.value));
+                bool is_selected = (static_cast<int>(i) == ctx.selected_keyframe_idx);
+
+                if (i < track.keyframes.size() - 1) {
+                    auto& next_kf = track.keyframes[i+1];
+                    ImVec2 p_next(TimeToScreen(next_kf.time), ValToScreen(next_kf.value));
+
+                    if (kf.interp == InterpolationType::Bezier) {
+                        ImVec2 p_h1(TimeToScreen(kf.time + kf.handle_right.x), ValToScreen(kf.value + kf.handle_right.y));
+                        ImVec2 p_h2(TimeToScreen(next_kf.time + next_kf.handle_left.x), ValToScreen(next_kf.value + next_kf.handle_left.y));
+                        draw->AddBezierCubic(p_kf, p_h1, p_h2, p_next, IM_COL32(255, 180, 0, 255), 2.0f);
+                        
+                        if (is_selected || static_cast<int>(i+1) == ctx.selected_keyframe_idx) {
+                            draw->AddLine(p_kf, p_h1, IM_COL32(150,150,150,100));
+                            draw->AddLine(p_next, p_h2, IM_COL32(150,150,150,100));
+                            draw->AddCircleFilled(p_h1, 4.0f, IM_COL32(255,255,255,200));
+                            draw->AddCircleFilled(p_h2, 4.0f, IM_COL32(255,255,255,200));
+
+                            if (is_active && is_mouse_clicked) {
+                                float d1 = pow(mouse_pos.x - p_h1.x, 2) + pow(mouse_pos.y - p_h1.y, 2);
+                                float d2 = pow(mouse_pos.x - p_h2.x, 2) + pow(mouse_pos.y - p_h2.y, 2);
+                                if (d1 < 64) { ctx.dragging_keyframe_idx = i; ctx.dragging_handle_id = 2; clicked_any_item = true; } 
+                                else if (d2 < 64) { ctx.dragging_keyframe_idx = i+1; ctx.dragging_handle_id = 1; clicked_any_item = true; } 
+                            }
+                        }
+                    } else if (kf.interp == InterpolationType::Linear) {
+                        draw->AddLine(p_kf, p_next, IM_COL32(255, 180, 0, 255), 2.0f);
+                    } else if (kf.interp == InterpolationType::Hold) {
+                        ImVec2 p_mid(p_next.x, p_kf.y);
+                        draw->AddLine(p_kf, p_mid, IM_COL32(255, 180, 0, 255), 2.0f);
+                        draw->AddLine(p_mid, p_next, IM_COL32(255, 180, 0, 255), 2.0f);
+                    }
+                }
+
+                draw->AddCircleFilled(p_kf, 5.0f, is_selected ? IM_COL32(255,255,255,255) : IM_COL32(255,180,0,255));
+                draw->AddCircle(p_kf, 6.0f, IM_COL32(0,0,0,255));
+
+                if (is_active && is_mouse_clicked) {
+                    float dist = pow(mouse_pos.x - p_kf.x, 2) + pow(mouse_pos.y - p_kf.y, 2);
+                    if (dist < 64) { 
+                        ctx.dragging_keyframe_idx = i; 
+                        ctx.dragging_handle_id = 0; 
+                        ctx.selected_keyframe_idx = i; // Select
+                        clicked_any_item = true; 
+                    }
+                }
+            }
+        }
+
+        draw->PopClipRect();
+
+        // --- DESELECT LOGIC ---
+        // If we clicked inside the graph but NOT on any item, deselect.
+        if (is_hovered && is_mouse_clicked && !clicked_any_item && !ImGui::GetIO().KeyAlt) {
+            ctx.selected_keyframe_idx = -1;
+        }
+
+        // =========================================================
+        // 4. DRAW AXES LABELS (Outside Clip)
+        // =========================================================
+        draw->PushClipRect(ImVec2(canvas_p0.x, canvas_p0.y), ImVec2(graph_p0.x, graph_p1.y), true);
+        for (float v = floor(v_min / v_step) * v_step; v < v_max + v_step; v += v_step) {
+            float y = ValToScreen(v);
+            if (y >= graph_p0.y && y <= graph_p1.y) {
+                draw->AddLine(ImVec2(graph_p0.x - 5, y), ImVec2(graph_p0.x, y), col_text);
+                char buf[16]; sprintf(buf, "%.2f", v);
+                ImVec2 txt_sz = ImGui::CalcTextSize(buf);
+                draw->AddText(ImVec2(graph_p0.x - 8 - txt_sz.x, y - txt_sz.y * 0.5f), col_text, buf);
+            }
+        }
+        draw->PopClipRect();
+
+        draw->PushClipRect(ImVec2(graph_p0.x, graph_p1.y), ImVec2(graph_p1.x, canvas_p1.y), true);
+        for (float t = floor(t_min / t_step) * t_step; t < t_max + t_step; t += t_step) {
+            float x = TimeToScreen(t);
+            if (x >= graph_p0.x && x <= graph_p1.x) {
+                draw->AddLine(ImVec2(x, graph_p1.y), ImVec2(x, graph_p1.y + 5), col_text);
+                char buf[16]; sprintf(buf, "%.2f", t);
+                draw->AddText(ImVec2(x + 3, graph_p1.y + 5), col_text, buf);
+            }
+        }
+        draw->PopClipRect();
+        
+        draw->AddRect(canvas_p0, canvas_p1, col_border);
+        draw->AddLine(ImVec2(graph_p0.x, graph_p0.y), ImVec2(graph_p0.x, graph_p1.y), col_border);
+        draw->AddLine(ImVec2(graph_p0.x, graph_p1.y), ImVec2(graph_p1.x, graph_p1.y), col_border);
+
+        // =========================================================
+        // 5. DRAGGING & SNAPPING
+        // =========================================================
+        if (ImGui::IsMouseDown(0) && ctx.dragging_keyframe_idx != -1 && !ImGui::GetIO().KeyAlt) {
+            int idx = ctx.dragging_keyframe_idx;
+            if (idx >= 0 && idx < track.keyframes.size()) {
+                auto& kf = track.keyframes[idx];
+                auto ApplySnap = [&](float val, float step) { return ctx.snap_enabled ? round(val / step) * step : val; };
+
+                if (ctx.dragging_handle_id == 0) { // Keyframe
+                    float new_t = ApplySnap(ScreenToTime(mouse_pos.x), 0.1f);
+                    float new_v = ApplySnap(ScreenToVal(mouse_pos.y), 0.1f);
+                    
+                    if(new_t < 0.0f) new_t = 0.0f;
+                    kf.time = new_t;
+                    if constexpr (std::is_same_v<T, float>) kf.value = new_v;
+                }
+                else if (ctx.dragging_handle_id == 1) { // Left
+                    float dx = ScreenToTime(mouse_pos.x) - kf.time;
+                    float dy = ScreenToVal(mouse_pos.y) - kf.value;
+                    if(ctx.snap_enabled) { dx = ApplySnap(dx, 0.05f); dy = ApplySnap(dy, 0.05f); }
+                    kf.handle_left.x = dx; kf.handle_left.y = dy;
+                    if (kf.handle_left.x > 0) kf.handle_left.x = 0; 
+                }
+                else if (ctx.dragging_handle_id == 2) { // Right
+                    float dx = ScreenToTime(mouse_pos.x) - kf.time;
+                    float dy = ScreenToVal(mouse_pos.y) - kf.value;
+                    if(ctx.snap_enabled) { dx = ApplySnap(dx, 0.05f); dy = ApplySnap(dy, 0.05f); }
+                    kf.handle_right.x = dx; kf.handle_right.y = dy;
+                    if (kf.handle_right.x < 0) kf.handle_right.x = 0;
+                }
+            }
+        } 
+        else if (ImGui::IsMouseReleased(0)) {
+            if (ctx.dragging_keyframe_idx != -1 && ctx.dragging_handle_id == 0) {
+                auto* dragged_kf = &track.keyframes[ctx.dragging_keyframe_idx];
+                std::sort(track.keyframes.begin(), track.keyframes.end(), [](const auto& a, const auto& b) { return a.time < b.time; });
+                // Re-find selection after sort
+                for(int i=0; i<track.keyframes.size(); ++i) {
+                    if (track.keyframes[i].time == dragged_kf->time && track.keyframes[i].value == dragged_kf->value) {
+                        ctx.selected_keyframe_idx = i; break;
+                    }
+                }
+            }
+            ctx.dragging_keyframe_idx = -1;
+            ctx.dragging_handle_id = -1;
         }
 
         ImGui::TreePop();
@@ -3316,6 +3883,77 @@ void DrawNodeEditorWindow(Clip* clip) {
     if (clip && clip->effect_graph) {
         auto& graph = clip->effect_graph;
 
+        // --- DELETION LOGIC (Moved to start to avoid context issues) ---
+        // Handle deletion before drawing the editor to ensure valid context
+        
+        // Update global active state for the main loop to see
+        node_editor_active = ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows);
+
+        if (node_editor_active && ImGui::IsKeyReleased(ImGuiKey_Delete)) {
+             bool graph_changed = false;
+
+            // Delete selected links
+            int num_selected_links = ImNodes::NumSelectedLinks();
+            if (num_selected_links > 0) {
+                std::vector<int> selected_links(num_selected_links);
+                ImNodes::GetSelectedLinks(selected_links.data());
+                
+                auto& links_vec = graph->links;
+                for (int link_id : selected_links) {
+                    links_vec.erase(
+                        std::remove_if(links_vec.begin(), links_vec.end(), [link_id](const Link& link) {
+                            return link.id == link_id;
+                        }),
+                        links_vec.end()
+                    );
+                }
+                graph_changed = true;
+            }
+
+            // Delete selected nodes
+            int num_selected_nodes = ImNodes::NumSelectedNodes();
+            if (num_selected_nodes > 0) {
+                std::vector<int> selected_nodes(num_selected_nodes);
+                ImNodes::GetSelectedNodes(selected_nodes.data());
+                
+                for (int node_id : selected_nodes) {
+                    // Don't delete the Output Node!
+                    if (node_id == graph->output_node_id) continue;
+                    // Don't delete the Input Node!
+                    if (node_id == graph->input_node_id) continue;
+
+                    // Safety Check: If we are deleting the node currently being edited in Smart Mask Editor
+                    if (current_editing_smart_mask_node && current_editing_smart_mask_node->id == node_id) {
+                        current_editing_smart_mask_node = nullptr;
+                        smart_mask_editor_open = false;
+                    }
+
+                    // Remove all links connected to this node
+                    auto& links_vec = graph->links;
+                    links_vec.erase(
+                        std::remove_if(links_vec.begin(), links_vec.end(), [node_id](const Link& link) {
+                            return link.from_node_id == node_id || link.to_node_id == node_id;
+                        }),
+                        links_vec.end()
+                    );
+
+                    // Remove the node itself
+                    graph->nodes.erase(node_id);
+
+                    // Clear selection if needed
+                    if (selected_node_id == node_id) {
+                        selected_node_id = -1;
+                    }
+                }
+                graph_changed = true;
+            }
+
+            if (graph_changed) {
+                graph->rebuild_order_from_links();
+            }
+        }
+        // ----------------------------------------------------------------
+
         ImNodes::BeginNodeEditor();
 
         // Open the popup on Shift+A. We check IsWindowHovered to make sure
@@ -3382,7 +4020,7 @@ void DrawNodeEditorWindow(Clip* clip) {
             };
 
             // 3. Check for Enter key press on the top result.
-            if ((ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter)) && !scored_results.empty()) {
+            if ((ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter)) && !scored_results.empty() && !ImGui::IsAnyItemFocused()) {
                 add_selected_node(scored_results.front().name);
             }
 
@@ -3405,6 +4043,36 @@ void DrawNodeEditorWindow(Clip* clip) {
 
         // --- Render Nodes and Pins ---
         for (auto const& [node_id, node_ptr] : graph->nodes) {
+            // --- Node Coloring Logic ---
+            ImU32 title_color = IM_COL32(255, 143, 38, 255); // Default Orange (Effects)
+            ImU32 title_hovered = IM_COL32(255, 171, 64, 255);
+            ImU32 title_selected = IM_COL32(255, 107, 0, 255);
+
+            if (std::dynamic_pointer_cast<SourceClipNode>(node_ptr) || 
+                std::dynamic_pointer_cast<EmptySourceNode>(node_ptr)) {
+                // Source/Input: Green
+                title_color = IM_COL32(76, 175, 80, 255);
+                title_hovered = IM_COL32(102, 187, 106, 255);
+                title_selected = IM_COL32(56, 142, 60, 255);
+            } else if (std::dynamic_pointer_cast<FinalOutputNode>(node_ptr)) {
+                // Output: Red
+                title_color = IM_COL32(211, 47, 47, 255);
+                title_hovered = IM_COL32(229, 57, 53, 255);
+                title_selected = IM_COL32(183, 28, 28, 255);
+            } else if (std::dynamic_pointer_cast<MergeNode>(node_ptr) || 
+                       std::dynamic_pointer_cast<TransformNode>(node_ptr) ||
+                       std::dynamic_pointer_cast<TrackerNode>(node_ptr)) {
+                // Utility: Blue/Purple
+                title_color = IM_COL32(63, 81, 181, 255);
+                title_hovered = IM_COL32(92, 107, 192, 255);
+                title_selected = IM_COL32(48, 63, 159, 255);
+            }
+            // Else: Default Orange for Effects
+
+            ImNodes::PushColorStyle(ImNodesCol_TitleBar, title_color);
+            ImNodes::PushColorStyle(ImNodesCol_TitleBarHovered, title_hovered);
+            ImNodes::PushColorStyle(ImNodesCol_TitleBarSelected, title_selected);
+
             ImNodes::BeginNode(node_id);
             
             ImNodes::BeginNodeTitleBar();
@@ -3412,9 +4080,11 @@ void DrawNodeEditorWindow(Clip* clip) {
             ImNodes::EndNodeTitleBar();
 
             for (const auto& pin : node_ptr->input_pins) {
+                ImNodes::PushAttributeFlag(ImNodesAttributeFlags_EnableLinkDetachWithDragClick);
                 ImNodes::BeginInputAttribute(pin.id);
                 ImGui::TextUnformatted(pin.name.c_str());
                 ImNodes::EndInputAttribute();
+                ImNodes::PopAttributeFlag();
             }
 
             for (const auto& pin : node_ptr->output_pins) {
@@ -3424,6 +4094,10 @@ void DrawNodeEditorWindow(Clip* clip) {
             }
 
             ImNodes::EndNode();
+
+            ImNodes::PopColorStyle();
+            ImNodes::PopColorStyle();
+            ImNodes::PopColorStyle();
         }
 
         // --- Render Links ---
@@ -3432,6 +4106,8 @@ void DrawNodeEditorWindow(Clip* clip) {
         }
 
         ImNodes::EndNodeEditor();
+
+
 
         const int num_selected_nodes = ImNodes::NumSelectedNodes();
         if (num_selected_nodes == 1) {
@@ -3447,6 +4123,8 @@ void DrawNodeEditorWindow(Clip* clip) {
         for (auto const& [node_id, node_ptr] : graph->nodes) {
             node_ptr->editor_pos = ImNodes::GetNodeEditorSpacePos(node_id);
         }
+
+
 
         // --- NEW & CORRECTED Link Management for Intuitive UX ---
 
@@ -3486,6 +4164,17 @@ void DrawNodeEditorWindow(Clip* clip) {
         }
 
         // 2. Handle DELETING links by dragging them off a pin
+        int destroyed_link_id;
+        if (ImNodes::IsLinkDestroyed(&destroyed_link_id)) {
+            auto& links_vec = graph->links;
+            links_vec.erase(
+                std::remove_if(links_vec.begin(), links_vec.end(), [destroyed_link_id](const Link& link) {
+                    return link.id == destroyed_link_id;
+                }),
+                links_vec.end()
+            );
+            graph->rebuild_order_from_links();
+        }
         int dropped_pin_id;
         // The 'true' argument is crucial: it reports drops that started from an existing link.
         if (ImNodes::IsLinkDropped(&dropped_pin_id, true)) {
@@ -3503,6 +4192,8 @@ void DrawNodeEditorWindow(Clip* clip) {
             graph->rebuild_order_from_links();
         }
         // --- END NEW & CORRECTED LOGIC ---
+
+
     } else {
         ApplyWindowBackgroundGradients();
         // --- NEW: Display a helpful message when no clip is selected ---
@@ -3857,7 +4548,259 @@ void DrawNodeInspectorWindow(Clip* clip, GLResources& gl_resources) {
         }
         
         if (ImGui::DragFloat("Font Size", &text_node->font_size, 1.0f, 8.0f, 256.0f)) {
-            text_node->needs_rebake = true;
+            // text_node->needs_rebake = true; // Optimization: We now scale the SDF quads, so no rebake needed!
+        }
+        // --- NEW: Rebake on Release for Maximum Quality ---
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            // User finished dragging. Let's rebake at the new size if it's larger than our current baked size,
+            // or just always rebake to ensure crispness (SDFs are best when rendered at 1:1 or downscaled).
+            // Actually, for SDFs, having a fixed high-res (e.g. 96) is usually enough.
+            // But if the user drags to 200, 96 might look soft.
+            // So let's update baked_font_size to match current font_size (with a minimum of 96).
+            float new_baked_size = std::clamp(text_node->font_size, 64.0f, 128.0f); // Cap at 128 to ensure it fits in atlas
+            if (std::abs(text_node->baked_font_size - new_baked_size) > 1.0f) {
+                text_node->baked_font_size = new_baked_size;
+                text_node->needs_rebake = true; 
+            }
+        }
+
+        // --- NEW: Layout Controls ---
+        ImGui::DragFloat("Letter Spacing", &text_node->letter_spacing, 0.05f, -10.0f, 50.0f); // Pixels or relative? Let's treat as pixels for now, or maybe small float if relative.
+        
+        const char* align_names[] = { "Left", "Center", "Right" };
+        int current_align = static_cast<int>(text_node->alignment);
+        if (ImGui::Combo("Alignment", &current_align, align_names, IM_ARRAYSIZE(align_names))) {
+            text_node->alignment = static_cast<TextEffectNode::Alignment>(current_align);
+        }
+
+        // --- NEW: Font Dropdown with Previews (Lazy Loaded) ---
+        struct FontMetadata {
+            std::string path;
+            std::string name;
+        };
+        static std::vector<FontMetadata> system_fonts;
+        static bool fonts_scanned = false;
+        
+        // Cache for previews: Path -> TextureID
+        static std::map<std::string, GLuint> font_preview_cache;
+
+        if (ImGui::TreeNode("Font Selection")) {
+            // 1. Scan fonts if needed
+            if (!fonts_scanned) {
+                // Determine system font directory (Windows)
+                // We could use SHGetFolderPath but hardcoded is okay for now given constraints.
+                std::string font_dir = "C:\\Windows\\Fonts";
+                try {
+                    if (std::filesystem::exists(font_dir)) {
+                        for (const auto& entry : std::filesystem::directory_iterator(font_dir)) {
+                            if (entry.is_regular_file()) {
+                                std::string ext = entry.path().extension().string();
+                                std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+                                if (ext == ".ttf" || ext == ".otf") {
+                                    std::string file_path = entry.path().string();
+                                    std::string friendly_name = entry.path().filename().string(); 
+                                    
+                                    // Get friendly name (re-using previous logic essentially)
+                                    // Use explicit error handling
+                                    std::ifstream f(file_path, std::ios::binary | std::ios::ate);
+                                    if (f.is_open()) {
+                                        std::streamsize size = f.tellg();
+                                        if (size > 100) { // Safety check: file must be reasonably large for a font
+                                            f.seekg(0, std::ios::beg);
+                                            std::vector<unsigned char> data(size);
+                                            if (f.read((char*)data.data(), size)) {
+                                                // VALIDATE MAGIC NUMBER to prevent crashes on collections or junk
+                                                uint32_t magic = ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) | ((uint32_t)data[2] << 8) | (uint32_t)data[3];
+                                                bool valid_header = (magic == 0x00010000) || (magic == 0x4F54544F) || (magic == 0x74727565); // 1.0, OTTO, true
+                                                
+                                                if (valid_header) {
+                                                    stbtt_fontinfo info;
+                                                    if (stbtt_InitFont(&info, data.data(), 0)) {
+                                                        int length = 0;
+                                                        const char* name_ptr = stbtt_GetFontNameString(&info, &length, 1, 0, 0, 4); // Mac ID
+                                                        if (name_ptr && length > 0) friendly_name = std::string(name_ptr, length);
+                                                        else {
+                                                            name_ptr = stbtt_GetFontNameString(&info, &length, 3, 1, 0x409, 4); // Win ID
+                                                            if (!name_ptr) name_ptr = stbtt_GetFontNameString(&info, &length, 3, 1, 0x409, 1);
+                                                            if (name_ptr && length > 0) {
+                                                                std::string ascii_name;
+                                                                for (int i = 0; i < length; i += 2) if (name_ptr[i] == 0 && name_ptr[i+1] >= 32 && name_ptr[i+1] <= 126) ascii_name += name_ptr[i+1];
+                                                                if (!ascii_name.empty()) friendly_name = ascii_name;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    system_fonts.push_back({file_path, friendly_name});
+                                }
+                            }
+                        }
+                        
+                        std::sort(system_fonts.begin(), system_fonts.end(), [](const FontMetadata& a, const FontMetadata& b) { return a.name < b.name; });
+                    }
+                } catch (...) {
+                    // Ignore errors during enumeration (e.g. permission denied)
+                }
+                fonts_scanned = true;
+            }
+
+            // 2. Display Combo with Clipper
+            // We use a custom PreviewValue for the combo box itself
+            std::string preview_text = "Select a font...";
+            for(const auto& f : system_fonts) if(f.path == text_node->font_path) preview_text = f.name;
+
+            if (ImGui::BeginCombo("System Fonts", preview_text.c_str())) {
+                
+                ImGuiListClipper clipper;
+                clipper.Begin(system_fonts.size());
+                
+                while (clipper.Step()) {
+                    for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; i++) {
+                        const auto& font_md = system_fonts[i];
+                        bool is_selected = (text_node->font_path == font_md.path);
+                        
+                        // Lazy Load Preview Texture
+                        GLuint tex_id = 0;
+                        if (font_preview_cache.find(font_md.path) == font_preview_cache.end()) {
+                            // Generate texture (Fail-safe)
+                             font_preview_cache[font_md.path] = 0; // Mark as visited/failed by default. Only update if success.
+                             try {
+                                 std::ifstream f(font_md.path, std::ios::binary | std::ios::ate);
+                                 if (f.is_open()) {
+                                     std::streamsize size = f.tellg();
+                                     if (size > 100) { // Safety check
+                                         f.seekg(0, std::ios::beg);
+                                         std::vector<unsigned char> data(size);
+                                         if (f.read((char*)data.data(), size)) {
+                                             // VALIDATE MAGIC NUMBER to prevent crashes on collections or junk
+                                             uint32_t magic = ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) | ((uint32_t)data[2] << 8) | (uint32_t)data[3];
+                                             bool valid_header = (magic == 0x00010000) || (magic == 0x4F54544F) || (magic == 0x74727565); // 1.0, OTTO, true
+                                             
+                                             if (valid_header) {
+                                                 stbtt_fontinfo info;
+                                                 if (stbtt_InitFont(&info, data.data(), 0)) {
+                                                     float height = 24.0f; // Preview height
+                                                     float scale = stbtt_ScaleForPixelHeight(&info, height);
+                                                 
+                                                    int ascent, descent, lineGap;
+                                                    stbtt_GetFontVMetrics(&info, &ascent, &descent, &lineGap);
+                                                    int baseline = (int)(ascent * scale);
+                                                    
+                                                    // Sanitize text to ASCII only to avoid signed char/UTF-8 issues causing crashes in stbtt
+                                                    std::string raw_name = font_md.name;
+                                                    std::string text = "";
+                                                    for (unsigned char c : raw_name) {
+                                                        if (c >= 32 && c <= 126) text += (char)c;
+                                                    }
+                                                    if (text.empty()) text = "Abc"; // Fallback if name is all weird symbols
+
+                                                    int width = 0;
+                                                    for(char c : text) {
+                                                        int adv, lsb;
+                                                        stbtt_GetCodepointHMetrics(&info, c, &adv, &lsb);
+                                                        // Sanity clamp to prevent massive widths from bad fonts
+                                                        float scaled_adv = adv * scale;
+                                                        if (scaled_adv < 0 || scaled_adv > 200) scaled_adv = 20; 
+                                                        width += (int)(scaled_adv);
+                                                    }
+                                                
+                                                    // Create bitmap
+                                                    if (width > 0 && width < 2048) { // Capped at 2048 for safety
+                                                        std::vector<unsigned char> bitmap(width * (int)height, 0);
+                                                        int x = 0;
+                                                        for(char c : text) {
+                                                            int ax, lsb;
+                                                            stbtt_GetCodepointHMetrics(&info, c, &ax, &lsb);
+                                                            int c_w, c_h, c_xoff, c_yoff;
+                                                            unsigned char* c_bitmap = stbtt_GetCodepointBitmap(&info, scale, scale, c, &c_w, &c_h, &c_xoff, &c_yoff);
+                                                            
+                                                            if (c_bitmap) {
+                                                                for (int iy = 0; iy < c_h; ++iy) {
+                                                                    for (int ix = 0; ix < c_w; ++ix) {
+                                                                        int target_x = x + c_xoff + ix;
+                                                                        int target_y = baseline + c_yoff + iy;
+                                                                        if (target_x >= 0 && target_x < width && target_y >= 0 && target_y < height) {
+                                                                            bitmap[target_y * width + target_x] = c_bitmap[iy * c_w + ix];
+                                                                        }
+                                                                    }
+                                                                }
+                                                                stbtt_FreeBitmap(c_bitmap, nullptr);
+                                                            }
+                                                            // Clamp advance here too to match width calculation!
+                                                            float scaled_adv = ax * scale;
+                                                            if (scaled_adv < 0 || scaled_adv > 200) scaled_adv = 20;
+                                                            x += (int)(scaled_adv);
+                                                        }
+                                                        
+                                                        // Convert 8-bit alpha to 32-bit RGBA (White text)
+                                                        std::vector<unsigned char> rgba(width * (int)height * 4, 0);
+                                                        for(int px=0; px < width * (int)height; ++px) {
+                                                            unsigned char alpha = bitmap[px];
+                                                            rgba[px*4 + 0] = 255;
+                                                            rgba[px*4 + 1] = 255;
+                                                            rgba[px*4 + 2] = 255;
+                                                            rgba[px*4 + 3] = alpha;
+                                                        }
+                                                        
+                                                        glGenTextures(1, &tex_id);
+                                                        glBindTexture(GL_TEXTURE_2D, tex_id);
+                                                        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, (int)height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+                                                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                                                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+                                                        // Store success
+                                                        font_preview_cache[font_md.path] = tex_id;
+                                                    }
+                                                }
+                                             }
+                                         }
+                                     }
+                                 }
+                                 // If invalid header or failed read, we leave cache as 0 (failed)
+                             } catch (...) {
+                                 // Catch all errors (including some SEH if compiler configured) and keep tex_id as 0
+                             } 
+                        } else {
+                            tex_id = font_preview_cache[font_md.path];
+                        }
+                        
+                        // Render Item using Selectable for functionality + Image/Text for display
+                        ImGui::PushID(i);
+                        // Get cursor pos for overlay
+                        ImVec2 p = ImGui::GetCursorScreenPos();
+                        
+                        if (ImGui::Selectable("##item", is_selected, 0, ImVec2(0, 30))) { 
+                            text_node->font_path = font_md.path;
+                            text_node->needs_rebake = true;
+                        }
+                        
+                        if (tex_id != 0) {
+                            int w = 0;
+                            glBindTexture(GL_TEXTURE_2D, tex_id);
+                            glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
+                            
+                            // Draw image overlay manually to avoid layout issues
+                            // p is top-left of the selectable item. 
+                            // Add slightly offset padding (e.g. 5px x, 3px y)
+                            ImGui::GetWindowDrawList()->AddImage((ImTextureID)(intptr_t)tex_id, 
+                                ImVec2(p.x + 5, p.y + 3), 
+                                ImVec2(p.x + 5 + (float)w, p.y + 3 + 24.0f));
+                        } else {
+                            // Draw text overlay if no preview
+                             ImGui::GetWindowDrawList()->AddText(ImVec2(p.x + 5, p.y + 5), ImGui::GetColorU32(ImGuiCol_Text), font_md.name.c_str());
+                        }
+
+                        if (is_selected) ImGui::SetItemDefaultFocus();
+                        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", font_md.path.c_str());
+                        
+                        ImGui::PopID();
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::TreePop();
         }
 
         ImGui::ColorEdit4("Color", &text_node->text_color.x);

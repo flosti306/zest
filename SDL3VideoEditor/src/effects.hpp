@@ -538,11 +538,25 @@ struct TextEffectNode : public EffectNode {
     float outline_thickness = 0.1f; // Relative to font size
     glm::vec4 outline_color = {0.0f, 0.0f, 0.0f, 1.0f}; // Black
 
+    // --- Layout Properties ---
+    enum class Alignment { Left, Center, Right };
+    Alignment alignment = Alignment::Center;
+    float letter_spacing = 0.0f; // In pixels (relative to font size?) No, let's make it a multiplier or just raw pixels. Let's say raw pixels for now, or relative to scale.
+    // Making it relative to font size (em) is usually better. 0.0 = normal. 0.1 = 10% of font size extra space.
+
+    // --- Performance Optimization ---
+    float baked_font_size = 96.0f; // High-res SDF atlas size. Display size scales this.
+
     // --- UPDATED: Internal Font Rendering State ---
     bool needs_rebake = true;
     GLuint font_atlas_tex = 0;
     // We no longer use stbtt_bakedchar. We use stbtt_packedchar for SDF.
     stbtt_packedchar pdata[96]; // Packed character data for ASCII 32-127
+
+    // --- NEW: Font Metrics for Multiline ---
+    float baked_ascent = 0.0f;
+    float baked_descent = 0.0f;
+    float baked_line_gap = 0.0f;
 
     TextEffectNode() {
         name = "Text";

@@ -1034,14 +1034,19 @@ void mix_audio_from_memory(const PreloadedAudio& audio, float time_sec, std::vec
 // This version still uses the slower render_frame + glReadPixels approach
 // but incorporates the updated render_frame and resource loading.
 // For faster export, pipe to FFmpeg or use libavcodec directly.
+// --- Video Export Optimization ---
+// 1. Pre-mix audio to a temp file (FFmpeg needs a seekable/stable audio source usually, or a second pipe which is complex).
+// 2. Pipe video frames directly to FFmpeg stdin to avoid massive disk I/O.
+// 3. Use PBOs for asynchronous GPU readback.
+
 bool start_video_export(const std::string& output_path, int width, int height, int fps,
     int duration_frames, const std::vector<Clip>& clips, SDL_Window* window) {
 
-    std::cout << "Starting video export (using glReadPixels method)..." << std::endl;
+    std::cout << "Starting optimized video export..." << std::endl;
     SDL_GLContext current_context = SDL_GL_GetCurrentContext();
-    if (!current_context) { /* error */ return false; }
+    if (!current_context) { std::cerr << "No GL context!" << std::endl; return false; }
 
-    // Prepare resources specifically for export resolution
+    // --- 1. Setup Resources ---
     GLResources export_res;
     if (!setup_gl_resources(export_res, width, height)) {
         std::cerr << "Failed to setup GL resources for export." << std::endl;
@@ -1059,65 +1064,29 @@ bool start_video_export(const std::string& output_path, int width, int height, i
         return a.layer < b.layer;
     });
 
-    // Open raw output files
-    std::ofstream video_file("video.raw", std::ios::binary);
-    std::ofstream audio_file("temp_audio.raw", std::ios::binary);
-    if (!video_file || !audio_file) { 
-        cleanup_gl_resources(export_res); 
-        cleanup_video_resources(export_res); 
-        return false; 
-    }
-
-    std::vector<uint8_t> pixels(width * height * 3); // RGB
+    // --- 2. Pre-mix Audio ---
+    std::cout << "Pre-mixing audio..." << std::endl;
     const int audio_sample_rate = 44100;
     const int audio_channels = 2;
     const int samples_per_frame = audio_sample_rate / fps;
-    std::vector<float> audio_float(samples_per_frame * audio_channels, 0.0f);
-    std::vector<int16_t> audio_s16(samples_per_frame * audio_channels);
+    
+    // We'll write audio to a temp file
+    std::string audio_temp_path = "temp_audio.raw";
+    std::ofstream audio_file(audio_temp_path, std::ios::binary);
+    if (!audio_file) {
+        std::cerr << "Failed to open temp audio file." << std::endl;
+        cleanup_gl_resources(export_res);
+        cleanup_video_resources(export_res);
+        return false;
+    }
 
-    // --- Render and Export Loop ---
+    std::vector<float> audio_mix_buffer(samples_per_frame * audio_channels);
+    std::vector<int16_t> audio_s16_buffer(samples_per_frame * audio_channels);
+
     for (int frame_idx = 0; frame_idx < duration_frames; ++frame_idx) {
         float current_time = static_cast<float>(frame_idx) / fps;
+        std::fill(audio_mix_buffer.begin(), audio_mix_buffer.end(), 0.0f);
 
-        // 1. Update video textures for this frame time
-        // Collect active video clips for this frame
-        std::vector<Clip> active_video_clips;
-        for(const auto& clip : sorted_clips) {
-            if (clip.type == ClipType::Video && is_video_file(clip.path) &&
-                current_time >= clip.start_time && current_time < clip.start_time + clip.duration) {
-                active_video_clips.push_back(clip);
-            }
-        }
-
-        // Ensure all video frames are decoded before rendering
-        for (const auto& clip : active_video_clips) {
-            auto it = export_res.video_cache.find(clip.path);
-            if (it != export_res.video_cache.end()) {
-                VideoData& video = it->second;
-                float media_time = (current_time - clip.start_time) + clip.media_start;
-                if (media_time >= 0) {
-                    // Force decode the frame we need
-                    ensure_video_decoded_upto(video, media_time);
-                    // Update the texture with the decoded frame
-                    update_texture_from_cache(video, media_time, false);
-                }
-            }
-        }
-
-        // 2. Render the composited frame to FBO
-        render_frame(export_res, current_time, sorted_clips, width, height, fps);
-
-        // 3. Read back pixels
-        glBindFramebuffer(GL_FRAMEBUFFER, export_res.fbo);
-        glReadBuffer(GL_COLOR_ATTACHMENT0);
-        glReadPixels(0, 0, width, height, GL_RGB, GL_UNSIGNED_BYTE, pixels.data());
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-
-        // Write video frame
-        video_file.write(reinterpret_cast<const char*>(pixels.data()), pixels.size());
-
-        // 4. Mix Audio
-        std::fill(audio_float.begin(), audio_float.end(), 0.0f);
         for (const auto& clip : sorted_clips) {
             if (clip.type == ClipType::Audio &&
                 current_time >= clip.start_time &&
@@ -1141,57 +1110,138 @@ bool start_video_export(const std::string& output_path, int width, int height, i
                         if (current_sample_idx * audio.channels + (audio.channels - 1) < audio.samples.size() && current_sample_idx >= 0) {
                             for (int ch = 0; ch < audio.channels; ++ch) {
                                 int16_t sample_s16 = audio.samples[current_sample_idx * audio.channels + ch];
-                                audio_float[i * audio.channels + ch] += (static_cast<float>(sample_s16) / 32768.0f) * clip_volume;
+                                audio_mix_buffer[i * audio.channels + ch] += (static_cast<float>(sample_s16) / 32768.0f) * clip_volume;
                             }
-                        } else {
-                            break;
                         }
                     }
                 }
             }
         }
 
-        // Clamp and convert float audio to S16
-        for (size_t i = 0; i < audio_float.size(); ++i) {
-            float sample_f = std::max(-1.0f, std::min(1.0f, audio_float[i]));
-            audio_s16[i] = static_cast<int16_t>(sample_f * 32767.0f);
+        // Convert to int16
+        for (size_t i = 0; i < audio_mix_buffer.size(); ++i) {
+            float sample_f = std::max(-1.0f, std::min(1.0f, audio_mix_buffer[i]));
+            audio_s16_buffer[i] = static_cast<int16_t>(sample_f * 32767.0f);
         }
-        audio_file.write(reinterpret_cast<const char*>(audio_s16.data()), audio_s16.size() * sizeof(int16_t));
-
-        // Progress update
-        if (frame_idx % 30 == 0 || frame_idx == duration_frames - 1) {
-            std::cout << "Export progress: Frame " << frame_idx + 1 << "/" << duration_frames << std::endl;
-        }
+        audio_file.write(reinterpret_cast<const char*>(audio_s16_buffer.data()), audio_s16_buffer.size() * sizeof(int16_t));
     }
-
-    video_file.close();
     audio_file.close();
+    std::cout << "Audio pre-mix complete." << std::endl;
 
-    // --- FFmpeg Command ---
+
+    // --- 3. Setup FFmpeg Pipe ---
     std::string ffmpeg_cmd =
         "ffmpeg -y "
         "-f rawvideo -pix_fmt rgb24 -s " + std::to_string(width) + "x" + std::to_string(height) +
-        " -r " + std::to_string(fps) + " -i video.raw "
-        "-f s16le -ac 2 -ar " + std::to_string(audio_sample_rate) + " -i temp_audio.raw "
+        " -r " + std::to_string(fps) + " -i - " // Read video from stdin
+        "-f s16le -ac 2 -ar " + std::to_string(audio_sample_rate) + " -i \"" + audio_temp_path + "\" "
         "-c:v libx264 -preset fast -crf 22 -pix_fmt yuv420p "
         "-c:a aac -b:a 192k "
         "-shortest \"" + output_path + "\"";
 
-    std::cout << "Running FFmpeg command:\n" << ffmpeg_cmd << std::endl;
-    int ret = system(ffmpeg_cmd.c_str());
-
-    // Cleanup
-    std::filesystem::remove("video.raw");
-    std::filesystem::remove("temp_audio.raw");
-    cleanup_gl_resources(export_res);
-    cleanup_video_resources(export_res);
-
-    if (ret != 0) {
-        std::cerr << "FFmpeg export failed with code " << ret << std::endl;
+    std::cout << "Opening FFmpeg pipe: " << ffmpeg_cmd << std::endl;
+    FILE* ffmpeg_pipe = _popen(ffmpeg_cmd.c_str(), "wb");
+    if (!ffmpeg_pipe) {
+        std::cerr << "Failed to open FFmpeg pipe!" << std::endl;
+        cleanup_gl_resources(export_res);
+        cleanup_video_resources(export_res);
         return false;
     }
 
-    std::cout << "Video export finished successfully." << std::endl;
+    // --- 4. Setup PBOs for Async Readback ---
+    GLuint pbos[2];
+    glGenBuffers(2, pbos);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, pbos[0]);
+    glBufferData(GL_PIXEL_PACK_BUFFER, width * height * 3, 0, GL_STREAM_READ);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, pbos[1]);
+    glBufferData(GL_PIXEL_PACK_BUFFER, width * height * 3, 0, GL_STREAM_READ);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+
+    std::vector<uint8_t> pixel_buffer(width * height * 3);
+    int pbo_index = 0;
+    int next_pbo_index = 1;
+
+    // --- 5. Render Loop ---
+    // We run one extra iteration to read back the last frame
+    for (int frame_idx = 0; frame_idx <= duration_frames; ++frame_idx) {
+        
+        // RENDER PHASE (only if not the extra last frame)
+        if (frame_idx < duration_frames) {
+            float current_time = static_cast<float>(frame_idx) / fps;
+
+            // Update video textures
+            std::vector<Clip> active_video_clips;
+            for(const auto& clip : sorted_clips) {
+                if (clip.type == ClipType::Video && is_video_file(clip.path) &&
+                    current_time >= clip.start_time && current_time < clip.start_time + clip.duration) {
+                    active_video_clips.push_back(clip);
+                }
+            }
+
+            for (const auto& clip : active_video_clips) {
+                auto it = export_res.video_cache.find(clip.path);
+                if (it != export_res.video_cache.end()) {
+                    VideoData& video = it->second;
+                    float media_time = (current_time - clip.start_time) + clip.media_start;
+                    if (media_time >= 0) {
+                        ensure_video_decoded_upto(video, media_time);
+                        update_texture_from_cache(video, media_time, false);
+                    }
+                }
+            }
+
+            // Render to FBO
+            render_frame(export_res, current_time, sorted_clips, width, height, fps);
+
+            // Trigger ReadPixels into PBO (Async)
+            glBindFramebuffer(GL_FRAMEBUFFER, export_res.fbo);
+            glReadBuffer(GL_COLOR_ATTACHMENT0);
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, pbos[pbo_index]);
+            glReadPixels(0, 0, width, height, GL_RGB, GL_UNSIGNED_BYTE, 0); // Offset 0 in PBO
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        }
+
+        // READBACK PHASE (Process the *previous* frame, available in the *other* PBO)
+        // We start reading back after the first frame is submitted (frame_idx > 0)
+        if (frame_idx > 0) {
+            // Map the PBO that contains the PREVIOUS frame's data
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, pbos[next_pbo_index]);
+            GLubyte* src = (GLubyte*)glMapBuffer(GL_PIXEL_PACK_BUFFER, GL_READ_ONLY);
+            
+            if (src) {
+                // Write directly to pipe
+                size_t written = fwrite(src, 1, width * height * 3, ffmpeg_pipe);
+                if (written != width * height * 3) {
+                    std::cerr << "Error writing to FFmpeg pipe!" << std::endl;
+                    glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+                    break; // Stop export
+                }
+                glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+            } else {
+                std::cerr << "Failed to map PBO!" << std::endl;
+            }
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+        }
+
+        // Swap indices
+        pbo_index = next_pbo_index;
+        next_pbo_index = (next_pbo_index + 1) % 2;
+
+        if (frame_idx % 30 == 0 && frame_idx < duration_frames) {
+            std::cout << "Exporting frame " << frame_idx + 1 << "/" << duration_frames << std::endl;
+        }
+    }
+
+    // --- 6. Cleanup ---
+    _pclose(ffmpeg_pipe);
+    glDeleteBuffers(2, pbos);
+    std::filesystem::remove(audio_temp_path);
+    
+    cleanup_gl_resources(export_res);
+    cleanup_video_resources(export_res);
+
+    std::cout << "Video export finished." << std::endl;
     return true;
 }
 

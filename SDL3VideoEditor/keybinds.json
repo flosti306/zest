@@ -1,0 +1,37 @@
+{
+    "Blade Tool": {
+        "description": "Split Clip at Playhead",
+        "key": "B",
+        "mod": 192
+    },
+    "Delete Selected": {
+        "description": "Delete Selected Clip",
+        "key": "Delete",
+        "mod": 0
+    },
+    "Frame Step Left": {
+        "description": "Step One Frame Back",
+        "key": "Left",
+        "mod": 0
+    },
+    "Frame Step Right": {
+        "description": "Step One Frame Forward",
+        "key": "Right",
+        "mod": 0
+    },
+    "Play/Pause": {
+        "description": "Toggle Playback",
+        "key": "Space",
+        "mod": 0
+    },
+    "Redo": {
+        "description": "Redo Last Action",
+        "key": "y",
+        "mod": 192
+    },
+    "Undo": {
+        "description": "Undo Last Action",
+        "key": "z",
+        "mod": 192
+    }
+}
