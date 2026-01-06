@@ -1335,6 +1335,12 @@ void TextEffectNode::RebakeFont() {
 
     float scale = stbtt_ScaleForPixelHeight(&font_info, baked_font_size);
 
+    int ascent, descent, lineGap;
+    stbtt_GetFontVMetrics(&font_info, &ascent, &descent, &lineGap);
+    baked_ascent = ascent * scale;
+    baked_descent = descent * scale;
+    baked_line_gap = lineGap * scale;
+
     stbtt_pack_context spc;
     // Just 1 pixel padding between packed glyphs for safety
     stbtt_PackBegin(&spc, sdf_atlas_data, ATLAS_WIDTH, ATLAS_HEIGHT, 0, 1, nullptr);
@@ -1516,87 +1522,105 @@ void TextEffectNode::Process(const std::vector<GLuint>& image_inputs, const std:
     glBindVertexArray(vao);
     
     // --- Generate vertex data for the text string ---
+    // Handle Multiline Text
+    float render_scale = font_size / baked_font_size;
+    
+    // Calculate line height
+    // baked_ascent is positive, baked_descent is negative. 
+    // Standard line height = ascent - descent + lineGap
+    float line_height = (baked_ascent - baked_descent + baked_line_gap) * render_scale;
+    // Fallback if metrics are zero (shouldn't happen if font loaded)
+    if (line_height == 0) line_height = font_size;
+
+    std::vector<std::string> lines;
+    std::stringstream ss(text_content);
+    std::string segment;
+    while (std::getline(ss, segment, '\n')) {
+        lines.push_back(segment);
+    }
+    // If text ends with newline, add empty line (though invisible, maintains logic consistency if more text follows)
+    if (!text_content.empty() && text_content.back() == '\n') lines.push_back("");
+
+    // Start Y position
+    // As per user feedback, the system behaves like Y-Down (0 at Top).
+    // Center of block is at Y.
+    // Top of block is Y - TotalH/2.
+    // Line 0 is at Top.
+    
+    // Line 0 Offset from Center: -(N-1)/2 * LH.
+    float current_y = (position.y * ctx.resolution.y) - ((lines.size() - 1) * line_height * 0.5f);
+
     std::vector<float> vertices;
     
-    // 1. Calculate Total Width for Alignment
-    float render_scale = font_size / baked_font_size;
-    float total_width = 0.0f;
-    for (const char* text_ptr = text_content.c_str(); *text_ptr; text_ptr++) {
-        if (*text_ptr >= 32 && *text_ptr < 128) {
-            // xadvance is pre-scaled by RebakeFont (to baked_font_size)
-            // We must scale it to render_font_size
-            total_width += pdata[*text_ptr - 32].xadvance * render_scale;
-            // Add custom letter spacing (if not at the very end, though standard is to just add it)
-            if (*(text_ptr + 1)) total_width += letter_spacing;
+    for (const auto& line : lines) {
+        // 1. Calculate Width for this line
+        float line_width = 0.0f;
+        for (char c : line) {
+            if (c >= 32 && c < 128) {
+                line_width += pdata[c - 32].xadvance * render_scale;
+                line_width += letter_spacing;
+            }
         }
+        if (line_width > 0 && !line.empty()) line_width -= letter_spacing; // Remove trailing spacing
+
+        // 2. Determine Start X for this line
+        float x = position.x * ctx.resolution.x;
+        if (alignment == Alignment::Center) {
+            x -= line_width * 0.5f;
+        } else if (alignment == Alignment::Right) {
+            x -= line_width;
+        }
+
+        // 3. Draw Loop for this line
+        for (char c : line) {
+            if (c >= 32 && c < 128) {
+                stbtt_aligned_quad q;
+                float dummy_x = 0; float dummy_y = 0;
+                stbtt_GetPackedQuad(pdata, 2048, 2048, c - 32, &dummy_x, &dummy_y, &q, 0);
+                
+                // Scale coordinates
+                float q_width = (q.x1 - q.x0) * render_scale;
+                float q_height = (q.y1 - q.y0) * render_scale;
+                
+                float q_x0_scaled = (q.x0) * render_scale;
+                float q_y0_scaled = (q.y0) * render_scale;
+                
+                // Final positions
+                // x is the current pen position.
+                // q.x0 is the offset from the pen.
+                float cur_x0 = x + q_x0_scaled;
+                // Revert to ADDITION for Y-Down coordinate system
+                float cur_y0 = current_y + q_y0_scaled;
+                float cur_x1 = cur_x0 + q_width;
+                float cur_y1 = current_y + (q.y1 * render_scale); // Or cur_y0 + q_height
+                
+                // Advance X
+                float advance = pdata[c - 32].xadvance * render_scale;
+                x += advance + letter_spacing;
+                
+                float quad_verts[] = {
+                    cur_x0, cur_y0, q.s0, q.t0,
+                    cur_x1, cur_y0, q.s1, q.t0,
+                    cur_x1, cur_y1, q.s1, q.t1,
+
+                    cur_x0, cur_y0, q.s0, q.t0,
+                    cur_x1, cur_y1, q.s1, q.t1,
+                    cur_x0, cur_y1, q.s0, q.t1
+                };
+                
+                vertices.insert(vertices.end(), std::begin(quad_verts), std::end(quad_verts));
+            }
+        }
+        
+        // Advance to next line (Downwards = Increase Y)
+        current_y += line_height;
     }
 
-    // 2. Determine Start X based on Alignment
-    float x = position.x * ctx.resolution.x;
-    float y = position.y * ctx.resolution.y;
-
-    if (alignment == Alignment::Center) {
-        x -= total_width * 0.5f;
-    } else if (alignment == Alignment::Right) {
-        x -= total_width;
-    }
-
-    // 3. Draw Loop
-    // render_scale is already calculated above
-    float start_x = x; // Keep track of line start if we add multiline later.
-
-    for (const char* text_ptr = text_content.c_str(); *text_ptr; text_ptr++) {
-        if (*text_ptr >= 32 && *text_ptr < 128) {
-            stbtt_aligned_quad q;
-            // GetPackedQuad uses the BAKED size coordinates.
-            float dummy_x = 0; float dummy_y = 0;
-            stbtt_GetPackedQuad(pdata, 2048, 2048, *text_ptr - 32, &dummy_x, &dummy_y, &q, 0);
-            
-            // We need to scale the LOCAL quad coordinates and add them to global position
-            // q.x0, y0, etc are relative to (0,0) of the 'pen' because we passed dummy_x=0.
-            
-            float q_width = (q.x1 - q.x0) * render_scale;
-            float q_height = (q.y1 - q.y0) * render_scale;
-            
-            float q_x0_scaled = (q.x0) * render_scale;
-            float q_y0_scaled = (q.y0) * render_scale;
-            
-            // Final positions
-            // x is the current pen position.
-            // q.x0 is the offset from the pen.
-            float cur_x0 = x + q_x0_scaled;
-            float cur_y0 = y + q_y0_scaled;
-            float cur_x1 = cur_x0 + q_width;
-            float cur_y1 = cur_y0 + q_height;
-            
-            // Advance x manually because we detached it from GetPackedQuad for scaling
-            // pdata.xadvance is also baked size, so scale it.
-            float advance = pdata[*text_ptr - 32].xadvance * render_scale;
-            x += advance;
-            
-            // Apply Manual Letter Spacing (already scaled? No, letter_spacing is pixels)
-            x += letter_spacing;
-
-            // For now, we ignore rotation for simplicity with VBOs
-            // To add rotation, you would build a transformation matrix and apply it in the vertex shader
-
-            float quad_verts[] = {
-                // pos.x, pos.y, tex.u, tex.v
-                // Standard quad triangle strip order usually, but here we use triangles
-                cur_x0, cur_y0, q.s0, q.t0,
-                cur_x1, cur_y0, q.s1, q.t0,
-                cur_x1, cur_y1, q.s1, q.t1,
-
-                cur_x0, cur_y0, q.s0, q.t0,
-                cur_x1, cur_y1, q.s1, q.t1,
-                cur_x0, cur_y1, q.s0, q.t1
-            };
-            
-            // Upload quad data to VBO and draw
-            glBindBuffer(GL_ARRAY_BUFFER, vbo);
-            glBufferData(GL_ARRAY_BUFFER, sizeof(quad_verts), quad_verts, GL_DYNAMIC_DRAW);
-            glDrawArrays(GL_TRIANGLES, 0, 6);
-        }
+    // Upload quad data to VBO and draw
+    if (!vertices.empty()) {
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glBufferData(GL_ARRAY_BUFFER, vertices.size() * sizeof(float), vertices.data(), GL_DYNAMIC_DRAW);
+        glDrawArrays(GL_TRIANGLES, 0, vertices.size() / 4); // 4 floats per vertex
     }
 
     // --- Restore OpenGL state ---

@@ -553,6 +553,11 @@ struct TextEffectNode : public EffectNode {
     // We no longer use stbtt_bakedchar. We use stbtt_packedchar for SDF.
     stbtt_packedchar pdata[96]; // Packed character data for ASCII 32-127
 
+    // --- NEW: Font Metrics for Multiline ---
+    float baked_ascent = 0.0f;
+    float baked_descent = 0.0f;
+    float baked_line_gap = 0.0f;
+
     TextEffectNode() {
         name = "Text";
         add_pin(true, "Image", PinType::Image);

@@ -1433,10 +1433,12 @@ int main(int argc, char* argv[]) {
                  int w, h; SDL_GetWindowSizeInPixels(window, &w, &h); glViewport(0, 0, w, h);
             }
 
-            if (keybind_manager.IsTriggered(event, "Play/Pause")) {
+            bool imgui_wants_keyboard = ImGui::GetIO().WantTextInput;
+
+            if (!imgui_wants_keyboard && keybind_manager.IsTriggered(event, "Play/Pause")) {
                 playing = !playing.load();
                 std::cout << "Playback " << (playing ? "started" : "paused") << "\n";
-            } else if (keybind_manager.IsTriggered(event, "Frame Step Left") || keybind_manager.IsTriggered(event, "Frame Step Right")) {
+            } else if (!imgui_wants_keyboard && (keybind_manager.IsTriggered(event, "Frame Step Left") || keybind_manager.IsTriggered(event, "Frame Step Right"))) {
                 if (export_fps > 0) {
                     // 1. Calculate the duration of a single frame.
                     const float frame_duration = 1.0f / static_cast<float>(export_fps);
@@ -1459,7 +1461,7 @@ int main(int argc, char* argv[]) {
                 }
             }
             // Use event.key.key and SDLK_B (Fix 3 & 4)
-            else if (keybind_manager.IsTriggered(event, "Blade Tool") && selected_clip) {
+            else if (!imgui_wants_keyboard && keybind_manager.IsTriggered(event, "Blade Tool") && selected_clip) {
                 // --- DEFINITIVE, POINTER-SAFE BLADE TOOL LOGIC ---
                 PushUndo(clips, playhead_time, zoom_factor);
 
@@ -1573,7 +1575,7 @@ int main(int argc, char* argv[]) {
             }
             // Use event.key.key and SDLK_DELETE (Fix 3 & 4)
             // Fix: Don't delete clips if we are interacting with the Node Editor or Smart Mask Editor
-            else if (keybind_manager.IsTriggered(event, "Delete Selected") && 
+            else if (!imgui_wants_keyboard && keybind_manager.IsTriggered(event, "Delete Selected") && 
                      selected_clip && 
                      !node_editor_active && 
                      !smart_mask_editor_open) {
@@ -1589,11 +1591,11 @@ int main(int argc, char* argv[]) {
                         process_message = "Deleted clip.";
                         std::cout << "Deleted selected clip." << std::endl;
                 }
-            } else if (keybind_manager.IsTriggered(event, "Undo")) {
+            } else if (!imgui_wants_keyboard && keybind_manager.IsTriggered(event, "Undo")) {
                     Undo(clips, playhead_time, zoom_factor, selected_clip);
                     layers_changed = true;
                     process_message = "Undo";
-            } else if (keybind_manager.IsTriggered(event, "Redo")) {
+            } else if (!imgui_wants_keyboard && keybind_manager.IsTriggered(event, "Redo")) {
                     Redo(clips, playhead_time, zoom_factor, selected_clip);
                     layers_changed = true;
                     process_message = "Redo";
