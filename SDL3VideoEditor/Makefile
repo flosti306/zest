@@ -1,5 +1,6 @@
 PROJECTNAME = Zest
 OUTPUT_DIR = build
+OBJ_DIR = $(OUTPUT_DIR)/obj
 
 # --- Build Configuration ---
 # Set BUILD_TYPE=release for optimized build, debug for debugging (default)
@@ -7,16 +8,17 @@ BUILD_TYPE ?= debug
 
 # Optimization flags based on build type
 ifeq ($(BUILD_TYPE),release)
-    OPT_FLAGS = -O2 -DNDEBUG -march=native
+    OPT_FLAGS = -O3 -flto -DNDEBUG -march=native
+    LDFLAGS = -flto -O3
 else
     OPT_FLAGS = -O0 -g
+    LDFLAGS = -g
 endif
 
 # --- OpenCV Configuration (Point to your installed OpenCV) ---
 OPENCV_INSTALL_DIR = C:/Programs/OpenCV/opencv-4.12.0/build_mingw/install
 OPENCV_SUBDIR_FOR_LIBS_BINS = x64/mingw
 
-# Corrected construction - ensure no extra spaces are introduced
 OPENCV_INCLUDE_DIR = $(OPENCV_INSTALL_DIR)/include
 OPENCV_LIB_DIR = $(OPENCV_INSTALL_DIR)/$(OPENCV_SUBDIR_FOR_LIBS_BINS)/lib
 OPENCV_BIN_DIR = $(OPENCV_INSTALL_DIR)/$(OPENCV_SUBDIR_FOR_LIBS_BINS)/bin
@@ -27,12 +29,8 @@ OPENCV_LIBS = -lopencv_core$(OPENCV_VERSION_SUFFIX) \
               -lopencv_imgproc$(OPENCV_VERSION_SUFFIX) \
               -lopencv_tracking$(OPENCV_VERSION_SUFFIX)
 
-# Use quotes around each path individually for -I and -L
 INCLUDE_DIRS = -Iinclude -Iinclude/SDL3 -Iinclude/imgui -Iinclude/ffmpeg -I"$(OPENCV_INCLUDE_DIR)"
 
-# Here's the critical part for LIB_DIRS:
-# Each -L option should be distinct and its path quoted if it contains spaces.
-# Your OPENCV_LIB_DIR itself might contain spaces if OPENCV_INSTALL_DIR does.
 LIB_DIRS = -Llib/ffmpeg -Llib -L"$(OPENCV_LIB_DIR)"
 
 # Link libraries
@@ -42,50 +40,68 @@ LIBS = $(OPENCV_LIBS) \
        -lopengl32 -lbcrypt -lsecur32 -lws2_32 \
        -lole32 -luuid -lcomdlg32
 
-# Source files (NO OpenCV sources here)
-SRC = $(wildcard src/*.cpp) $(wildcard imgui/*.cpp)
-SRC := $(filter-out src/main_old.cpp, $(SRC))
-SRC += src/glad.c
-SRC += src/miniz.c
-SRC += src/tinyfiledialogs.c
+# Source files
+SRC_CPP = $(wildcard src/*.cpp) $(wildcard imgui/*.cpp)
+SRC_CPP := $(filter-out src/main_old.cpp, $(SRC_CPP))
+SRC_C = src/glad.c src/miniz.c src/tinyfiledialogs.c
 
-# Object files
-OBJ = $(SRC:.cpp=.o)
-OBJ := $(OBJ:.c=.o)
+# Object files moved to build/obj/ directory instead of littering the source tree
+OBJ_CPP = $(patsubst %.cpp, $(OBJ_DIR)/%.o, $(notdir $(SRC_CPP)))
+OBJ_C = $(patsubst %.c, $(OBJ_DIR)/%.o, $(notdir $(SRC_C)))
+OBJ = $(OBJ_CPP) $(OBJ_C)
+
+# Dependency files for auto-recompilation on header changes
+DEP = $(OBJ:.o=.d)
 
 # Resource file
-RES = res/zest_icon.res
+RES = $(OBJ_DIR)/zest_icon.res
 
-$(shell mkdir -p $(OUTPUT_DIR))
+# Search paths for source files so Make can find them when writing to $(OBJ_DIR)
+vpath %.cpp src imgui
+vpath %.c src
+
+# OS specific commands and directory safety
+ifeq ($(OS),Windows_NT)
+    MKDIR = if not exist "$(subst /,\,$1)" mkdir "$(subst /,\,$1)"
+    RM = del /Q /S
+    FIX_PATH = $(subst /,\,$1)
+else
+    MKDIR = mkdir -p "$1"
+    RM = rm -rf
+    FIX_PATH = $1
+endif
 
 $(info === Build Configuration ===============)
 $(info BUILD_TYPE: $(BUILD_TYPE))
-$(info OPT_FLAGS: $(OPT_FLAGS))
+$(info OPT_FLAGS:  $(OPT_FLAGS))
 $(info =======================================)
-$(info OPENCV_INSTALL_DIR is: [$(OPENCV_INSTALL_DIR)])
-$(info OPENCV_SUBDIR_FOR_LIBS_BINS is: [$(OPENCV_SUBDIR_FOR_LIBS_BINS)])
-$(info OPENCV_LIB_DIR is: [$(OPENCV_LIB_DIR)])
-$(info LIB_DIRS for linker is: [$(LIB_DIRS)])
-$(info OPENCV_LIBS for linker is: [$(OPENCV_LIBS)])
 
-default: $(OUTPUT_DIR)/$(PROJECTNAME).exe
+default: dirs $(OUTPUT_DIR)/$(PROJECTNAME).exe
 
-$(RES): res/zest_icon.rc
+dirs:
+	@$(call MKDIR,$(OUTPUT_DIR))
+	@$(call MKDIR,$(OBJ_DIR))
+
+# Dependency tracking flags
+DEPFLAGS = -MMD -MP
+
+$(RES): res/zest_icon.rc | dirs
 	windres $< -O coff -o $@
 
-%.o: %.cpp
-	g++ -c $< -o $@ $(INCLUDE_DIRS) -std=c++23 -Wall $(OPT_FLAGS) -Wno-deprecated-declarations
+$(OBJ_DIR)/%.o: %.cpp | dirs
+	g++ -c $< -o $@ $(INCLUDE_DIRS) -std=c++23 -Wall $(OPT_FLAGS) $(DEPFLAGS) -Wno-deprecated-declarations
 
-%.o: %.c
-	gcc -c $< -o $@ $(INCLUDE_DIRS) -Wall $(OPT_FLAGS)
+$(OBJ_DIR)/%.o: %.c | dirs
+	gcc -c $< -o $@ $(INCLUDE_DIRS) -Wall $(OPT_FLAGS) $(DEPFLAGS)
 
 $(OUTPUT_DIR)/$(PROJECTNAME).exe: $(OBJ) $(RES)
 	@echo "--- Linking ---"
-	@echo "Full linker command would be:"
-	@echo "g++ $(OBJ) $(RES) -o $@ $(LIB_DIRS) $(LIBS)"
-	g++ $(OBJ) $(RES) -o $@ $(LIB_DIRS) $(LIBS) $(OPT_FLAGS)
+	g++ $^ -o $@ $(LIB_DIRS) $(LIBS) $(LDFLAGS)
 
 clean:
-	rm -rf $(OUTPUT_DIR)/*.exe res/*.res $(OBJ)
+	-@$(RM) "$(call FIX_PATH,$(OUTPUT_DIR)/*.exe)" 2>nul || exit 0
+	-@$(RM) "$(call FIX_PATH,$(OBJ_DIR))" 2>nul || exit 0
 
-.PHONY: default clean
+-include $(DEP)
+
+.PHONY: default clean dirs
