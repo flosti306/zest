@@ -250,7 +250,10 @@ bool start_video_export(const std::string& output_path,
                        int width, int height, int fps,
                        int duration_frames,
                        const std::vector<Clip>& clips,
-                       SDL_Window* window); // Keep signature, implementation needs update
+                       SDL_Window* window); 
+
+// Global UI function for the Render Window
+void DrawRenderWindow(const std::vector<Clip>& clips, bool* p_open, int& render_width, int& render_height, int& export_fps, float max_duration);
 
 std::vector<float> GenerateWaveformPreview(const std::vector<int16_t>& samples, int channels, int samples_per_pixel);
 

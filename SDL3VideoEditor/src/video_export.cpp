@@ -11,6 +11,8 @@
 #include <SDL.h>
 #include <SDL_render.h>
 #include <SDL_image.h>
+#include <imgui.h>
+#include <tinyfiledialogs.h>
 #include <string>
 #include <map>
 #include <thread>
@@ -2184,4 +2186,43 @@ void set_audio_volume(AudioPlaybackState& state, float volume) {
     if (state.device) {
         SDL_SetAudioDeviceGain(state.device, state.volume);
     }
+}
+
+void DrawRenderWindow(const std::vector<Clip>& clips, bool* p_open, int& render_width, int& render_height, int& export_fps, float max_duration) {
+    if (!ImGui::Begin("Render Video", p_open)) {
+        ImGui::End();
+        return;
+    }
+
+    static char output_path[1024] = "output.mp4";
+    ImGui::InputText("Output Path", output_path, sizeof(output_path));
+    ImGui::SameLine();
+    if (ImGui::Button("Browse...")) {
+         const char* filters[] = { "*.mp4", "*.avi", "*.mov" };
+         const char* path = tinyfd_saveFileDialog("Export Video", output_path, 3, filters, "Video Files");
+         if (path) strncpy(output_path, path, sizeof(output_path));
+    }
+
+    ImGui::InputInt("Width", &render_width);
+    ImGui::InputInt("Height", &render_height);
+    ImGui::InputInt("FPS", &export_fps);
+    ImGui::Text("Duration: %.2fs", max_duration);
+
+    static std::string status_msg = "";
+
+    if (ImGui::Button("Start Export")) {
+        int total_frames = static_cast<int>(std::ceil(max_duration * export_fps));
+        if (total_frames > 0) {
+            status_msg = "Exporting...";
+            SDL_Window* current_window = SDL_GL_GetCurrentWindow();
+            bool success = start_video_export(output_path, render_width, render_height, export_fps, total_frames, clips, current_window);
+            status_msg = success ? "Export Successful!" : "Export Failed!";
+        } else {
+            status_msg = "Invalid duration.";
+        }
+    }
+    
+    ImGui::Text("%s", status_msg.c_str());
+
+    ImGui::End();
 }

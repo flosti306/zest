@@ -59,6 +59,7 @@ struct KeyframeTrack {
 
 struct Clip {
     std::string name;
+    int uid = -1; // Unique ID for bindings
     
     float start_time = 0.0f;      // timeline position in seconds
     float duration = 0.0f;        // duration on timeline
@@ -100,5 +101,8 @@ struct Clip {
 
     bool has_effects = false;
 };
+
+// Global UID generator (implemented in main.cpp)
+int GetNextClipUID();
 
 #include "keyframetrack.inl"
