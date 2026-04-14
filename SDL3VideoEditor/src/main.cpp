@@ -55,6 +55,8 @@ extern "C" {
 #include "project_io.hpp"
 #include "effects.hpp"
 #include "keybinds.hpp"
+#include "templating.hpp"
+#include "templating_ui.hpp"
 #include "stb_truetype.h" // Include API definition only
 
 // Global gradient data storage (used by ApplyWindowBackgroundGradients)
@@ -62,6 +64,10 @@ struct GradientData {
     ImVec4 window_grad_top;
     ImVec4 window_grad_bottom;
 };
+
+// UI State Flags
+bool show_template_designer = false;
+bool show_insert_template_dialog = false; 
 
 struct ScoredNodeResult {
     std::string name;
@@ -175,6 +181,23 @@ if (condition) { \
 // A map where the key is the node's display name and the value is a function that creates it.
 using NodeFactory = std::function<std::shared_ptr<EffectNode>()>;
 std::map<std::string, NodeFactory> node_registry;
+
+// --- Forward Declarations ---
+template<typename T>
+void DrawKeyframeTrackEditor(const std::string& label, KeyframeTrack<T>& track);
+void DrawTimelineEditor(std::vector<Clip>& clips, float& playhead_time, float& max_duration, float& zoom_factor, std::atomic<bool>& layers_changed, Clip*& selected_clip, GLResources& res, float& last_playhead_time_for_velocity);
+void UpdatePreview(GLResources& res, const std::vector<Clip>& sorted_clips, int width, int height, float playhead_time, bool force_update);
+void RenderPreviewWindow(GLResources& res, Clip* selected_clip, int preview_width, int preview_height);
+void DrawEffectUIForClip(Clip& clip, GLResources& gl_resources);
+void OpenSmartMaskEditor(MaskEffectNode* node, GLuint clip_texture_for_background, const DecodedFrame& decoded_frame_for_cv);
+void DrawSmartMaskEditorWindow();
+void DrawNodeEditorWindow(Clip* clip);
+void DrawAddMediaWindow(std::vector<Clip>& clips, float zoom_factor, bool layers_changed);
+void DrawNodeInspectorWindow(Clip* clip, GLResources& gl_resources);
+void DrawRenderWindow(const std::vector<Clip>& clips, bool* p_open, int& render_width, int& render_height, int& export_fps, float max_duration);
+void DrawTemplateDesignerWindow(bool* p_open, std::vector<Clip>& clips);
+void DrawInsertTemplateDialog(bool* p_open, std::vector<Clip>& clips, float playhead_time);
+void ValidateClipUIDs(std::vector<Clip>& clips);
 
 // A function to populate our registry.
 void InitializeNodeRegistry() {
@@ -427,8 +450,8 @@ bool LoadTextureFromFile(const char* filename, GLuint* out_texture_id, int* out_
 }
 
 // --- Docking Setup ---
-void RenderDockSpace(bool* show_keybinds) {
-    static ImGuiDockNodeFlags dockspace_flags = ImGuiDockNodeFlags_PassthruCentralNode; // Allow background rendering
+void RenderDockSpace(bool* show_keybinds, std::vector<Clip>& clips, float& playhead_time, float& zoom_factor, std::string& current_project_path, bool& show_render_window, bool& show_metrics_window) {
+    static ImGuiDockNodeFlags dockspace_flags = ImGuiDockNodeFlags_PassthruCentralNode; 
 
     ImGuiWindowFlags window_flags = ImGuiWindowFlags_MenuBar | ImGuiWindowFlags_NoDocking;
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
@@ -456,9 +479,52 @@ void RenderDockSpace(bool* show_keybinds) {
 
     if (ImGui::BeginMenuBar()) {
         if (ImGui::BeginMenu("File")) {
-            if (ImGui::MenuItem("Load Project...")) { /* Trigger load */ }
-            if (ImGui::MenuItem("Save Project...")) { /* Trigger save */ }
-            if (ImGui::MenuItem("Export Video...")) { /* Trigger export */ }
+            if (ImGui::MenuItem("Load Project...")) { 
+                 const char* filterPatterns[1] = { "*.zest" };
+                 const char* path = tinyfd_openFileDialog("Load Project", "", 1, filterPatterns, "Zest Project", 0);
+                 if (path) {
+                    float loaded_ph = 0;
+                    float loaded_zoom = 1.0f;
+                    std::vector<Clip> loaded_clips;
+                    if (LoadProject(path, loaded_clips, loaded_ph, loaded_zoom)) {
+                        clips = std::move(loaded_clips);
+                        playhead_time = loaded_ph;
+                        zoom_factor = loaded_zoom;
+                        current_project_path = path;
+                        ValidateClipUIDs(clips);
+                    }
+                 }
+            }
+            if (ImGui::MenuItem("Save Project...")) { 
+                if (!current_project_path.empty()) {
+                    SaveProject(current_project_path, clips, playhead_time, zoom_factor);
+                } else {
+                    const char* filterPatterns[1] = { "*.zest" };
+                    const char* path = tinyfd_saveFileDialog("Save Project", "project.zest", 1, filterPatterns, "Zest Project");
+                    if (path) {
+                        if (SaveProject(path, clips, playhead_time, zoom_factor)) {
+                             current_project_path = path;
+                        }
+                    }
+                }
+            }
+            if (ImGui::MenuItem("Save Project As...", "Ctrl+Shift+S")) {
+                const char* filterPatterns[1] = { "*.zest" };
+                const char* path = tinyfd_saveFileDialog("Save Project As", "", 1, filterPatterns, "Zest Project");
+                if (path) {
+                    if (SaveProject(path, clips, playhead_time, zoom_factor)) {
+                         current_project_path = path;
+                    }
+                }
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Render Video...", "Ctrl+E")) {
+                show_render_window = true;
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Insert Project / Template...", "Ctrl+I")) {
+                show_insert_template_dialog = true;
+            }
             ImGui::Separator();
             if (ImGui::MenuItem("Exit")) {
                  SDL_Event quit_event; quit_event.type = SDL_EVENT_QUIT; SDL_PushEvent(&quit_event);
@@ -473,12 +539,43 @@ void RenderDockSpace(bool* show_keybinds) {
              }
              ImGui::EndMenu();
         }
+        if (ImGui::BeginMenu("View")) {
+            ImGui::MenuItem("Metrics", NULL, &show_metrics_window);
+            ImGui::MenuItem("Template Designer", NULL, &show_template_designer);
+            ImGui::EndMenu();
+        }
         ImGui::EndMenuBar();
     }
     ImGui::End();
 }
 
 // --- Clip Management ---
+// --- UID Management ---
+static int next_clip_uid = 1000;
+
+int GetNextClipUID() {
+    return next_clip_uid++;
+}
+
+void ValidateClipUIDs(std::vector<Clip>& clips) {
+    if (clips.empty()) return;
+    
+    int max_uid = 999;
+    for (const auto& clip : clips) {
+        if (clip.uid > max_uid) {
+            max_uid = clip.uid;
+        }
+    }
+    next_clip_uid = max_uid + 1;
+
+    for (auto& clip : clips) {
+        if (clip.uid == -1) {
+            clip.uid = GetNextClipUID();
+            std::cout << "Assigned missing UID " << clip.uid << " to clip: " << clip.name << std::endl;
+        }
+    }
+}
+
 void AddNewClip(std::vector<Clip>& clips, const std::string& input_path, float video_duration, int layer, GLResources& res) {
     Clip temp_clip;
     temp_clip.path = input_path;
@@ -491,6 +588,7 @@ void AddNewClip(std::vector<Clip>& clips, const std::string& input_path, float v
     size_t video_index = clips.size();
     clips.emplace_back();
     Clip& video_clip = clips[video_index];
+    video_clip.uid = GetNextClipUID();
     video_clip.name = base_name + " [Video]";
     video_clip.path = input_path;
     video_clip.type = ClipType::Video;
@@ -514,6 +612,7 @@ void AddNewClip(std::vector<Clip>& clips, const std::string& input_path, float v
         size_t audio_index = clips.size();
         clips.emplace_back();
         Clip& audio_clip = clips[audio_index];
+        audio_clip.uid = GetNextClipUID();
         audio_clip.name = base_name + " [Audio]";
         audio_clip.path = input_path;
         audio_clip.type = ClipType::Audio;
@@ -574,6 +673,7 @@ void AddNewImageClip(std::vector<Clip>& clips, const std::string& input_path, in
 
     clips.emplace_back();
     Clip& image_clip = clips.back();
+    image_clip.uid = GetNextClipUID();
 
     image_clip.name = std::filesystem::path(input_path).filename().string();
     image_clip.path = input_path;
@@ -607,6 +707,7 @@ void AddNewImageClip(std::vector<Clip>& clips, const std::string& input_path, in
 void AddNewCompositionClip(std::vector<Clip>& clips, float duration) {
     clips.emplace_back();
     Clip& comp_clip = clips.back();
+    comp_clip.uid = GetNextClipUID();
 
     comp_clip.name = "Composition";
     comp_clip.path = "Composition"; // Use a special identifier, not a file path
@@ -1265,19 +1366,6 @@ void Redo(std::vector<Clip>& clips, float& playhead_time, float& zoom_factor, Cl
     selected_clip = nullptr;
 }
 
-// --- Forward Declarations ---
-template<typename T>
-void DrawKeyframeTrackEditor(const std::string& label, KeyframeTrack<T>& track);
-void DrawTimelineEditor(std::vector<Clip>& clips, float& playhead_time, float& max_duration, float& zoom_factor, std::atomic<bool>& layers_changed, Clip*& selected_clip, GLResources& res, float& last_playhead_time_for_velocity);
-void UpdatePreview(GLResources& res, const std::vector<Clip>& sorted_clips, int width, int height, float playhead_time, bool force_update);
-void RenderPreviewWindow(GLResources& res, Clip* selected_clip, int preview_width, int preview_height);
-void DrawEffectUIForClip(Clip& clip, GLResources& gl_resources);
-void OpenSmartMaskEditor(MaskEffectNode* node, GLuint clip_texture_for_background, const DecodedFrame& decoded_frame_for_cv);
-void DrawSmartMaskEditorWindow();
-void DrawNodeEditorWindow(Clip* clip);
-void DrawAddMediaWindow(std::vector<Clip>& clips, float zoom_factor, bool layers_changed);
-void DrawNodeInspectorWindow(Clip* clip, GLResources& gl_resources);
-
 // --- Main Application ---
 int main(int argc, char* argv[]) {
     avformat_network_init();
@@ -1348,9 +1436,12 @@ int main(int argc, char* argv[]) {
 
     char input_path[FILENAME_MAX] = "";
     char output_path[FILENAME_MAX] = "output.mp4";
+    std::string current_project_path = "";
     float max_duration = 10.0f;
     float zoom_factor = 1.0f;
     std::atomic<bool> layers_changed = true;
+    bool show_render_window = false;
+    bool show_metrics_window = false;
     bool file_dropped_this_frame = false;
     std::string process_message = "Ready.";
     std::vector<Clip> clips;
@@ -1707,7 +1798,9 @@ int main(int argc, char* argv[]) {
         last_playhead_time_for_velocity = playhead_time;
 
         ImGui_ImplOpenGL3_NewFrame(); ImGui_ImplSDL3_NewFrame(); ImGui::NewFrame();
-        RenderDockSpace(&show_keybind_settings);
+        RenderDockSpace(&show_keybind_settings, clips, playhead_time, zoom_factor, current_project_path, show_render_window, show_metrics_window);
+
+        if (show_metrics_window) ImGui::ShowMetricsWindow(&show_metrics_window);
 
         ImGui::Begin("Controls");
         ApplyWindowBackgroundGradients();
@@ -1800,6 +1893,53 @@ int main(int argc, char* argv[]) {
 
         if (smart_mask_editor_open) {
             DrawSmartMaskEditorWindow(); // Call this similar to DrawMaskEditorWindow
+        }
+
+        if(show_render_window) {
+            DrawRenderWindow(clips, &show_render_window, render_width, render_height, export_fps, max_duration);
+        }
+
+        // --- Templating UI ---
+        if (show_template_designer) {
+            DrawTemplateDesignerWindow(&show_template_designer, clips);
+        }
+        if (show_insert_template_dialog) {
+            size_t old_size = clips.size();
+            DrawInsertTemplateDialog(&show_insert_template_dialog, clips, playhead_time, gl_resources);
+            
+            if (old_size < clips.size()) {
+                layers_changed = true; // IMPORTANT: Force Timeline Editor to rebuild its internal state map
+                selected_clip = &clips[old_size]; // Auto-select the newly inserted clip to ensure immediate UI and rendering state updates
+            }
+            
+            for(size_t i = old_size; i < clips.size(); i++) {
+                Clip& new_clip = clips[i];
+                if(show_thumbs) QueueClipThumbnails(gl_resources, new_clip);
+                
+                // Ensure waveform is updated if the template's file path was dynamically rebound
+                auto audio_it = gl_resources.preloaded_audio.find(new_clip.path);
+                if (audio_it != gl_resources.preloaded_audio.end()) {
+                    if (new_clip.type == ClipType::Audio || !new_clip.is_audio_only) {
+                        new_clip.waveform = audio_it->second.waveform;
+                    }
+                }
+
+                if (is_video_file(new_clip.path)) {
+                    auto it = gl_resources.video_cache.find(new_clip.path);
+                    if (it != gl_resources.video_cache.end() && it->second.is_initialized) {
+                        VideoData& video = it->second;
+                        float first_frame_time = new_clip.media_start;
+                        if (should_request_frame(video, first_frame_time)) {
+                            std::lock_guard<std::mutex> lock(decoder_request_mutex);
+                            DecodedFrameRequest req;
+                            req.clip_path = new_clip.path;
+                            req.timestamp = first_frame_time;
+                            decoder_request_queue.push_back(req);
+                            decoder_worker_cv.notify_one();
+                        }
+                    }
+                }
+            }
         }
 
         if (show_keybind_settings) {

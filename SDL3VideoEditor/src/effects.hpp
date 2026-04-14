@@ -190,6 +190,8 @@ struct EffectGraph {
 
     void insert_node_before_output(std::shared_ptr<EffectNode> new_node);
     
+    std::shared_ptr<EffectGraph> Clone() const;
+    
     // ... (deep copy constructor and processing methods)
     void ProcessNodeGraph(GLuint source_clip_texture, GLuint final_output_fbo, float time, glm::vec2 resolution, int fps);
 private:

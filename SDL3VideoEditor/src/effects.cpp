@@ -441,6 +441,34 @@ void EffectGraph::insert_node_before_output(std::shared_ptr<EffectNode> new_node
     rebuild_order_from_links();
 }
 
+std::shared_ptr<EffectGraph> EffectGraph::Clone() const {
+    auto new_graph = std::make_shared<EffectGraph>();
+    // EffectGraph constructor adds Source and Output nodes. Clear them.
+    new_graph->nodes.clear();
+    new_graph->links.clear();
+    new_graph->node_order.clear();
+
+    new_graph->next_node_id = next_node_id;
+    new_graph->next_link_id = next_link_id;
+    new_graph->input_node_id = input_node_id;
+    new_graph->output_node_id = output_node_id;
+
+    for (const auto& [id, node] : nodes) {
+        auto cloned_node = node->clone();
+        for(auto& p : cloned_node->input_pins) p.node = cloned_node.get();
+        for(auto& p : cloned_node->output_pins) p.node = cloned_node.get();
+        new_graph->nodes[id] = cloned_node;
+    }
+    
+    new_graph->links = links;
+    new_graph->node_order = node_order;
+
+    // Transient textures should not be copied across clones
+    new_graph->transient_textures.clear();
+
+    return new_graph;
+}
+
 void EffectGraph::ProcessNodeGraph(GLuint source_clip_texture, GLuint final_output_fbo, float time, glm::vec2 resolution, int fps) {
     if (nodes.empty() || output_node_id == 0) return;
 

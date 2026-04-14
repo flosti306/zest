@@ -1,4 +1,5 @@
 #include "project_io.hpp"
+#include "templating.hpp"
 #include "effects.hpp" // Required for EffectNode and subclasses
 #include <imgui.h>     // Required for ImVec2
 #include <fstream>
@@ -502,6 +503,7 @@ void to_json(json& j, const Clip& clip) {
         {"rotation_track", clip.rotation_track},
         {"scale_track", clip.scale_track},
         {"volume_track", clip.volume_track},
+        {"uid", clip.uid},
         // Add more fields as needed
     };
     // Waveform is not serialized (can be regenerated)
@@ -526,6 +528,7 @@ void from_json(const json& j, Clip& clip) {
     clip.is_audio_only = j.value("is_audio_only", false);
     clip.has_audio = j.value("has_audio", false);
     clip.volume = j.value("volume", 1.0f);
+    clip.uid = j.value("uid", -1);
     
     // Effect graph deserialization
     if (j.contains("effect_graph")) {
@@ -534,6 +537,9 @@ void from_json(const json& j, Clip& clip) {
     } else {
         clip.effect_graph = nullptr;
     }
+    
+    // Evaluate has_effects based on the populated graph
+    clip.has_effects = clip.effect_graph && !clip.effect_graph->nodes.empty();
 
     // Keyframe tracks
     if (j.contains("opacity_track")) from_json(j["opacity_track"], clip.opacity_track);
@@ -585,6 +591,9 @@ bool SaveProject(const std::string& filename, const std::vector<Clip>& clips, fl
     json j;
     j["playhead_time"] = playhead_time;
     j["zoom_factor"] = zoom_factor;
+    
+    // Save Template Data
+    TemplateManager::Get().SaveToJSON(j["template_data"]);
 
     // Create a map from clip address to index for fast lookups
     std::map<const Clip*, size_t> clip_to_index_map;
@@ -638,6 +647,13 @@ bool LoadProject(const std::string& filename, std::vector<Clip>& clips, float& p
 
     playhead_time = j.value("playhead_time", 0.0f);
     zoom_factor = j.value("zoom_factor", 1.0f);
+
+    // Load Template Data
+    if (j.contains("template_data")) {
+        TemplateManager::Get().LoadFromJSON(j["template_data"]);
+    } else {
+        TemplateManager::Get().Clear();
+    }
     
     // --- Two-pass loading to re-establish links ---
     clips.clear();
@@ -673,6 +689,9 @@ bool SaveProjectToStream(std::ostream& out, const std::vector<Clip>& clips, floa
     json j;
     j["playhead_time"] = playhead_time;
     j["zoom_factor"] = zoom_factor;
+    
+    // Save Template Data
+    TemplateManager::Get().SaveToJSON(j["template_data"]);
 
     std::map<const Clip*, size_t> clip_to_index_map;
     for(size_t i = 0; i < clips.size(); ++i) {
@@ -706,6 +725,13 @@ bool LoadProjectFromStream(std::istream& in, std::vector<Clip>& clips, float& pl
 
     playhead_time = j.value("playhead_time", 0.0f);
     zoom_factor = j.value("zoom_factor", 1.0f);
+
+    // Load Template Data
+    if (j.contains("template_data")) {
+        TemplateManager::Get().LoadFromJSON(j["template_data"]);
+    } else {
+        TemplateManager::Get().Clear();
+    }
     
     clips.clear();
     if (!j.contains("clips") || !j["clips"].is_array()) {
