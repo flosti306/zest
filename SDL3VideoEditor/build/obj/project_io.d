@@ -362,7 +362,8 @@ build/obj/project_io.o: src/project_io.cpp src/project_io.hpp \
  include/ffmpeg/libswresample/version.h \
  include/ffmpeg/libswresample/version_major.h \
  include/ffmpeg/libavutil/imgutils.h include/ffmpeg/libavutil/pixdesc.h \
- include/SDL3/SDL_opengl.h include/stb_truetype.h include/miniz.h
+ include/ffmpeg/libavutil/audio_fifo.h include/SDL3/SDL_opengl.h \
+ include/stb_truetype.h include/miniz.h
 src/project_io.hpp:
 src/shared.hpp:
 include/glm/glm.hpp:
@@ -796,6 +797,7 @@ include/ffmpeg/libswresample/version.h:
 include/ffmpeg/libswresample/version_major.h:
 include/ffmpeg/libavutil/imgutils.h:
 include/ffmpeg/libavutil/pixdesc.h:
+include/ffmpeg/libavutil/audio_fifo.h:
 include/SDL3/SDL_opengl.h:
 include/stb_truetype.h:
 include/miniz.h:

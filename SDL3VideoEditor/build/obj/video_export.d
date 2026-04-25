@@ -1,4 +1,46 @@
-build/obj/video_export.o: src/video_export.cpp include/glad/glad.h \
+build/obj/video_export.o: src/video_export.cpp src/video_export.hpp \
+ include/ffmpeg/libavformat/avformat.h \
+ include/ffmpeg/libavcodec/codec_par.h include/ffmpeg/libavutil/avutil.h \
+ include/ffmpeg/libavutil/common.h include/ffmpeg/libavutil/attributes.h \
+ include/ffmpeg/libavutil/error.h include/ffmpeg/libavutil/macros.h \
+ include/ffmpeg/libavutil/avconfig.h include/ffmpeg/libavutil/version.h \
+ include/ffmpeg/libavutil/mem.h include/ffmpeg/libavutil/rational.h \
+ include/ffmpeg/libavutil/mathematics.h \
+ include/ffmpeg/libavutil/intfloat.h include/ffmpeg/libavutil/log.h \
+ include/ffmpeg/libavutil/pixfmt.h \
+ include/ffmpeg/libavutil/channel_layout.h \
+ include/ffmpeg/libavutil/rational.h include/ffmpeg/libavutil/pixfmt.h \
+ include/ffmpeg/libavcodec/codec_id.h \
+ include/ffmpeg/libavutil/samplefmt.h \
+ include/ffmpeg/libavcodec/version_major.h \
+ include/ffmpeg/libavcodec/defs.h include/ffmpeg/libavcodec/packet.h \
+ include/ffmpeg/libavutil/attributes.h include/ffmpeg/libavutil/buffer.h \
+ include/ffmpeg/libavutil/dict.h include/ffmpeg/libavutil/version.h \
+ include/ffmpeg/libavcodec/version_major.h \
+ include/ffmpeg/libavcodec/defs.h include/ffmpeg/libavcodec/packet.h \
+ include/ffmpeg/libavutil/log.h include/ffmpeg/libavformat/avio.h \
+ include/ffmpeg/libavformat/version_major.h \
+ include/ffmpeg/libavformat/version.h \
+ include/ffmpeg/libavformat/version_major.h \
+ include/ffmpeg/libavutil/frame.h include/ffmpeg/libavutil/avutil.h \
+ include/ffmpeg/libavutil/buffer.h \
+ include/ffmpeg/libavutil/channel_layout.h \
+ include/ffmpeg/libavutil/dict.h include/ffmpeg/libavutil/samplefmt.h \
+ include/ffmpeg/libavcodec/codec.h include/ffmpeg/libavutil/hwcontext.h \
+ include/ffmpeg/libavutil/frame.h include/ffmpeg/libavcodec/codec_id.h \
+ include/ffmpeg/libavcodec/avcodec.h include/ffmpeg/libavcodec/codec.h \
+ include/ffmpeg/libavcodec/version.h \
+ include/ffmpeg/libavcodec/codec_desc.h \
+ include/ffmpeg/libavcodec/codec_par.h \
+ include/ffmpeg/libswscale/swscale.h \
+ include/ffmpeg/libswscale/version_major.h \
+ include/ffmpeg/libswscale/version.h \
+ include/ffmpeg/libswresample/swresample.h \
+ include/ffmpeg/libswresample/version_major.h \
+ include/ffmpeg/libswresample/version.h \
+ include/ffmpeg/libswresample/version_major.h \
+ include/ffmpeg/libavutil/imgutils.h include/ffmpeg/libavutil/pixdesc.h \
+ include/ffmpeg/libavutil/audio_fifo.h include/glad/glad.h \
  include/KHR/khrplatform.h include/SDL3/SDL_opengl.h \
  include/SDL3/SDL_platform.h include/SDL3/SDL_platform_defines.h \
  include/SDL3/SDL_begin_code.h include/SDL3/SDL_close_code.h \
@@ -27,13 +69,12 @@ build/obj/video_export.o: src/video_export.cpp include/glad/glad.h \
  include/SDL3/SDL_process.h include/SDL3/SDL_render.h \
  include/SDL3/SDL_storage.h include/SDL3/SDL_system.h \
  include/SDL3/SDL_time.h include/SDL3/SDL_timer.h include/SDL3/SDL_tray.h \
- include/SDL3/SDL_version.h include/SDL3/SDL_oldnames.h \
- include/SDL3/SDL_image.h include/imgui/imgui.h include/imgui/imconfig.h \
- include/tinyfiledialogs.h include/glm/glm.hpp \
- include/glm/detail/_fixes.hpp include/glm/detail/setup.hpp \
- include/glm/detail/../simd/platform.h include/glm/fwd.hpp \
- include/glm/detail/qualifier.hpp include/glm/detail/setup.hpp \
- include/glm/vec2.hpp include/glm/./ext/vector_bool2.hpp \
+ include/SDL3/SDL_version.h include/SDL3/SDL_oldnames.h src/shared.hpp \
+ include/glm/glm.hpp include/glm/detail/_fixes.hpp \
+ include/glm/detail/setup.hpp include/glm/detail/../simd/platform.h \
+ include/glm/fwd.hpp include/glm/detail/qualifier.hpp \
+ include/glm/detail/setup.hpp include/glm/vec2.hpp \
+ include/glm/./ext/vector_bool2.hpp \
  include/glm/./ext/../detail/type_vec2.hpp \
  include/glm/./ext/../detail/type_vec2.inl \
  include/glm/./ext/../detail/./compute_vector_relational.hpp \
@@ -159,49 +200,8 @@ build/obj/video_export.o: src/video_export.cpp include/glad/glad.h \
  include/glm/packing.hpp include/glm/detail/func_packing.inl \
  include/glm/detail/type_half.hpp include/glm/detail/type_half.inl \
  include/glm/integer.hpp include/glm/detail/func_integer.inl \
- src/shared.hpp src/keyframetrack.inl src/video_export.hpp \
- include/ffmpeg/libavformat/avformat.h \
- include/ffmpeg/libavcodec/codec_par.h include/ffmpeg/libavutil/avutil.h \
- include/ffmpeg/libavutil/common.h include/ffmpeg/libavutil/attributes.h \
- include/ffmpeg/libavutil/error.h include/ffmpeg/libavutil/macros.h \
- include/ffmpeg/libavutil/avconfig.h include/ffmpeg/libavutil/version.h \
- include/ffmpeg/libavutil/mem.h include/ffmpeg/libavutil/rational.h \
- include/ffmpeg/libavutil/mathematics.h \
- include/ffmpeg/libavutil/intfloat.h include/ffmpeg/libavutil/log.h \
- include/ffmpeg/libavutil/pixfmt.h \
- include/ffmpeg/libavutil/channel_layout.h \
- include/ffmpeg/libavutil/rational.h include/ffmpeg/libavutil/pixfmt.h \
- include/ffmpeg/libavcodec/codec_id.h \
- include/ffmpeg/libavutil/samplefmt.h \
- include/ffmpeg/libavcodec/version_major.h \
- include/ffmpeg/libavcodec/defs.h include/ffmpeg/libavcodec/packet.h \
- include/ffmpeg/libavutil/attributes.h include/ffmpeg/libavutil/buffer.h \
- include/ffmpeg/libavutil/dict.h include/ffmpeg/libavutil/version.h \
- include/ffmpeg/libavcodec/version_major.h \
- include/ffmpeg/libavcodec/defs.h include/ffmpeg/libavcodec/packet.h \
- include/ffmpeg/libavutil/log.h include/ffmpeg/libavformat/avio.h \
- include/ffmpeg/libavformat/version_major.h \
- include/ffmpeg/libavformat/version.h \
- include/ffmpeg/libavformat/version_major.h \
- include/ffmpeg/libavutil/frame.h include/ffmpeg/libavutil/avutil.h \
- include/ffmpeg/libavutil/buffer.h \
- include/ffmpeg/libavutil/channel_layout.h \
- include/ffmpeg/libavutil/dict.h include/ffmpeg/libavutil/samplefmt.h \
- include/ffmpeg/libavcodec/codec.h include/ffmpeg/libavutil/hwcontext.h \
- include/ffmpeg/libavutil/frame.h include/ffmpeg/libavcodec/codec_id.h \
- include/ffmpeg/libavcodec/avcodec.h include/ffmpeg/libavcodec/codec.h \
- include/ffmpeg/libavcodec/version.h \
- include/ffmpeg/libavcodec/codec_desc.h \
- include/ffmpeg/libavcodec/codec_par.h \
- include/ffmpeg/libswscale/swscale.h \
- include/ffmpeg/libswscale/version_major.h \
- include/ffmpeg/libswscale/version.h \
- include/ffmpeg/libswresample/swresample.h \
- include/ffmpeg/libswresample/version_major.h \
- include/ffmpeg/libswresample/version.h \
- include/ffmpeg/libswresample/version_major.h \
- include/ffmpeg/libavutil/imgutils.h include/ffmpeg/libavutil/pixdesc.h \
- src/effects.hpp include/SDL3/SDL.h include/SDL3/SDL_image.h \
+ src/keyframetrack.inl src/effects.hpp include/SDL3/SDL.h \
+ include/SDL3/SDL_image.h \
  C:/Programs/OpenCV/opencv-4.12.0/build_mingw/install/include/opencv2/opencv.hpp \
  C:/Programs/OpenCV/opencv-4.12.0/build_mingw/install/include/opencv2/opencv_modules.hpp \
  C:/Programs/OpenCV/opencv-4.12.0/build_mingw/install/include/opencv2/core.hpp \
@@ -317,7 +317,70 @@ build/obj/video_export.o: src/video_export.cpp include/glad/glad.h \
  C:/Programs/OpenCV/opencv-4.12.0/build_mingw/install/include/opencv2/video.hpp \
  C:/Programs/OpenCV/opencv-4.12.0/build_mingw/install/include/opencv2/video/tracking.hpp \
  C:/Programs/OpenCV/opencv-4.12.0/build_mingw/install/include/opencv2/video/background_segm.hpp \
- include/stb_truetype.h include/ffmpeg/libavutil/opt.h
+ include/imgui/imgui.h include/imgui/imconfig.h include/stb_truetype.h \
+ include/SDL3/SDL_image.h include/tinyfiledialogs.h \
+ include/ffmpeg/libavutil/opt.h
+src/video_export.hpp:
+include/ffmpeg/libavformat/avformat.h:
+include/ffmpeg/libavcodec/codec_par.h:
+include/ffmpeg/libavutil/avutil.h:
+include/ffmpeg/libavutil/common.h:
+include/ffmpeg/libavutil/attributes.h:
+include/ffmpeg/libavutil/error.h:
+include/ffmpeg/libavutil/macros.h:
+include/ffmpeg/libavutil/avconfig.h:
+include/ffmpeg/libavutil/version.h:
+include/ffmpeg/libavutil/mem.h:
+include/ffmpeg/libavutil/rational.h:
+include/ffmpeg/libavutil/mathematics.h:
+include/ffmpeg/libavutil/intfloat.h:
+include/ffmpeg/libavutil/log.h:
+include/ffmpeg/libavutil/pixfmt.h:
+include/ffmpeg/libavutil/channel_layout.h:
+include/ffmpeg/libavutil/rational.h:
+include/ffmpeg/libavutil/pixfmt.h:
+include/ffmpeg/libavcodec/codec_id.h:
+include/ffmpeg/libavutil/samplefmt.h:
+include/ffmpeg/libavcodec/version_major.h:
+include/ffmpeg/libavcodec/defs.h:
+include/ffmpeg/libavcodec/packet.h:
+include/ffmpeg/libavutil/attributes.h:
+include/ffmpeg/libavutil/buffer.h:
+include/ffmpeg/libavutil/dict.h:
+include/ffmpeg/libavutil/version.h:
+include/ffmpeg/libavcodec/version_major.h:
+include/ffmpeg/libavcodec/defs.h:
+include/ffmpeg/libavcodec/packet.h:
+include/ffmpeg/libavutil/log.h:
+include/ffmpeg/libavformat/avio.h:
+include/ffmpeg/libavformat/version_major.h:
+include/ffmpeg/libavformat/version.h:
+include/ffmpeg/libavformat/version_major.h:
+include/ffmpeg/libavutil/frame.h:
+include/ffmpeg/libavutil/avutil.h:
+include/ffmpeg/libavutil/buffer.h:
+include/ffmpeg/libavutil/channel_layout.h:
+include/ffmpeg/libavutil/dict.h:
+include/ffmpeg/libavutil/samplefmt.h:
+include/ffmpeg/libavcodec/codec.h:
+include/ffmpeg/libavutil/hwcontext.h:
+include/ffmpeg/libavutil/frame.h:
+include/ffmpeg/libavcodec/codec_id.h:
+include/ffmpeg/libavcodec/avcodec.h:
+include/ffmpeg/libavcodec/codec.h:
+include/ffmpeg/libavcodec/version.h:
+include/ffmpeg/libavcodec/codec_desc.h:
+include/ffmpeg/libavcodec/codec_par.h:
+include/ffmpeg/libswscale/swscale.h:
+include/ffmpeg/libswscale/version_major.h:
+include/ffmpeg/libswscale/version.h:
+include/ffmpeg/libswresample/swresample.h:
+include/ffmpeg/libswresample/version_major.h:
+include/ffmpeg/libswresample/version.h:
+include/ffmpeg/libswresample/version_major.h:
+include/ffmpeg/libavutil/imgutils.h:
+include/ffmpeg/libavutil/pixdesc.h:
+include/ffmpeg/libavutil/audio_fifo.h:
 include/glad/glad.h:
 include/KHR/khrplatform.h:
 include/SDL3/SDL_opengl.h:
@@ -380,10 +443,7 @@ include/SDL3/SDL_timer.h:
 include/SDL3/SDL_tray.h:
 include/SDL3/SDL_version.h:
 include/SDL3/SDL_oldnames.h:
-include/SDL3/SDL_image.h:
-include/imgui/imgui.h:
-include/imgui/imconfig.h:
-include/tinyfiledialogs.h:
+src/shared.hpp:
 include/glm/glm.hpp:
 include/glm/detail/_fixes.hpp:
 include/glm/detail/setup.hpp:
@@ -526,68 +586,7 @@ include/glm/detail/type_half.hpp:
 include/glm/detail/type_half.inl:
 include/glm/integer.hpp:
 include/glm/detail/func_integer.inl:
-src/shared.hpp:
 src/keyframetrack.inl:
-src/video_export.hpp:
-include/ffmpeg/libavformat/avformat.h:
-include/ffmpeg/libavcodec/codec_par.h:
-include/ffmpeg/libavutil/avutil.h:
-include/ffmpeg/libavutil/common.h:
-include/ffmpeg/libavutil/attributes.h:
-include/ffmpeg/libavutil/error.h:
-include/ffmpeg/libavutil/macros.h:
-include/ffmpeg/libavutil/avconfig.h:
-include/ffmpeg/libavutil/version.h:
-include/ffmpeg/libavutil/mem.h:
-include/ffmpeg/libavutil/rational.h:
-include/ffmpeg/libavutil/mathematics.h:
-include/ffmpeg/libavutil/intfloat.h:
-include/ffmpeg/libavutil/log.h:
-include/ffmpeg/libavutil/pixfmt.h:
-include/ffmpeg/libavutil/channel_layout.h:
-include/ffmpeg/libavutil/rational.h:
-include/ffmpeg/libavutil/pixfmt.h:
-include/ffmpeg/libavcodec/codec_id.h:
-include/ffmpeg/libavutil/samplefmt.h:
-include/ffmpeg/libavcodec/version_major.h:
-include/ffmpeg/libavcodec/defs.h:
-include/ffmpeg/libavcodec/packet.h:
-include/ffmpeg/libavutil/attributes.h:
-include/ffmpeg/libavutil/buffer.h:
-include/ffmpeg/libavutil/dict.h:
-include/ffmpeg/libavutil/version.h:
-include/ffmpeg/libavcodec/version_major.h:
-include/ffmpeg/libavcodec/defs.h:
-include/ffmpeg/libavcodec/packet.h:
-include/ffmpeg/libavutil/log.h:
-include/ffmpeg/libavformat/avio.h:
-include/ffmpeg/libavformat/version_major.h:
-include/ffmpeg/libavformat/version.h:
-include/ffmpeg/libavformat/version_major.h:
-include/ffmpeg/libavutil/frame.h:
-include/ffmpeg/libavutil/avutil.h:
-include/ffmpeg/libavutil/buffer.h:
-include/ffmpeg/libavutil/channel_layout.h:
-include/ffmpeg/libavutil/dict.h:
-include/ffmpeg/libavutil/samplefmt.h:
-include/ffmpeg/libavcodec/codec.h:
-include/ffmpeg/libavutil/hwcontext.h:
-include/ffmpeg/libavutil/frame.h:
-include/ffmpeg/libavcodec/codec_id.h:
-include/ffmpeg/libavcodec/avcodec.h:
-include/ffmpeg/libavcodec/codec.h:
-include/ffmpeg/libavcodec/version.h:
-include/ffmpeg/libavcodec/codec_desc.h:
-include/ffmpeg/libavcodec/codec_par.h:
-include/ffmpeg/libswscale/swscale.h:
-include/ffmpeg/libswscale/version_major.h:
-include/ffmpeg/libswscale/version.h:
-include/ffmpeg/libswresample/swresample.h:
-include/ffmpeg/libswresample/version_major.h:
-include/ffmpeg/libswresample/version.h:
-include/ffmpeg/libswresample/version_major.h:
-include/ffmpeg/libavutil/imgutils.h:
-include/ffmpeg/libavutil/pixdesc.h:
 src/effects.hpp:
 include/SDL3/SDL.h:
 include/SDL3/SDL_image.h:
@@ -706,5 +705,9 @@ C:/Programs/OpenCV/opencv-4.12.0/build_mingw/install/include/opencv2/stitching/d
 C:/Programs/OpenCV/opencv-4.12.0/build_mingw/install/include/opencv2/video.hpp:
 C:/Programs/OpenCV/opencv-4.12.0/build_mingw/install/include/opencv2/video/tracking.hpp:
 C:/Programs/OpenCV/opencv-4.12.0/build_mingw/install/include/opencv2/video/background_segm.hpp:
+include/imgui/imgui.h:
+include/imgui/imconfig.h:
 include/stb_truetype.h:
+include/SDL3/SDL_image.h:
+include/tinyfiledialogs.h:
 include/ffmpeg/libavutil/opt.h:

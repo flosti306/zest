@@ -268,8 +268,8 @@ build/obj/main.o: src/main.cpp include/ffmpeg/libavformat/avformat.h \
  include/nlohmann/ordered_map.hpp \
  include/nlohmann/detail/macro_unscope.hpp \
  include/nlohmann/thirdparty/hedley/hedley_undef.hpp src/video_export.hpp \
- include/SDL3/SDL_opengl.h src/shared.hpp src/keyframetrack.inl \
- src/project_io.hpp src/effects.hpp \
+ include/ffmpeg/libavutil/audio_fifo.h include/SDL3/SDL_opengl.h \
+ src/shared.hpp src/keyframetrack.inl src/project_io.hpp src/effects.hpp \
  C:/Programs/OpenCV/opencv-4.12.0/build_mingw/install/include/opencv2/opencv.hpp \
  C:/Programs/OpenCV/opencv-4.12.0/build_mingw/install/include/opencv2/opencv_modules.hpp \
  C:/Programs/OpenCV/opencv-4.12.0/build_mingw/install/include/opencv2/core.hpp \
@@ -729,6 +729,7 @@ include/nlohmann/ordered_map.hpp:
 include/nlohmann/detail/macro_unscope.hpp:
 include/nlohmann/thirdparty/hedley/hedley_undef.hpp:
 src/video_export.hpp:
+include/ffmpeg/libavutil/audio_fifo.h:
 include/SDL3/SDL_opengl.h:
 src/shared.hpp:
 src/keyframetrack.inl:

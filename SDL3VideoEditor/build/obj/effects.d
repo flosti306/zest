@@ -329,8 +329,9 @@ build/obj/effects.o: src/effects.cpp include/glm/glm.hpp \
  include/ffmpeg/libswresample/version.h \
  include/ffmpeg/libswresample/version_major.h \
  include/ffmpeg/libavutil/imgutils.h include/ffmpeg/libavutil/pixdesc.h \
- include/SDL3/SDL_opengl.h src/shared.hpp src/keyframetrack.inl \
- include/stb_truetype.h src/cv_utils.hpp \
+ include/ffmpeg/libavutil/audio_fifo.h include/SDL3/SDL_opengl.h \
+ src/shared.hpp src/keyframetrack.inl include/stb_truetype.h \
+ src/cv_utils.hpp \
  C:/Programs/OpenCV/opencv-4.12.0/build_mingw/install/include/opencv2/tracking/tracking.hpp \
  C:/Programs/OpenCV/opencv-4.12.0/build_mingw/install/include/opencv2/tracking.hpp \
  include/stb_image_write.h
@@ -730,6 +731,7 @@ include/ffmpeg/libswresample/version.h:
 include/ffmpeg/libswresample/version_major.h:
 include/ffmpeg/libavutil/imgutils.h:
 include/ffmpeg/libavutil/pixdesc.h:
+include/ffmpeg/libavutil/audio_fifo.h:
 include/SDL3/SDL_opengl.h:
 src/shared.hpp:
 src/keyframetrack.inl:

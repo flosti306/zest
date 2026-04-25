@@ -8,8 +8,11 @@ extern "C" {
     #include <libavutil/imgutils.h>
     #include <libavutil/samplefmt.h>
     #include <libavutil/rational.h> // For AVRational
+    #include <libavutil/hwcontext.h>
+    #include <libavutil/audio_fifo.h>
 }
 
+#include <glad/glad.h>
 #include <SDL_opengl.h>
 #include <cstdio>
 #include <vector>
@@ -90,6 +93,8 @@ struct VideoData {
     // uint8_t* buffer = nullptr;   // Managed within DecodedFrame now
     GLuint texture_id = 0;
     bool is_initialized = false;
+    AVBufferRef* hw_device_ctx = nullptr;
+    AVPixelFormat hw_pix_fmt = AV_PIX_FMT_NONE;
 
     // Decoding State & Cache
     double last_requested_pts = -1.0; // Last time requested by the application
@@ -197,6 +202,7 @@ struct DecodedFrameRequest {
 struct DecodedFrameResult {
     std::string clip_path;
     bool success = false;
+    double requested_timestamp = -1.0;
     std::string error_message;
     DecodedFrame frame; // Contains the pixels, w, h, and pts
 };
@@ -265,7 +271,7 @@ void stop_thumbnail_worker();
 
 void update_video_previews(GLResources& res, const std::vector<Clip>& active_clips, float current_time, bool is_playing, bool is_scrubbing);
 bool update_texture_from_cache(VideoData& video, double target_time_seconds, bool strict);
-void update_playback_state(GLResources& res, float current_time, float last_time, bool& is_playing_out, bool& is_scrubbing_out);
+void update_playback_state(GLResources& res, float current_time, float last_time, bool master_playing, bool& is_playing_out, bool& is_scrubbing_out);
 bool should_request_frame(VideoData& video, double target_time);
 
 struct AudioPlaybackState {

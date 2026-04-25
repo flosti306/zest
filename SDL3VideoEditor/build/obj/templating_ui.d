@@ -317,9 +317,9 @@ build/obj/templating_ui.o: src/templating_ui.cpp src/templating_ui.hpp \
  include/ffmpeg/libswresample/version.h \
  include/ffmpeg/libswresample/version_major.h \
  include/ffmpeg/libavutil/imgutils.h include/ffmpeg/libavutil/pixdesc.h \
- include/SDL3/SDL_opengl.h include/stb_truetype.h src/project_io.hpp \
- src/templating.hpp include/nlohmann/json.hpp \
- include/nlohmann/adl_serializer.hpp \
+ include/ffmpeg/libavutil/audio_fifo.h include/SDL3/SDL_opengl.h \
+ include/stb_truetype.h src/project_io.hpp src/templating.hpp \
+ include/nlohmann/json.hpp include/nlohmann/adl_serializer.hpp \
  include/nlohmann/detail/abi_macros.hpp \
  include/nlohmann/detail/conversions/from_json.hpp \
  include/nlohmann/detail/exceptions.hpp \
@@ -750,6 +750,7 @@ include/ffmpeg/libswresample/version.h:
 include/ffmpeg/libswresample/version_major.h:
 include/ffmpeg/libavutil/imgutils.h:
 include/ffmpeg/libavutil/pixdesc.h:
+include/ffmpeg/libavutil/audio_fifo.h:
 include/SDL3/SDL_opengl.h:
 include/stb_truetype.h:
 src/project_io.hpp:

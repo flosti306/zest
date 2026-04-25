@@ -1760,7 +1760,7 @@ int main(int argc, char* argv[]) {
     // 2. Determine playback state (playing, scrubbing, paused)
     bool is_playing_live, is_scrubbing;
     // Pass the master 'playing' atomic to correctly determine state
-    update_playback_state(gl_resources, playhead_time, last_time, is_playing_live, is_scrubbing);
+    update_playback_state(gl_resources, playhead_time, last_time, playing.load(), is_playing_live, is_scrubbing);
     last_time = playhead_time;
     is_playing_live = is_playing_live && playing.load(); 
 
@@ -1768,7 +1768,7 @@ int main(int argc, char* argv[]) {
     update_video_previews(gl_resources, active_clips_for_preview, playhead_time, is_playing_live, is_scrubbing);
     
     // 4. Process any completed frames from the decoder thread
-    process_decoded_frames(gl_resources, 30); // Process up to 30 frames per UI loop
+    process_decoded_frames(gl_resources, 60); // Drain decoder results faster to reduce preview stutter
 
     // 5. Update textures from the cache using asynchronous PBO uploads
     for (const auto& clip : active_clips_for_preview) {

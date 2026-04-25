@@ -360,8 +360,8 @@ build/obj/templating.o: src/templating.cpp src/templating.hpp \
  include/ffmpeg/libswresample/version.h \
  include/ffmpeg/libswresample/version_major.h \
  include/ffmpeg/libavutil/imgutils.h include/ffmpeg/libavutil/pixdesc.h \
- include/SDL3/SDL_opengl.h src/shared.hpp src/keyframetrack.inl \
- include/stb_truetype.h
+ include/ffmpeg/libavutil/audio_fifo.h include/SDL3/SDL_opengl.h \
+ src/shared.hpp src/keyframetrack.inl include/stb_truetype.h
 src/templating.hpp:
 include/nlohmann/json.hpp:
 include/nlohmann/adl_serializer.hpp:
@@ -792,6 +792,7 @@ include/ffmpeg/libswresample/version.h:
 include/ffmpeg/libswresample/version_major.h:
 include/ffmpeg/libavutil/imgutils.h:
 include/ffmpeg/libavutil/pixdesc.h:
+include/ffmpeg/libavutil/audio_fifo.h:
 include/SDL3/SDL_opengl.h:
 src/shared.hpp:
 src/keyframetrack.inl:
