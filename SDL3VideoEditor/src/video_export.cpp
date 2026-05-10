@@ -55,6 +55,19 @@ std::atomic<bool> stop_decoder_worker_flag = false;
 std::mutex pending_requests_mutex;
 std::set<std::pair<std::string, double>> global_pending_requests;
 
+std::mutex playback_perf_mutex;
+PlaybackPerfStats playback_perf_stats;
+
+PlaybackPerfStats get_playback_perf_stats() {
+  std::lock_guard<std::mutex> lock(playback_perf_mutex);
+  return playback_perf_stats;
+}
+
+void reset_playback_perf_stats() {
+  std::lock_guard<std::mutex> lock(playback_perf_mutex);
+  playback_perf_stats = PlaybackPerfStats{};
+}
+
 void start_thumbnail_worker();
 void stop_thumbnail_worker();
 bool decode_frame_at_timestamp(DecoderState *state, double timestamp,
@@ -542,6 +555,8 @@ bool update_texture_from_cache(VideoData &video, double target_time_seconds,
                                bool strict = false) {
   if (!video.is_initialized || video.frame_cache.empty() ||
       video.pbos[0] == 0) {
+    std::lock_guard<std::mutex> perf_lock(playback_perf_mutex);
+    playback_perf_stats.texture_upload_misses++;
     return false;
   }
 
@@ -557,13 +572,19 @@ bool update_texture_from_cache(VideoData &video, double target_time_seconds,
 
   // --- STRICT MODE: Only show if exact frame is available ---
   if (strict && (min_diff > 0.05)) { // 5ms tolerance
+    std::lock_guard<std::mutex> perf_lock(playback_perf_mutex);
+    playback_perf_stats.texture_upload_misses++;
     return false; // Don't update texture, wait for exact frame
   }
 
-  if (!best_frame)
+  if (!best_frame) {
+    std::lock_guard<std::mutex> perf_lock(playback_perf_mutex);
+    playback_perf_stats.texture_upload_misses++;
     return false;
+  }
 
   // ...existing PBO upload logic...
+  const auto upload_start = std::chrono::steady_clock::now();
   glBindTexture(GL_TEXTURE_2D, video.texture_id);
   video.pbo_index = (video.pbo_index + 1) % 2;
   int current_pbo_id = video.pbos[video.pbo_index];
@@ -577,12 +598,29 @@ bool update_texture_from_cache(VideoData &video, double target_time_seconds,
     glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
   } else {
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    std::lock_guard<std::mutex> perf_lock(playback_perf_mutex);
+    playback_perf_stats.texture_upload_misses++;
     return false;
   }
   glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, video.width, video.height, GL_RGB,
                   GL_UNSIGNED_BYTE, (void *)0);
   glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
   glBindTexture(GL_TEXTURE_2D, 0);
+
+  const double upload_ms =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                upload_start)
+          .count();
+  {
+    std::lock_guard<std::mutex> perf_lock(playback_perf_mutex);
+    playback_perf_stats.texture_upload_hits++;
+    const double prev_samples =
+        static_cast<double>(playback_perf_stats.texture_upload_hits - 1);
+    playback_perf_stats.avg_texture_upload_ms =
+        ((playback_perf_stats.avg_texture_upload_ms * prev_samples) +
+         upload_ms) /
+        static_cast<double>(playback_perf_stats.texture_upload_hits);
+  }
 
   return true;
 }
@@ -2421,16 +2459,34 @@ void update_video_previews(GLResources &res,
                            float current_time, bool is_playing,
                            bool is_scrubbing) {
 
-  // On a new scrub action, clear out old, low-priority prefetch requests.
+  // On a new scrub action, clear out old prefetch requests.
   if (is_scrubbing) {
-    std::lock_guard<std::mutex> lock(decoder_request_mutex);
-    decoder_request_queue.erase(
-        std::remove_if(decoder_request_queue.begin(),
-                       decoder_request_queue.end(),
-                       [](const DecodedFrameRequest &req) {
-                         return req.priority == RequestPriority::Normal;
-                       }),
-        decoder_request_queue.end());
+    std::vector<std::pair<std::string, double>> removed_requests;
+    {
+      std::lock_guard<std::mutex> lock(decoder_request_mutex);
+      decoder_request_queue.erase(
+          std::remove_if(
+              decoder_request_queue.begin(), decoder_request_queue.end(),
+              [&](const DecodedFrameRequest &req) {
+                // Remove ALL requests when scrubbing, as they are now stale.
+                removed_requests.push_back({req.clip_path, req.timestamp});
+                return true;
+              }),
+          decoder_request_queue.end());
+    }
+    if (!removed_requests.empty()) {
+      std::lock_guard<std::mutex> perf_lock(playback_perf_mutex);
+      playback_perf_stats.requests_dropped_stale +=
+          static_cast<uint64_t>(removed_requests.size());
+    }
+    std::lock_guard<std::mutex> pending_lock(pending_requests_mutex);
+    for (const auto &[path, ts] : removed_requests) {
+      auto video_it = res.video_cache.find(path);
+      if (video_it != res.video_cache.end()) {
+        video_it->second.pending_requests.erase(ts);
+      }
+      global_pending_requests.erase({path, ts});
+    }
   }
 
   for (const auto &clip : active_clips) {
@@ -2462,6 +2518,17 @@ void update_video_previews(GLResources &res,
         decoder_request_queue.push_back({clip.path, request_time, priority});
       }
       decoder_worker_cv.notify_one();
+
+      std::lock_guard<std::mutex> perf_lock(playback_perf_mutex);
+      if (priority == RequestPriority::High) {
+        playback_perf_stats.requests_enqueued_high++;
+      } else {
+        playback_perf_stats.requests_enqueued_normal++;
+      }
+      playback_perf_stats.decoder_queue_size =
+          static_cast<int>(decoder_request_queue.size());
+      playback_perf_stats.pending_clip_requests =
+          static_cast<int>(video.pending_requests.size());
     };
 
     // --- Prioritized Request Logic ---
@@ -2478,20 +2545,43 @@ void update_video_previews(GLResources &res,
     // 2. During smooth playback, prefetch with NORMAL priority.
     if (is_playing) {
       // Prevent backlog growth: drop stale prefetch entries for this clip.
+      std::vector<double> removed_prefetch_times;
       {
         std::lock_guard<std::mutex> lock(decoder_request_mutex);
         decoder_request_queue.erase(
             std::remove_if(
                 decoder_request_queue.begin(), decoder_request_queue.end(),
                 [&](const DecodedFrameRequest &req) {
-                  return req.clip_path == clip.path &&
-                         req.priority == RequestPriority::Normal &&
-                         req.timestamp < (media_time - 0.25);
+                  const bool should_remove =
+                      req.clip_path == clip.path &&
+                      req.timestamp < (media_time - 0.25);
+                  if (should_remove) {
+                    removed_prefetch_times.push_back(req.timestamp);
+                  }
+                  return should_remove;
                 }),
             decoder_request_queue.end());
       }
+      if (!removed_prefetch_times.empty()) {
+        {
+          std::lock_guard<std::mutex> perf_lock(playback_perf_mutex);
+          playback_perf_stats.requests_dropped_stale +=
+              static_cast<uint64_t>(removed_prefetch_times.size());
+        }
+        for (double ts : removed_prefetch_times) {
+          video.pending_requests.erase(ts);
+          std::lock_guard<std::mutex> pending_lock(pending_requests_mutex);
+          global_pending_requests.erase({clip.path, ts});
+        }
+      }
 
-      const int prefetch_count = 6;
+      int queue_pressure = 0;
+      {
+        std::lock_guard<std::mutex> lock(decoder_request_mutex);
+        queue_pressure = static_cast<int>(decoder_request_queue.size());
+      }
+      const int prefetch_count =
+          (queue_pressure > 20) ? 2 : (queue_pressure > 12 ? 4 : 6);
       const size_t max_pending_per_clip = 12;
       const float frame_duration =
           (video.time_base.den > 0)
@@ -2500,7 +2590,7 @@ void update_video_previews(GLResources &res,
                                    ->r_frame_rate))
               : (1.0f / 30.0f);
 
-      for (int i = 1; i <= prefetch_count; ++i) {
+      for (int i = 0; i <= prefetch_count; ++i) { // Start at 0 to ensure current frame is requested
         double prefetch_time = media_time + i * frame_duration;
         if (prefetch_time > video.duration_sec)
           break;
@@ -2514,6 +2604,22 @@ void update_video_previews(GLResources &res,
       }
     }
   }
+
+  int request_queue_size = 0;
+  int global_pending_size = 0;
+  {
+    std::lock_guard<std::mutex> lock(decoder_request_mutex);
+    request_queue_size = static_cast<int>(decoder_request_queue.size());
+  }
+  {
+    std::lock_guard<std::mutex> lock(pending_requests_mutex);
+    global_pending_size = static_cast<int>(global_pending_requests.size());
+  }
+  {
+    std::lock_guard<std::mutex> perf_lock(playback_perf_mutex);
+    playback_perf_stats.decoder_queue_size = request_queue_size;
+    playback_perf_stats.pending_global_requests = global_pending_size;
+  }
 }
 
 // --- NEW: Function to process results from the decoder thread ---
@@ -2526,6 +2632,9 @@ void process_decoded_frames(GLResources &res, int max_per_frame = 5) {
         break;
       result = std::move(decoder_result_queue.front());
       decoder_result_queue.pop();
+      std::lock_guard<std::mutex> perf_lock(playback_perf_mutex);
+      playback_perf_stats.decoder_result_queue_size =
+          static_cast<int>(decoder_result_queue.size());
     }
 
     auto it = res.video_cache.find(result.clip_path);
@@ -2559,13 +2668,27 @@ void process_decoded_frames(GLResources &res, int max_per_frame = 5) {
     }
 
     if (!result.success)
+    {
+      std::lock_guard<std::mutex> perf_lock(playback_perf_mutex);
+      playback_perf_stats.decoded_frames_failed++;
       continue;
+    }
 
-    // Keep cache sorted without sorting the full deque each insertion.
-    auto insert_pos = std::lower_bound(
-        video.frame_cache.begin(), video.frame_cache.end(), result.frame.pts,
-        [](const DecodedFrame &a, double pts) { return a.pts < pts; });
-    video.frame_cache.insert(insert_pos, std::move(result.frame));
+    {
+      std::lock_guard<std::mutex> perf_lock(playback_perf_mutex);
+      playback_perf_stats.decoded_frames_success++;
+    }
+
+    // Fast path: decode results are usually in chronological order.
+    if (video.frame_cache.empty() ||
+        result.frame.pts >= video.frame_cache.back().pts) {
+      video.frame_cache.push_back(std::move(result.frame));
+    } else {
+      auto insert_pos = std::lower_bound(
+          video.frame_cache.begin(), video.frame_cache.end(), result.frame.pts,
+          [](const DecodedFrame &a, double pts) { return a.pts < pts; });
+      video.frame_cache.insert(insert_pos, std::move(result.frame));
+    }
 
     // Trim cache if it's too large, removing the oldest frames.
     while (video.frame_cache.size() > VideoData::MAX_CACHE_SIZE) {

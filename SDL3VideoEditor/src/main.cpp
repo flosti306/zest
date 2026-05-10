@@ -1768,7 +1768,7 @@ int main(int argc, char* argv[]) {
     update_video_previews(gl_resources, active_clips_for_preview, playhead_time, is_playing_live, is_scrubbing);
     
     // 4. Process any completed frames from the decoder thread
-    process_decoded_frames(gl_resources, 60); // Drain decoder results faster to reduce preview stutter
+    process_decoded_frames(gl_resources, is_playing_live ? 24 : 60); // Keep playback frame-time stable while still draining quickly when paused/scrubbing
 
     // 5. Update textures from the cache using asynchronous PBO uploads
     for (const auto& clip : active_clips_for_preview) {
@@ -1814,6 +1814,21 @@ int main(int argc, char* argv[]) {
         ImGui::Text("Time: %.2f / %.2f", playhead_time, max_duration);
         if (ImGui::SliderFloat("##Seek", &playhead_time, 0.0f, max_duration, "%.2f s")) {
              layers_changed = true; playing = false;
+        }
+        if (ImGui::CollapsingHeader("Playback Profiling", ImGuiTreeNodeFlags_DefaultOpen)) {
+            PlaybackPerfStats perf = get_playback_perf_stats();
+            ImGui::Text("Decoder queue: %d | Result queue: %d", perf.decoder_queue_size, perf.decoder_result_queue_size);
+            ImGui::Text("Pending global: %d | Pending clip: %d", perf.pending_global_requests, perf.pending_clip_requests);
+            ImGui::Text("Enqueued high: %llu | normal: %llu", (unsigned long long)perf.requests_enqueued_high, (unsigned long long)perf.requests_enqueued_normal);
+            ImGui::Text("Dropped stale: %llu", (unsigned long long)perf.requests_dropped_stale);
+            ImGui::Text("Decoded ok: %llu | fail: %llu", (unsigned long long)perf.decoded_frames_success, (unsigned long long)perf.decoded_frames_failed);
+            ImGui::Text("Upload hits: %llu | misses: %llu | avg ms: %.3f",
+                        (unsigned long long)perf.texture_upload_hits,
+                        (unsigned long long)perf.texture_upload_misses,
+                        perf.avg_texture_upload_ms);
+            if (ImGui::Button("Reset Playback Stats")) {
+                reset_playback_perf_stats();
+            }
         }
         ImGui::Separator();
         if (ImGui::Button("Export Video")) {

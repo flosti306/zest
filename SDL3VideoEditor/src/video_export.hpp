@@ -80,6 +80,21 @@ struct DecodedFrame {
     double pts = -1.0; // Presentation timestamp in seconds
 };
 
+struct PlaybackPerfStats {
+    int decoder_queue_size = 0;
+    int decoder_result_queue_size = 0;
+    int pending_global_requests = 0;
+    int pending_clip_requests = 0;
+    uint64_t requests_enqueued_high = 0;
+    uint64_t requests_enqueued_normal = 0;
+    uint64_t requests_dropped_stale = 0;
+    uint64_t decoded_frames_success = 0;
+    uint64_t decoded_frames_failed = 0;
+    uint64_t texture_upload_hits = 0;
+    uint64_t texture_upload_misses = 0;
+    double avg_texture_upload_ms = 0.0;
+};
+
 struct VideoData {
     AVFormatContext* format_ctx = nullptr;
     AVCodecContext* codec_ctx = nullptr;
@@ -129,7 +144,7 @@ struct VideoData {
     static constexpr int MAX_PENDING_REQUESTS = 30;       // Allow more in-flight requests
     
     // Cache management
-    static constexpr size_t MAX_CACHE_SIZE = 150; // Reduced from potentially larger value
+    static constexpr size_t MAX_CACHE_SIZE = 90; // Smaller cache reduces scan/insert cost during playback
 };
 
 struct AudioData {
@@ -273,6 +288,8 @@ void update_video_previews(GLResources& res, const std::vector<Clip>& active_cli
 bool update_texture_from_cache(VideoData& video, double target_time_seconds, bool strict);
 void update_playback_state(GLResources& res, float current_time, float last_time, bool master_playing, bool& is_playing_out, bool& is_scrubbing_out);
 bool should_request_frame(VideoData& video, double target_time);
+PlaybackPerfStats get_playback_perf_stats();
+void reset_playback_perf_stats();
 
 struct AudioPlaybackState {
     SDL_AudioDeviceID device = 0;
